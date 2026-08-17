@@ -13,10 +13,11 @@ human-facing [`damo`](https://github.com/damonitor/damo) tool.
 - Linux DAMON admin sysfs (`/sys/kernel/mm/damon/admin`)
 - Virtual-address monitoring of one PID
 - Typed process IDs, intervals, region bounds, operations, actions, and errors
-- Passive tri-state feature discovery and exclusive staged discovery
+- Passive four-state feature discovery and exclusive staged discovery
+- Typed coverage of all 57 official `damo` sysfs capability names
 - A sorted inventory of concrete attributes, including unknown future paths
 - Advisory session locking, ownership rechecks, rollback, and cleanup
-- Query snapshots through a match-all `stat` DAMOS scheme
+- Query snapshots through a match-all `stat` DAMOS scheme when supported
 - Raw low-level DAMON snapshots with explicit effective-unit attachment and
   checked high-level byte conversions
 - Allocation-free scaled region views over the raw snapshot storage
@@ -53,6 +54,13 @@ Linux 7.1. Capabilities are discovered from sysfs instead of inferred from a
 kernel version. Optional attributes whose absence has the same legacy default
 behavior are written only when present. See
 [`docs/kernel-abi.md`](docs/kernel-abi.md) for the exact source audit.
+
+The compatibility target is official `damo`'s sysfs backend. Monitoring can
+start on the original Linux 5.18 admin sysfs layout even though snapshot
+materialization was added later. A snapshot request reports an unsupported
+feature without stopping the monitor on such kernels. `damo` can additionally
+fall back to the older debugfs ABI, which is outside this crate's current sysfs
+scope.
 
 ## High-level API
 
@@ -97,10 +105,14 @@ regions are borrowed views, so attaching the effective unit does not allocate a
 second region vector.
 
 Call `Damon::capabilities()` while DAMON is otherwise unused to temporarily
-stage representative indexed children, inspect their concrete attributes, and
-restore the empty hierarchy. `Kdamond::capabilities()` remains the passive
-low-level query and reports children that have not been staged as
-`RequiresStaging`.
+stage representative indexed children, probe semantic filter values, inspect
+their concrete attributes, and restore the empty hierarchy.
+`Kdamond::capabilities()` remains the passive low-level query. Capability
+results distinguish `Supported`, `Unsupported`, `RequiresStaging`, and
+`Unverified`. The last state is important for Linux 5.18, where writing and
+reading an operation name does not prove that its implementation was compiled
+into the kernel. A successful high-level start confirms the selected
+operation.
 
 ## Low-level API
 

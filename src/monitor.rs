@@ -72,13 +72,13 @@ impl Damon {
     }
 
     /// Exclusively stages representative nodes and discovers this kernel's
-    /// concrete DAMON sysfs capabilities.
+    /// concrete and semantic DAMON sysfs capabilities.
     ///
     /// Discovery holds the same advisory lock as a monitor and requires the
     /// global DAMON hierarchy to be empty. It never starts a kdamond. The
     /// temporary hierarchy is removed before this method returns. This makes
-    /// capabilities below indexed children observable without replacing
-    /// another controller's configuration.
+    /// capabilities below indexed children and accepted filter values
+    /// observable without replacing another controller's configuration.
     pub fn capabilities(&self) -> Result<Capabilities> {
         let _session_lock = SessionLock::acquire(&self.lock_path)?;
         let existing = self.admin.kdamond_count()?;
@@ -123,7 +123,10 @@ fn stage_capability_probe(kdamond: &Kdamond) -> Result<(Capabilities, Configurat
         }
     }
 
-    let capabilities = kdamond.capabilities(0, 0)?;
+    let semantic_capabilities = retry_busy(|| kdamond.probe_semantic_filter_capabilities(0, 0))?;
+    let mut capabilities = kdamond.capabilities(0, 0)?;
+    capabilities.apply_feature_capabilities(semantic_capabilities);
+    capabilities.replace_operations(retry_busy(|| kdamond.probe_operations(0))?);
     let fingerprint = kdamond.configuration_fingerprint()?;
     Ok((capabilities, fingerprint))
 }
@@ -232,7 +235,7 @@ impl MonitorBuilder<'_> {
             });
         }
         let setup = configure_monitor(&kdamond, self.pid, intervals, region_bounds);
-        let (capabilities, staged) = match setup {
+        let (mut capabilities, staged) = match setup {
             Ok(configured) => configured,
             Err(operation) => {
                 return Err(with_rollback(
@@ -273,6 +276,7 @@ impl MonitorBuilder<'_> {
                 rollback_owned_monitor(&self.damon.admin, &kdamond, &ownership),
             ));
         }
+        capabilities.confirm_operation(&Operation::VirtualAddress);
 
         Ok(Monitor {
             admin: self.damon.admin.clone(),
@@ -328,12 +332,6 @@ fn configure_monitor(
     scheme.set_default_apply_interval_if_present()?;
 
     let capabilities = kdamond.capabilities(0, 0)?;
-    if capabilities.feature_support(SysfsFeature::TriedRegions) != CapabilitySupport::Supported {
-        return Err(Error::UnsupportedFeature {
-            feature: "DAMOS tried-region queries",
-        });
-    }
-
     let staged = StagedOwnership {
         operation: Operation::VirtualAddress,
         effective_address_unit: AddressUnit::ONE,
@@ -582,12 +580,23 @@ impl Monitor {
     ///
     /// The kernel fulfills this request through a match-all `stat` DAMOS
     /// scheme. The call may wait for the scheme's next apply interval. Mutable
-    /// access serializes sysfs result materialization for this monitor.
+    /// access serializes sysfs result materialization for this monitor. Kernels
+    /// before tried-region queries were introduced can still run the monitor,
+    /// but this method returns [`Error::UnsupportedFeature`].
     pub fn snapshot(&mut self) -> Result<Snapshot> {
         if !self.running {
             return Err(Error::NotRunning);
         }
         self.verify_running()?;
+        if self
+            .capabilities
+            .feature_support(SysfsFeature::TriedRegions)
+            != CapabilitySupport::Supported
+        {
+            return Err(Error::UnsupportedFeature {
+                feature: "DAMOS tried-region queries",
+            });
+        }
         retry_busy(|| {
             self.kdamond
                 .command(KdamondCommand::UpdateSchemesTriedRegions)
@@ -962,15 +971,27 @@ mod tests {
 
         assert_eq!(damon.admin.kdamond_count().expect("read restored count"), 0);
         assert_eq!(
+            capabilities.damo_feature_support("sysfs/ctx_pause"),
+            Some(CapabilitySupport::Supported)
+        );
+        assert_eq!(capabilities.damo_feature_support("sysfs/not_known"), None);
+        assert_eq!(
             capabilities.feature_support(SysfsFeature::ProbeFilterPath),
             CapabilitySupport::Supported
         );
         assert!(capabilities.has_attribute("contexts/0/monitoring_attrs/probes/0/filters/0/path"));
         assert!(capabilities.has_attribute("contexts/0/schemes/0/quotas/goals/0/target_metric"));
-        assert!(
+        assert!(capabilities.operations().iter().any(|capability| {
+            capability.operation() == &Operation::Unknown("future_operation".into())
+                && capability.support() == CapabilitySupport::Supported
+        }));
+        assert_eq!(
             capabilities
-                .operations()
-                .contains(&Operation::Unknown("future_operation".into()))
+                .features()
+                .iter()
+                .filter(|capability| capability.feature().damo_name().is_some())
+                .count(),
+            57
         );
     }
 
@@ -990,6 +1011,118 @@ mod tests {
 
         assert!(matches!(error, Error::InUse { kdamonds: 1 }));
         assert_eq!(damon.admin.kdamond_count().expect("preserve count"), 1);
+    }
+
+    #[test]
+    fn exclusive_capability_probe_tests_operations_when_listing_is_absent() {
+        let model = Model::without_available_operations_file("vaddr\npaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+
+        let capabilities = damon.capabilities().expect("probe modeled operations");
+
+        assert_eq!(
+            capabilities.feature_support(SysfsFeature::AvailableOperations),
+            CapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            capabilities.operation_support(&Operation::VirtualAddress),
+            Some(CapabilitySupport::Unverified)
+        );
+        assert_eq!(
+            capabilities.operation_support(&Operation::PhysicalAddress),
+            Some(CapabilitySupport::Unverified)
+        );
+        assert_eq!(
+            capabilities.operation_support(&Operation::FixedVirtualAddress),
+            Some(CapabilitySupport::Unsupported)
+        );
+        assert!(!capabilities.supports_operation(&Operation::VirtualAddress));
+        assert_eq!(damon.admin.kdamond_count().expect("read restored count"), 0);
+    }
+
+    #[test]
+    fn legacy_operation_writes_do_not_claim_registered_support() {
+        let model = Model::with_legacy_operation_sets("vaddr\n", "vaddr\npaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+
+        let capabilities = damon.capabilities().expect("probe legacy operations");
+
+        assert_eq!(
+            capabilities.operation_support(&Operation::PhysicalAddress),
+            Some(CapabilitySupport::Unverified)
+        );
+        assert!(!capabilities.supports_operation(&Operation::PhysicalAddress));
+    }
+
+    #[test]
+    fn recognized_but_unregistered_operation_fails_start_and_rolls_back() {
+        let model = Model::with_legacy_operation_sets("paddr\n", "vaddr\npaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+
+        let error = damon
+            .monitor_pid(Pid::new(42).expect("valid pid"))
+            .start()
+            .expect_err("an unregistered vaddr implementation must not start");
+
+        assert!(matches!(error, Error::Io { .. }));
+        assert_eq!(damon.admin.kdamond_count().expect("read restored count"), 0);
+    }
+
+    #[test]
+    fn exclusive_capability_probe_checks_semantic_filter_values() {
+        let model = Model::new("vaddr\npaddr\nfvaddr\n");
+        model.set_supported_scheme_filter_types("anon\nmemcg\naddr\ntarget\n");
+        model.set_supported_probe_filter_types("anon\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+
+        let capabilities = damon.capabilities().expect("probe semantic values");
+
+        assert_eq!(
+            capabilities.feature_support(SysfsFeature::SchemeFilterYoung),
+            CapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            capabilities.feature_support(SysfsFeature::SchemeFilterAddress),
+            CapabilitySupport::Supported
+        );
+        assert_eq!(
+            capabilities.feature_support(SysfsFeature::ProbeTypeAnonymous),
+            CapabilitySupport::Supported
+        );
+        assert_eq!(
+            capabilities.feature_support(SysfsFeature::ProbeTypeMemoryControlGroup),
+            CapabilitySupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn passive_capability_probe_does_not_claim_unchecked_filter_values() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        damon
+            .admin
+            .set_kdamond_count(1)
+            .expect("stage modeled kdamond");
+        let kdamond = damon.admin.kdamond(0);
+        kdamond.set_context_count(1).expect("stage context");
+        let context = kdamond.context(0);
+        context.set_target_count(1).expect("stage target");
+        context.set_scheme_count(1).expect("stage scheme");
+        kdamond
+            .stage_optional_capability_children(0, 0, 0)
+            .expect("stage optional children");
+
+        let capabilities = kdamond.capabilities(0, 0).expect("inspect paths");
+
+        assert_eq!(
+            capabilities.feature_support(SysfsFeature::SchemeFilterYoung),
+            CapabilitySupport::Unverified
+        );
     }
 
     fn os_error(code: i32) -> Error {

@@ -20,6 +20,8 @@ Versioning and the Keep a Changelog structure.
   children and restores an empty hierarchy.
 - A sorted concrete-attribute inventory that preserves paths unknown to this
   crate version.
+- Typed coverage and exact-name lookup for all 57 official `damo` sysfs
+  capability concepts.
 
 ### Changed
 
@@ -67,3 +69,10 @@ Versioning and the Keep a Changelog structure.
   initial regions, and scheme apply intervals.
 - Parse tried-region and probe directories by numerically sorting the entries
   that actually exist instead of stopping at the first missing index.
+- Start and manage monitors on older admin-sysfs kernels without tried-region
+  queries, returning an unsupported-feature error only from snapshot requests.
+- Report accepted legacy operation writes as unverified when the hierarchy does
+  not expose authoritative `avail_operations`, then restore the original
+  operation. A successful monitor start confirms the selected operation.
+- Probe semantic DAMOS and monitoring-probe filter values in representative
+  staged children instead of inferring support from a shared `type` path.

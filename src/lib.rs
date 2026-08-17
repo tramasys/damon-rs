@@ -47,4 +47,4 @@ pub use monitor::{DEFAULT_SESSION_LOCK_PATH, Damon, Monitor, MonitorBuilder};
 pub use region::{
     ProbeHit, RawRegion, RawSnapshot, Region, RegionIter, Snapshot, SnapshotCompleteness,
 };
-pub use sysfs::{Capabilities, CapabilitySupport, Operation, SysfsFeature};
+pub use sysfs::{Capabilities, CapabilitySupport, Operation, OperationCapability, SysfsFeature};

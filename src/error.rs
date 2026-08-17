@@ -101,11 +101,11 @@ pub enum Error {
         /// The underlying I/O error.
         source: io::Error,
     },
-    /// Setup failed and restoring the previous empty state also failed.
+    /// An operation failed and restoring the preceding state also failed.
     Rollback {
-        /// The setup error.
+        /// The primary operation error.
         operation: Box<Error>,
-        /// The rollback error.
+        /// The state-restoration error.
         rollback: Box<Error>,
     },
 }
@@ -192,7 +192,7 @@ impl fmt::Display for Error {
                 rollback,
             } => write!(
                 formatter,
-                "DAMON setup failed ({operation}); rollback also failed ({rollback})"
+                "DAMON operation failed ({operation}); restoring the prior state also failed ({rollback})"
             ),
         }
     }

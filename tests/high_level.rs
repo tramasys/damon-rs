@@ -379,8 +379,10 @@ fn stages_queries_and_cleans_up_a_monitor() {
         CapabilitySupport::Supported
     );
     assert_eq!(
-        monitor.capabilities().operations()[2],
-        Operation::Unknown("future_ops".into())
+        monitor
+            .capabilities()
+            .operation_support(&Operation::Unknown("future_ops".into())),
+        Some(CapabilitySupport::Supported)
     );
 
     let snapshot = monitor.snapshot().expect("query snapshot");
@@ -425,6 +427,7 @@ fn high_level_staging_adapts_to_legacy_optional_attributes() {
     ] {
         fixture.remove(path);
     }
+    fixture.remove_dir("kdamonds/0/contexts/0/schemes/0/tried_regions");
 
     let monitor = fixture
         .damon()
@@ -447,6 +450,8 @@ fn high_level_staging_adapts_to_legacy_optional_attributes() {
         SysfsFeature::ObsoleteTarget,
         SysfsFeature::InitialRegions,
         SysfsFeature::SchemeApplyInterval,
+        SysfsFeature::TriedRegions,
+        SysfsFeature::TriedRegionsTotalBytes,
     ] {
         assert_eq!(
             monitor.capabilities().feature_support(feature),
@@ -819,15 +824,25 @@ fn supports_tried_regions_without_total_bytes() {
 }
 
 #[test]
-fn rolls_back_when_tried_region_queries_are_unsupported() {
+fn monitoring_works_without_optional_tried_region_queries() {
     let fixture = Fixture::new("vaddr\n");
     fixture.remove_dir("kdamonds/0/contexts/0/schemes/0/tried_regions");
     let damon = fixture.damon();
 
-    let error = damon
+    let mut monitor = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
         .start()
-        .expect_err("query support must be detected");
+        .expect("monitoring does not require optional query support");
+    assert_eq!(
+        monitor
+            .capabilities()
+            .feature_support(SysfsFeature::TriedRegions),
+        CapabilitySupport::Unsupported
+    );
+
+    let error = monitor
+        .snapshot()
+        .expect_err("snapshot query support must be detected before its command");
 
     assert!(matches!(
         error,
@@ -835,6 +850,7 @@ fn rolls_back_when_tried_region_queries_are_unsupported() {
             feature: "DAMOS tried-region queries"
         }
     ));
+    monitor.stop().expect("stop monitor without query support");
     assert_eq!(fixture.read("kdamonds/nr_kdamonds"), "0");
 }
 

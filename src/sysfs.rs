@@ -191,16 +191,39 @@ impl fmt::Display for Action {
     }
 }
 
-/// An optional DAMON sysfs feature detected from a concrete ABI path.
+/// A DAMON sysfs capability represented by the typed discovery API.
 ///
-/// Discovery is based on populated sysfs paths rather than the running kernel
-/// version. Features below an unstaged indexed child, such as a probe filter,
-/// are reported through [`CapabilitySupport::RequiresStaging`].
+/// Semantic variants correspond to the official `damo` sysfs capability map.
+/// Discovery uses populated paths and accepted values rather than the running
+/// kernel version. Features below an unstaged indexed child are reported
+/// through [`CapabilitySupport::RequiresStaging`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum SysfsFeature {
+    /// Process virtual-address monitoring (`sysfs/vaddr`).
+    VirtualAddressOperation,
+    /// Physical-address monitoring (`sysfs/paddr`).
+    PhysicalAddressOperation,
+    /// Fixed virtual-address monitoring (`sysfs/fvaddr`).
+    FixedVirtualAddressOperation,
+    /// DAMOS schemes (`sysfs/schemes`).
+    Schemes,
+    /// DAMOS time quotas (`sysfs/schemes_time_quota`).
+    SchemeTimeQuota,
+    /// DAMOS size quotas (`sysfs/schemes_size_quota`).
+    SchemeSizeQuota,
+    /// DAMOS quota prioritization weights (`sysfs/schemes_prioritization`).
+    SchemePrioritization,
+    /// DAMOS watermarks (`sysfs/schemes_wmarks`).
+    SchemeWatermarks,
+    /// Successful DAMOS application statistics (`sysfs/schemes_stat_succ`).
+    SchemeSuccessfulStats,
+    /// DAMOS quota-exceeded statistics (`sysfs/schemes_stat_qt_exceed`).
+    SchemeQuotaExceededStats,
     /// `contexts/<N>/avail_operations` is present.
     AvailableOperations,
+    /// Running-context parameter commits (`sysfs/online_params_commit`).
+    OnlineParametersCommit,
     /// `kdamonds/<N>/refresh_ms` is present.
     PeriodicRefresh,
     /// `contexts/<N>/addr_unit` is present.
@@ -229,18 +252,174 @@ pub enum SysfsFeature {
     TriedRegions,
     /// `schemes/<N>/tried_regions/total_bytes` is present.
     TriedRegionsTotalBytes,
+    /// The original unified DAMOS filter directory (`sysfs/schemes_filters`).
+    SchemeFilters,
+    /// Anonymous-memory DAMOS filters (`sysfs/schemes_filters_anon`).
+    SchemeFilterAnonymous,
+    /// Memory-control-group DAMOS filters (`sysfs/schemes_filters_memcg`).
+    SchemeFilterMemoryControlGroup,
+    /// Address-range DAMOS filters (`sysfs/schemes_filters_addr`).
+    SchemeFilterAddress,
+    /// DAMON-target DAMOS filters (`sysfs/schemes_filters_target`).
+    SchemeFilterTarget,
+    /// Young-page DAMOS filters (`sysfs/schemes_filters_young`).
+    SchemeFilterYoung,
+    /// Huge-page-size DAMOS filters (`sysfs/schemes_filters_hugepage_size`).
+    SchemeFilterHugePageSize,
+    /// Unmapped-page DAMOS filters (`sysfs/schemes_filters_unmapped`).
+    SchemeFilterUnmapped,
+    /// Active-page DAMOS filters (`sysfs/schemes_filters_active`).
+    SchemeFilterActive,
+    /// Separate core and operations DAMOS filter directories.
+    SeparateSchemeFilterDirectories,
+    /// Per-filter allow controls (`sysfs/allow_filter`).
+    SchemeFilterAllow,
+    /// DAMOS quota goals (`sysfs/schemes_quota_goals`).
+    SchemeQuotaGoals,
+    /// Effective DAMOS quota reporting (`sysfs/schemes_quota_effective_bytes`).
+    SchemeQuotaEffectiveBytes,
+    /// DAMOS quota-goal metrics (`sysfs/schemes_quota_goal_metric`).
+    SchemeQuotaGoalMetric,
+    /// DAMOS quota-goal PSI metrics (`sysfs/schemes_quota_goal_some_psi`).
+    SchemeQuotaGoalSomePsi,
+    /// Node-memory DAMOS quota goals.
+    SchemeQuotaGoalNodeMemory,
+    /// Node memory-control-group DAMOS quota goals.
+    SchemeQuotaGoalNodeMemoryControlGroup,
+    /// Active-memory DAMOS quota goals.
+    SchemeQuotaGoalActiveMemory,
+    /// Node-eligible-memory DAMOS quota goals.
+    SchemeQuotaGoalNodeEligibleMemory,
+    /// Automatic DAMOS quota-goal tuning.
+    SchemeQuotaGoalTuner,
+    /// DAMOS quota failure-charge ratios.
+    SchemeQuotaFailureChargeRatio,
+    /// DAMOS memory migration (`sysfs/schemes_migrate`).
+    SchemeMigration,
+    /// Weighted DAMOS migration destinations (`sysfs/schemes_dests`).
+    SchemeDestinations,
+    /// Bytes passed by operations-layer filters.
+    SchemeOperationsFilterPassedBytes,
+    /// Number of DAMOS snapshots (`sysfs/damos_stat_nr_snapshots`).
+    SchemeSnapshotCount,
+    /// Configurable maximum number of DAMOS snapshots.
+    SchemeMaximumSnapshotCount,
+    /// DAMOS collapse action (`sysfs/damos_action_collapse`).
+    CollapseAction,
+    /// Auto-tuned monitoring interval goals (`sysfs/intervals_goal`).
+    MonitoringIntervalsGoal,
+    /// Monitoring-data probes (`sysfs/attrs_monitoring`).
+    AttributeMonitoring,
+    /// Anonymous-memory monitoring-probe filters (`sysfs/probe_type_anon`).
+    ProbeTypeAnonymous,
+    /// Memory-control-group monitoring-probe filters (`sysfs/probe_type_memcg`).
+    ProbeTypeMemoryControlGroup,
+    /// Monitoring-probe weights (`sysfs/probe_weights`).
+    ProbeWeight,
+    /// Monitoring-probe preparations (`sysfs/probe_preps`).
+    ProbePreparations,
+    /// Page-idle probe preparation (`sysfs/probe_prep_set_pgidle`).
+    ProbePreparationSetPageIdle,
+    /// Page-idle-unset monitoring probes (`sysfs/probe_type_pgidle_unset`).
+    ProbeTypePageIdleUnset,
+    /// DAMON sample controls (`sysfs/damon_sample_control`).
+    SampleControl,
+    /// Monitoring-operation attributes (`sysfs/ops_attrs`).
+    OperationAttributes,
 }
 
-/// Whether an optional sysfs feature can be observed in the current hierarchy.
+impl SysfsFeature {
+    /// Returns the corresponding official `damo` sysfs feature name.
+    ///
+    /// Low-level attribute-detail variants that are finer grained than the
+    /// official capability map return `None`.
+    #[must_use]
+    pub const fn damo_name(self) -> Option<&'static str> {
+        match self {
+            Self::VirtualAddressOperation => Some("sysfs/vaddr"),
+            Self::PhysicalAddressOperation => Some("sysfs/paddr"),
+            Self::FixedVirtualAddressOperation => Some("sysfs/fvaddr"),
+            Self::Schemes => Some("sysfs/schemes"),
+            Self::SchemeTimeQuota => Some("sysfs/schemes_time_quota"),
+            Self::SchemeSizeQuota => Some("sysfs/schemes_size_quota"),
+            Self::SchemePrioritization => Some("sysfs/schemes_prioritization"),
+            Self::SchemeWatermarks => Some("sysfs/schemes_wmarks"),
+            Self::SchemeSuccessfulStats => Some("sysfs/schemes_stat_succ"),
+            Self::SchemeQuotaExceededStats => Some("sysfs/schemes_stat_qt_exceed"),
+            Self::AvailableOperations => Some("sysfs/avail_ops"),
+            Self::OnlineParametersCommit => Some("sysfs/online_params_commit"),
+            Self::PeriodicRefresh => Some("sysfs/refresh_ms"),
+            Self::AddressUnit => Some("sysfs/addr_unit"),
+            Self::ContextPause => Some("sysfs/ctx_pause"),
+            Self::AttributeMonitoring => Some("sysfs/attrs_monitoring"),
+            Self::SchemeApplyInterval => Some("sysfs/schemes_apply_interval"),
+            Self::ObsoleteTarget => Some("sysfs/obsolete_target"),
+            Self::InitialRegions => Some("sysfs/init_regions"),
+            Self::TriedRegions => Some("sysfs/schemes_tried_regions"),
+            Self::TriedRegionsTotalBytes => Some("sysfs/schemes_tried_regions_sz"),
+            Self::SchemeFilters => Some("sysfs/schemes_filters"),
+            Self::SchemeFilterAnonymous => Some("sysfs/schemes_filters_anon"),
+            Self::SchemeFilterMemoryControlGroup => Some("sysfs/schemes_filters_memcg"),
+            Self::SchemeFilterAddress => Some("sysfs/schemes_filters_addr"),
+            Self::SchemeFilterTarget => Some("sysfs/schemes_filters_target"),
+            Self::SchemeFilterYoung => Some("sysfs/schemes_filters_young"),
+            Self::SchemeFilterHugePageSize => Some("sysfs/schemes_filters_hugepage_size"),
+            Self::SchemeFilterUnmapped => Some("sysfs/schemes_filters_unmapped"),
+            Self::SchemeFilterActive => Some("sysfs/schemes_filters_active"),
+            Self::SeparateSchemeFilterDirectories => Some("sysfs/schemes_filters_core_ops_dirs"),
+            Self::SchemeFilterAllow => Some("sysfs/allow_filter"),
+            Self::SchemeQuotaGoals => Some("sysfs/schemes_quota_goals"),
+            Self::SchemeQuotaEffectiveBytes => Some("sysfs/schemes_quota_effective_bytes"),
+            Self::SchemeQuotaGoalMetric => Some("sysfs/schemes_quota_goal_metric"),
+            Self::SchemeQuotaGoalSomePsi => Some("sysfs/schemes_quota_goal_some_psi"),
+            Self::SchemeQuotaGoalNodeMemory => Some("sysfs/schemes_quota_goal_node_mem_used_free"),
+            Self::SchemeQuotaGoalNodeMemoryControlGroup => {
+                Some("sysfs/schemes_quota_goal_node_memcg_used_free")
+            }
+            Self::SchemeQuotaGoalActiveMemory => Some("sysfs/damos_quota_goal_in_active_mem_bp"),
+            Self::SchemeQuotaGoalNodeEligibleMemory => {
+                Some("sysfs/damos_quota_goal_node_eligible_mem_bp")
+            }
+            Self::SchemeQuotaGoalTuner => Some("sysfs/damos_quota_goal_tuner"),
+            Self::SchemeQuotaFailureChargeRatio => Some("sysfs/damos_quota_fail_charge_ratio"),
+            Self::SchemeMigration => Some("sysfs/schemes_migrate"),
+            Self::SchemeDestinations => Some("sysfs/schemes_dests"),
+            Self::SchemeOperationsFilterPassedBytes => Some("sysfs/sz_ops_filter_passed"),
+            Self::SchemeSnapshotCount => Some("sysfs/damos_stat_nr_snapshots"),
+            Self::SchemeMaximumSnapshotCount => Some("sysfs/damos_max_nr_snapshots"),
+            Self::CollapseAction => Some("sysfs/damos_action_collapse"),
+            Self::MonitoringIntervalsGoal => Some("sysfs/intervals_goal"),
+            Self::ProbeTypeAnonymous => Some("sysfs/probe_type_anon"),
+            Self::ProbeTypeMemoryControlGroup => Some("sysfs/probe_type_memcg"),
+            Self::ProbeWeight => Some("sysfs/probe_weights"),
+            Self::ProbePreparations => Some("sysfs/probe_preps"),
+            Self::ProbePreparationSetPageIdle => Some("sysfs/probe_prep_set_pgidle"),
+            Self::ProbeTypePageIdleUnset => Some("sysfs/probe_type_pgidle_unset"),
+            Self::SampleControl => Some("sysfs/damon_sample_control"),
+            Self::OperationAttributes => Some("sysfs/ops_attrs"),
+            Self::AttributeProbeCount
+            | Self::ProbeFilterCount
+            | Self::ProbeFilterType
+            | Self::ProbeFilterMatching
+            | Self::ProbeFilterAllow
+            | Self::ProbeFilterPath => None,
+        }
+    }
+}
+
+/// Strength of the evidence observed for a DAMON sysfs capability.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum CapabilitySupport {
-    /// The concrete sysfs path is present.
+    /// Support was established from authoritative or usable ABI evidence.
     Supported,
-    /// The concrete sysfs path is absent even though its parent is staged.
+    /// A relevant staged path was absent or a candidate value was rejected.
     Unsupported,
     /// An indexed parent must be staged before support can be observed.
     RequiresStaging,
+    /// The visible ABI or an accepted staging value suggests support, but
+    /// semantic usability has not been confirmed.
+    Unverified,
 }
 
 /// The discovery result for one optional sysfs feature.
@@ -250,6 +429,27 @@ pub struct FeatureCapability {
     support: CapabilitySupport,
 }
 
+/// Discovery result for one DAMON monitoring operation.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct OperationCapability {
+    operation: Operation,
+    support: CapabilitySupport,
+}
+
+impl OperationCapability {
+    /// Returns the operation being described.
+    #[must_use]
+    pub const fn operation(&self) -> &Operation {
+        &self.operation
+    }
+
+    /// Returns the observed support state.
+    #[must_use]
+    pub const fn support(&self) -> CapabilitySupport {
+        self.support
+    }
+}
+
 impl FeatureCapability {
     /// Returns the optional feature being described.
     #[must_use]
@@ -257,37 +457,46 @@ impl FeatureCapability {
         self.feature
     }
 
-    /// Returns whether the feature is supported or needs more staging.
+    /// Returns the observed support state.
     #[must_use]
     pub const fn support(self) -> CapabilitySupport {
         self.support
     }
 }
 
-/// Runtime capabilities discovered from individual DAMON sysfs paths.
+/// Runtime capabilities discovered from DAMON sysfs paths and accepted values.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Capabilities {
-    operations: Box<[Operation]>,
+    operations: Box<[OperationCapability]>,
     features: Box<[FeatureCapability]>,
     attribute_paths: Box<[String]>,
 }
 
 impl Capabilities {
-    /// Returns the monitoring operations observed during discovery.
+    /// Returns the monitoring operations examined during discovery.
     ///
-    /// When `avail_operations` is absent, this contains only the selected
-    /// operation that could be read back successfully.
+    /// A kernel-provided `avail_operations` file confirms support. On older
+    /// kernels, successful staging writes are reported as
+    /// [`CapabilitySupport::Unverified`] because Linux 5.18 accepts recognized
+    /// operation names even when their implementations are not registered.
     #[must_use]
-    pub fn operations(&self) -> &[Operation] {
+    pub fn operations(&self) -> &[OperationCapability] {
         &self.operations
     }
 
-    /// Returns whether support for an operation was observed.
+    /// Returns the observed state for an operation, if it was examined.
     #[must_use]
-    pub fn supports_operation(&self, operation: &Operation) -> bool {
+    pub fn operation_support(&self, operation: &Operation) -> Option<CapabilitySupport> {
         self.operations
             .iter()
-            .any(|candidate| candidate == operation)
+            .find(|capability| capability.operation == *operation)
+            .map(OperationCapability::support)
+    }
+
+    /// Returns whether operation support was confirmed.
+    #[must_use]
+    pub fn supports_operation(&self, operation: &Operation) -> bool {
+        self.operation_support(operation) == Some(CapabilitySupport::Supported)
     }
 
     /// Returns the discovery result for every known optional feature.
@@ -307,6 +516,18 @@ impl Capabilities {
             })
     }
 
+    /// Looks up support using an official `damo` sysfs feature name.
+    ///
+    /// Returns `None` when the name is not part of the `damo` capability map
+    /// audited by this crate version.
+    #[must_use]
+    pub fn damo_feature_support(&self, name: &str) -> Option<CapabilitySupport> {
+        self.features
+            .iter()
+            .find(|capability| capability.feature.damo_name() == Some(name))
+            .map(|capability| capability.support())
+    }
+
     /// Returns every concrete attribute path observed below the kdamond.
     ///
     /// Paths are relative to `kdamonds/<N>` and preserve unknown attributes
@@ -323,6 +544,64 @@ impl Capabilities {
         self.attribute_paths
             .binary_search_by(|path| path.as_str().cmp(relative_path))
             .is_ok()
+    }
+
+    pub(crate) fn replace_operations(&mut self, operations: Vec<OperationCapability>) {
+        self.operations = operations.into_boxed_slice();
+        self.sync_operation_features();
+    }
+
+    pub(crate) fn confirm_operation(&mut self, operation: &Operation) {
+        if let Some(capability) = self
+            .operations
+            .iter_mut()
+            .find(|capability| capability.operation == *operation)
+        {
+            capability.support = CapabilitySupport::Supported;
+        } else {
+            self.operations = self
+                .operations
+                .iter()
+                .cloned()
+                .chain([operation_capability(
+                    operation.clone(),
+                    CapabilitySupport::Supported,
+                )])
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+        }
+        self.sync_operation_features();
+    }
+
+    pub(crate) fn apply_feature_capabilities(
+        &mut self,
+        capabilities: impl IntoIterator<Item = FeatureCapability>,
+    ) {
+        for capability in capabilities {
+            set_feature_support(&mut self.features, capability.feature, capability.support);
+        }
+    }
+
+    fn sync_operation_features(&mut self) {
+        for (operation, feature) in [
+            (
+                Operation::VirtualAddress,
+                SysfsFeature::VirtualAddressOperation,
+            ),
+            (
+                Operation::PhysicalAddress,
+                SysfsFeature::PhysicalAddressOperation,
+            ),
+            (
+                Operation::FixedVirtualAddress,
+                SysfsFeature::FixedVirtualAddressOperation,
+            ),
+        ] {
+            let support = self
+                .operation_support(&operation)
+                .unwrap_or(CapabilitySupport::Unsupported);
+            set_feature_support(&mut self.features, feature, support);
+        }
     }
 }
 
@@ -672,11 +951,13 @@ impl Kdamond {
         }
     }
 
-    /// Discovers features from individual paths in a staged context and scheme.
+    /// Discovers features passively in a staged context and scheme.
     ///
     /// Paths below an unstaged probe or probe filter are reported as
     /// [`CapabilitySupport::RequiresStaging`], rather than being confused with
-    /// kernel-level absence. This method never modifies the staged hierarchy.
+    /// kernel-level absence. Semantic values that require a write probe are
+    /// [`CapabilitySupport::Unverified`]. This method never modifies the staged
+    /// hierarchy.
     pub fn capabilities(&self, context_index: usize, scheme_index: usize) -> Result<Capabilities> {
         let context_count = self.context_count()?;
         if context_index >= context_count {
@@ -697,45 +978,9 @@ impl Kdamond {
         }
         let scheme = context.scheme(scheme_index);
         let target_count = context.target_count()?;
-        let target = context.target(0);
         let probes = context.path.join("monitoring_attrs/probes");
         let probe_filter = probes.join("0/filters/0");
-        let mut features = Vec::new();
-
-        for (feature, path) in [
-            (SysfsFeature::PeriodicRefresh, self.path.join("refresh_ms")),
-            (
-                SysfsFeature::AvailableOperations,
-                context.path.join("avail_operations"),
-            ),
-            (SysfsFeature::AddressUnit, context.path.join("addr_unit")),
-            (SysfsFeature::ContextPause, context.path.join("pause")),
-            (SysfsFeature::AttributeProbeCount, probes.join("nr_probes")),
-            (
-                SysfsFeature::SchemeApplyInterval,
-                scheme.path.join("apply_interval_us"),
-            ),
-        ] {
-            features.push(feature_capability(feature, support_for_path(&path)?));
-        }
-
-        for (feature, path) in [
-            (
-                SysfsFeature::ObsoleteTarget,
-                target.path.join("obsolete_target"),
-            ),
-            (
-                SysfsFeature::InitialRegions,
-                target.path.join("regions/nr_regions"),
-            ),
-        ] {
-            let support = if target_count == 0 {
-                CapabilitySupport::RequiresStaging
-            } else {
-                support_for_path(&path)?
-            };
-            features.push(feature_capability(feature, support));
-        }
+        let mut features = semantic_feature_capabilities(self, &context, &scheme, target_count)?;
 
         features.extend(probe_feature_capabilities(
             &context,
@@ -743,36 +988,76 @@ impl Kdamond {
             &probe_filter,
         )?);
 
-        let tried_regions = scheme.path.join("tried_regions");
-        features.push(feature_capability(
-            SysfsFeature::TriedRegions,
-            if path_is_dir(&tried_regions)? {
-                CapabilitySupport::Supported
-            } else {
-                CapabilitySupport::Unsupported
-            },
-        ));
-        features.push(feature_capability(
-            SysfsFeature::TriedRegionsTotalBytes,
-            support_for_path(&tried_regions.join("total_bytes"))?,
-        ));
-
         let operations = if feature_support(&features, SysfsFeature::AvailableOperations)
             == CapabilitySupport::Supported
         {
-            context.available_operations()?
+            listed_operation_capabilities(context.available_operations()?)
         } else {
-            vec![context.operation()?]
+            passive_operation_capabilities(context.operation()?)
         };
-        Ok(Capabilities {
+        let mut capabilities = Capabilities {
             operations: operations.into_boxed_slice(),
             features: features.into_boxed_slice(),
             attribute_paths: observed_attribute_paths(&self.path)?.into_boxed_slice(),
-        })
+        };
+        capabilities.sync_operation_features();
+        Ok(capabilities)
     }
 
     pub(crate) fn configuration_fingerprint(&self) -> Result<ConfigurationFingerprint> {
         capture_configuration(&self.path)
+    }
+
+    pub(crate) fn probe_operations(
+        &self,
+        context_index: usize,
+    ) -> Result<Vec<OperationCapability>> {
+        let context = self.context(context_index);
+        if let Some(operations) = context.available_operations_if_present()? {
+            return Ok(listed_operation_capabilities(operations));
+        }
+
+        let original = context.operation()?;
+        let mut operations = Vec::with_capacity(4);
+        if matches!(original, Operation::Unknown(_)) {
+            operations.push(operation_capability(
+                original.clone(),
+                CapabilitySupport::Unverified,
+            ));
+        }
+        let probe_result = (|| {
+            for candidate in [
+                Operation::VirtualAddress,
+                Operation::PhysicalAddress,
+                Operation::FixedVirtualAddress,
+            ] {
+                match context.set_operation(&candidate) {
+                    Ok(()) => {
+                        let support = if context.operation()? == candidate {
+                            CapabilitySupport::Unverified
+                        } else {
+                            CapabilitySupport::Unsupported
+                        };
+                        operations.push(operation_capability(candidate, support));
+                    }
+                    Err(error) if is_unsupported_value_write(&error) => operations.push(
+                        operation_capability(candidate, CapabilitySupport::Unsupported),
+                    ),
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(operations)
+        })();
+        let restore_result = context.set_operation(&original);
+        match (probe_result, restore_result) {
+            (Ok(operations), Ok(())) => Ok(operations),
+            (Err(operation), Ok(())) => Err(operation),
+            (Ok(_), Err(restore)) => Err(restore),
+            (Err(operation), Err(rollback)) => Err(Error::Rollback {
+                operation: Box::new(operation),
+                rollback: Box::new(rollback),
+            }),
+        }
     }
 
     pub(crate) fn stage_optional_capability_children(
@@ -796,6 +1081,325 @@ impl Kdamond {
         }
         Ok(())
     }
+
+    pub(crate) fn probe_semantic_filter_capabilities(
+        &self,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<Vec<FeatureCapability>> {
+        let context = self.context(context_index);
+        let scheme = context.scheme(scheme_index);
+        let scheme_filter_counts = [
+            scheme.path.join("filters/nr_filters"),
+            scheme.path.join("core_filters/nr_filters"),
+            scheme.path.join("ops_filters/nr_filters"),
+        ];
+        let mut scheme_filter_types = Vec::new();
+        for path in &scheme_filter_counts {
+            if path_exists(path)? {
+                scheme_filter_types.push(path.with_file_name("0").join("type"));
+            }
+        }
+        let mut capabilities = probe_accepted_values(
+            &scheme_filter_types,
+            &scheme_filter_counts,
+            &[
+                (SysfsFeature::SchemeFilterAnonymous, "anon"),
+                (SysfsFeature::SchemeFilterMemoryControlGroup, "memcg"),
+                (SysfsFeature::SchemeFilterAddress, "addr"),
+                (SysfsFeature::SchemeFilterTarget, "target"),
+                (SysfsFeature::SchemeFilterYoung, "young"),
+                (SysfsFeature::SchemeFilterHugePageSize, "hugepage_size"),
+                (SysfsFeature::SchemeFilterUnmapped, "unmapped"),
+                (SysfsFeature::SchemeFilterActive, "active"),
+            ],
+        )?;
+
+        let probe_filter_count = context
+            .path
+            .join("monitoring_attrs/probes/0/filters/nr_filters");
+        if path_exists(&probe_filter_count)? {
+            capabilities.extend(probe_accepted_values(
+                &[probe_filter_count.with_file_name("0").join("type")],
+                std::slice::from_ref(&probe_filter_count),
+                &[
+                    (SysfsFeature::ProbeTypeAnonymous, "anon"),
+                    (SysfsFeature::ProbeTypeMemoryControlGroup, "memcg"),
+                    (SysfsFeature::ProbeTypePageIdleUnset, "pgidle_unset"),
+                ],
+            )?);
+        }
+        Ok(capabilities)
+    }
+}
+
+fn semantic_feature_capabilities(
+    kdamond: &Kdamond,
+    context: &Context,
+    scheme: &Scheme,
+    target_count: usize,
+) -> Result<Vec<FeatureCapability>> {
+    let mut capabilities = context_semantic_capabilities(kdamond, context)?;
+    capabilities.extend(scheme_semantic_capabilities(scheme)?);
+    capabilities.extend(target_semantic_capabilities(context, target_count)?);
+    capabilities.extend(scheme_filter_capabilities(scheme)?);
+    capabilities.extend(quota_goal_capabilities(scheme)?);
+    capabilities.extend(probe_semantic_capabilities(context)?);
+    Ok(capabilities)
+}
+
+fn context_semantic_capabilities(
+    kdamond: &Kdamond,
+    context: &Context,
+) -> Result<Vec<FeatureCapability>> {
+    let probes = context.path.join("monitoring_attrs/probes/nr_probes");
+    let mut capabilities = [
+        SysfsFeature::VirtualAddressOperation,
+        SysfsFeature::PhysicalAddressOperation,
+        SysfsFeature::FixedVirtualAddressOperation,
+    ]
+    .into_iter()
+    .map(|feature| feature_capability(feature, CapabilitySupport::Unsupported))
+    .collect::<Vec<_>>();
+    capabilities.extend(path_feature_capabilities([
+        (
+            SysfsFeature::Schemes,
+            context.path.join("schemes/nr_schemes"),
+        ),
+        (
+            SysfsFeature::AvailableOperations,
+            context.path.join("avail_operations"),
+        ),
+        (
+            SysfsFeature::OnlineParametersCommit,
+            context.path.join("avail_operations"),
+        ),
+        (
+            SysfsFeature::PeriodicRefresh,
+            kdamond.path.join("refresh_ms"),
+        ),
+        (SysfsFeature::AddressUnit, context.path.join("addr_unit")),
+        (SysfsFeature::ContextPause, context.path.join("pause")),
+        (SysfsFeature::AttributeProbeCount, probes.clone()),
+        (SysfsFeature::AttributeMonitoring, probes),
+        (
+            SysfsFeature::MonitoringIntervalsGoal,
+            context
+                .path
+                .join("monitoring_attrs/intervals/intervals_goal/access_bp"),
+        ),
+        (
+            SysfsFeature::SampleControl,
+            context.path.join("monitoring_attrs/sample"),
+        ),
+        (
+            SysfsFeature::OperationAttributes,
+            context.path.join("operations_attrs"),
+        ),
+    ])?);
+    Ok(capabilities)
+}
+
+fn scheme_semantic_capabilities(scheme: &Scheme) -> Result<Vec<FeatureCapability>> {
+    let path = &scheme.path;
+    let quotas = path.join("quotas");
+    let stats = path.join("stats");
+    let tried_regions = path.join("tried_regions");
+    let mut capabilities = path_feature_capabilities([
+        (SysfsFeature::SchemeTimeQuota, quotas.join("ms")),
+        (SysfsFeature::SchemeSizeQuota, quotas.join("bytes")),
+        (
+            SysfsFeature::SchemePrioritization,
+            quotas.join("weights/sz_permil"),
+        ),
+        (
+            SysfsFeature::SchemeWatermarks,
+            path.join("watermarks/metric"),
+        ),
+        (
+            SysfsFeature::SchemeSuccessfulStats,
+            stats.join("nr_applied"),
+        ),
+        (
+            SysfsFeature::SchemeQuotaExceededStats,
+            stats.join("qt_exceeds"),
+        ),
+        (
+            SysfsFeature::SchemeApplyInterval,
+            path.join("apply_interval_us"),
+        ),
+        (
+            SysfsFeature::SchemeQuotaGoals,
+            quotas.join("goals/nr_goals"),
+        ),
+        (
+            SysfsFeature::SchemeQuotaEffectiveBytes,
+            quotas.join("effective_bytes"),
+        ),
+        (SysfsFeature::SchemeMigration, path.join("target_nid")),
+        (
+            SysfsFeature::SchemeDestinations,
+            path.join("dests/nr_dests"),
+        ),
+        (
+            SysfsFeature::SchemeOperationsFilterPassedBytes,
+            stats.join("sz_ops_filter_passed"),
+        ),
+        (
+            SysfsFeature::SchemeSnapshotCount,
+            stats.join("nr_snapshots"),
+        ),
+        (
+            SysfsFeature::SchemeMaximumSnapshotCount,
+            stats.join("max_nr_snapshots"),
+        ),
+        (
+            SysfsFeature::SchemeQuotaGoalTuner,
+            quotas.join("goal_tuner"),
+        ),
+        (
+            SysfsFeature::SchemeQuotaFailureChargeRatio,
+            quotas.join("fail_charge_denom"),
+        ),
+        (
+            SysfsFeature::TriedRegionsTotalBytes,
+            tried_regions.join("total_bytes"),
+        ),
+    ])?;
+    for (feature, directory) in [
+        (SysfsFeature::SchemeFilters, path.join("filters")),
+        (
+            SysfsFeature::SeparateSchemeFilterDirectories,
+            path.join("core_filters"),
+        ),
+        (SysfsFeature::TriedRegions, tried_regions),
+    ] {
+        capabilities.push(feature_capability(
+            feature,
+            support_for_directory(&directory)?,
+        ));
+    }
+    Ok(capabilities)
+}
+
+fn target_semantic_capabilities(
+    context: &Context,
+    target_count: usize,
+) -> Result<Vec<FeatureCapability>> {
+    let target = context.target(0);
+    let support = |path: PathBuf| {
+        if target_count == 0 {
+            Ok(CapabilitySupport::RequiresStaging)
+        } else {
+            support_for_path(&path)
+        }
+    };
+    Ok(vec![
+        feature_capability(
+            SysfsFeature::InitialRegions,
+            support(target.path.join("regions/nr_regions"))?,
+        ),
+        feature_capability(
+            SysfsFeature::ObsoleteTarget,
+            support(target.path.join("obsolete_target"))?,
+        ),
+    ])
+}
+
+fn scheme_filter_capabilities(scheme: &Scheme) -> Result<Vec<FeatureCapability>> {
+    let filters = scheme.path.join("filters");
+    let core_filters = scheme.path.join("core_filters");
+    let ops_filters = scheme.path.join("ops_filters");
+    let support = filter_value_support(&[&filters, &core_filters, &ops_filters])?;
+    let mut capabilities = [
+        SysfsFeature::SchemeFilterAnonymous,
+        SysfsFeature::SchemeFilterMemoryControlGroup,
+        SysfsFeature::SchemeFilterAddress,
+        SysfsFeature::SchemeFilterTarget,
+        SysfsFeature::SchemeFilterYoung,
+        SysfsFeature::SchemeFilterHugePageSize,
+        SysfsFeature::SchemeFilterUnmapped,
+        SysfsFeature::SchemeFilterActive,
+    ]
+    .into_iter()
+    .map(|feature| feature_capability(feature, support))
+    .collect::<Vec<_>>();
+    capabilities.push(feature_capability(
+        SysfsFeature::SchemeFilterAllow,
+        indexed_attribute_support(&[
+            (
+                &ops_filters.join("nr_filters"),
+                &ops_filters.join("0/allow"),
+            ),
+            (&filters.join("nr_filters"), &filters.join("0/allow")),
+        ])?,
+    ));
+    Ok(capabilities)
+}
+
+fn quota_goal_capabilities(scheme: &Scheme) -> Result<Vec<FeatureCapability>> {
+    let quotas = scheme.path.join("quotas");
+    let goals = quotas.join("goals");
+    let goal = goals.join("0");
+    let goal_support = indexed_child_support(&goals.join("nr_goals"), &goal)?;
+    let effective_quotas = support_for_path(&quotas.join("effective_bytes"))?;
+    let max_snapshots = support_for_path(&scheme.path.join("stats/max_nr_snapshots"))?;
+    let failure_charge = support_for_path(&quotas.join("fail_charge_denom"))?;
+    Ok(vec![
+        feature_capability(SysfsFeature::SchemeQuotaGoalMetric, effective_quotas),
+        feature_capability(SysfsFeature::SchemeQuotaGoalSomePsi, effective_quotas),
+        feature_capability(
+            SysfsFeature::SchemeQuotaGoalNodeMemory,
+            child_attribute_support(goal_support, &goal.join("nid"))?,
+        ),
+        feature_capability(
+            SysfsFeature::SchemeQuotaGoalNodeMemoryControlGroup,
+            child_attribute_support(goal_support, &goal.join("path"))?,
+        ),
+        feature_capability(SysfsFeature::SchemeQuotaGoalActiveMemory, max_snapshots),
+        feature_capability(
+            SysfsFeature::SchemeQuotaGoalNodeEligibleMemory,
+            failure_charge,
+        ),
+        feature_capability(SysfsFeature::CollapseAction, failure_charge),
+    ])
+}
+
+fn probe_semantic_capabilities(context: &Context) -> Result<Vec<FeatureCapability>> {
+    let probes = context.path.join("monitoring_attrs/probes");
+    let probe = probes.join("0");
+    let probe_support = indexed_child_support(&probes.join("nr_probes"), &probe)?;
+    let filter_support = if probe_support == CapabilitySupport::Supported {
+        indexed_child_support(&probe.join("filters/nr_filters"), &probe.join("filters/0"))?
+    } else {
+        probe_support
+    };
+    let prep_support = if probe_support == CapabilitySupport::Supported {
+        support_for_directory(&probe.join("preps"))?
+    } else {
+        probe_support
+    };
+    Ok(vec![
+        feature_capability(SysfsFeature::ProbeTypeAnonymous, filter_support),
+        feature_capability(SysfsFeature::ProbeTypeMemoryControlGroup, filter_support),
+        feature_capability(
+            SysfsFeature::ProbeWeight,
+            child_attribute_support(probe_support, &probe.join("weight"))?,
+        ),
+        feature_capability(SysfsFeature::ProbePreparations, prep_support),
+        feature_capability(SysfsFeature::ProbePreparationSetPageIdle, prep_support),
+        feature_capability(SysfsFeature::ProbeTypePageIdleUnset, prep_support),
+    ])
+}
+
+fn path_feature_capabilities(
+    features: impl IntoIterator<Item = (SysfsFeature, PathBuf)>,
+) -> Result<Vec<FeatureCapability>> {
+    let mut capabilities = Vec::new();
+    for (feature, path) in features {
+        capabilities.push(feature_capability(feature, support_for_path(&path)?));
+    }
+    Ok(capabilities)
 }
 
 fn probe_feature_capabilities(
@@ -807,6 +1411,7 @@ fn probe_feature_capabilities(
     let probe_filter_count_support = match probe_count_support {
         CapabilitySupport::Unsupported => CapabilitySupport::Unsupported,
         CapabilitySupport::RequiresStaging => CapabilitySupport::RequiresStaging,
+        CapabilitySupport::Unverified => CapabilitySupport::Unverified,
         CapabilitySupport::Supported if context.probe_count()? == 0 => {
             CapabilitySupport::RequiresStaging
         }
@@ -820,6 +1425,7 @@ fn probe_feature_capabilities(
     let attribute_support = match probe_filter_count_support {
         CapabilitySupport::Unsupported => CapabilitySupport::Unsupported,
         CapabilitySupport::RequiresStaging => CapabilitySupport::RequiresStaging,
+        CapabilitySupport::Unverified => CapabilitySupport::Unverified,
         CapabilitySupport::Supported if context.probe(0).filter_count()? == 0 => {
             CapabilitySupport::RequiresStaging
         }
@@ -1402,6 +2008,115 @@ fn is_kernel_ulong_width_error(error: &Error) -> bool {
     )
 }
 
+fn is_unsupported_value_write(error: &Error) -> bool {
+    const LINUX_EINVAL: i32 = 22;
+
+    matches!(
+        error,
+        Error::Io { source, .. } if source.raw_os_error() == Some(LINUX_EINVAL)
+    )
+}
+
+fn operation_capability(operation: Operation, support: CapabilitySupport) -> OperationCapability {
+    OperationCapability { operation, support }
+}
+
+fn known_operations() -> [Operation; 3] {
+    [
+        Operation::VirtualAddress,
+        Operation::PhysicalAddress,
+        Operation::FixedVirtualAddress,
+    ]
+}
+
+fn listed_operation_capabilities(available: Vec<Operation>) -> Vec<OperationCapability> {
+    let mut capabilities = known_operations()
+        .into_iter()
+        .map(|operation| {
+            let support = if available.contains(&operation) {
+                CapabilitySupport::Supported
+            } else {
+                CapabilitySupport::Unsupported
+            };
+            operation_capability(operation, support)
+        })
+        .collect::<Vec<_>>();
+    capabilities.extend(
+        available
+            .into_iter()
+            .filter(|operation| matches!(operation, Operation::Unknown(_)))
+            .map(|operation| operation_capability(operation, CapabilitySupport::Supported)),
+    );
+    capabilities
+}
+
+fn passive_operation_capabilities(selected: Operation) -> Vec<OperationCapability> {
+    let mut capabilities = known_operations()
+        .into_iter()
+        .map(|operation| {
+            let support = if operation == selected {
+                CapabilitySupport::Unverified
+            } else {
+                CapabilitySupport::RequiresStaging
+            };
+            operation_capability(operation, support)
+        })
+        .collect::<Vec<_>>();
+    if matches!(selected, Operation::Unknown(_)) {
+        capabilities.push(operation_capability(
+            selected,
+            CapabilitySupport::Unverified,
+        ));
+    }
+    capabilities
+}
+
+fn probe_accepted_values(
+    value_paths: &[PathBuf],
+    reset_count_paths: &[PathBuf],
+    candidates: &[(SysfsFeature, &str)],
+) -> Result<Vec<FeatureCapability>> {
+    let probe_result = (|| {
+        let mut capabilities = Vec::with_capacity(candidates.len());
+        for &(feature, value) in candidates {
+            let mut support = CapabilitySupport::Unsupported;
+            for path in value_paths {
+                if !path_exists(path)? {
+                    continue;
+                }
+                match write_bytes(path, value.as_bytes()) {
+                    Ok(()) if read_text(path)?.trim() == value => {
+                        support = CapabilitySupport::Supported;
+                        break;
+                    }
+                    Ok(()) => {}
+                    Err(error) if is_unsupported_value_write(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            capabilities.push(feature_capability(feature, support));
+        }
+        Ok(capabilities)
+    })();
+    let restore_result = (|| {
+        for path in reset_count_paths {
+            if path_exists(path)? {
+                write_value(path, 1_u8)?;
+            }
+        }
+        Ok(())
+    })();
+    match (probe_result, restore_result) {
+        (Ok(capabilities), Ok(())) => Ok(capabilities),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(restore)) => Err(restore),
+        (Err(operation), Err(rollback)) => Err(Error::Rollback {
+            operation: Box::new(operation),
+            rollback: Box::new(rollback),
+        }),
+    }
+}
+
 fn path_exists(path: &Path) -> Result<bool> {
     #[cfg(test)]
     if let Some(result) = test_backend::path_exists(path) {
@@ -1566,6 +2281,74 @@ fn support_for_path(path: &Path) -> Result<CapabilitySupport> {
     }
 }
 
+fn support_for_directory(path: &Path) -> Result<CapabilitySupport> {
+    if path_is_dir(path)? {
+        Ok(CapabilitySupport::Supported)
+    } else {
+        Ok(CapabilitySupport::Unsupported)
+    }
+}
+
+fn indexed_attribute_support(paths: &[(&Path, &Path)]) -> Result<CapabilitySupport> {
+    let mut needs_staging = false;
+    for &(count_path, attribute) in paths {
+        if path_exists(attribute)? {
+            return Ok(CapabilitySupport::Supported);
+        }
+        if path_exists(count_path)? && read_usize(count_path)? == 0 {
+            needs_staging = true;
+        }
+    }
+    if needs_staging {
+        return Ok(CapabilitySupport::RequiresStaging);
+    }
+    Ok(CapabilitySupport::Unsupported)
+}
+
+fn indexed_child_support(count_path: &Path, child: &Path) -> Result<CapabilitySupport> {
+    if !path_exists(count_path)? {
+        return Ok(CapabilitySupport::Unsupported);
+    }
+    if read_usize(count_path)? == 0 {
+        return Ok(CapabilitySupport::RequiresStaging);
+    }
+    support_for_directory(child)
+}
+
+fn child_attribute_support(
+    child_support: CapabilitySupport,
+    attribute: &Path,
+) -> Result<CapabilitySupport> {
+    if child_support == CapabilitySupport::Supported {
+        support_for_path(attribute)
+    } else {
+        Ok(child_support)
+    }
+}
+
+fn filter_value_support(filter_directories: &[&Path]) -> Result<CapabilitySupport> {
+    let mut unstaged_child = false;
+    for directory in filter_directories {
+        if !path_is_dir(directory)? {
+            continue;
+        }
+        let count_path = directory.join("nr_filters");
+        if !path_exists(&count_path)? {
+            continue;
+        }
+        if read_usize(&count_path)? == 0 {
+            unstaged_child = true;
+        } else if path_exists(&directory.join("0/type"))? {
+            return Ok(CapabilitySupport::Unverified);
+        }
+    }
+    if unstaged_child {
+        Ok(CapabilitySupport::RequiresStaging)
+    } else {
+        Ok(CapabilitySupport::Unsupported)
+    }
+}
+
 const fn feature_capability(
     feature: SysfsFeature,
     support: CapabilitySupport,
@@ -1580,6 +2363,19 @@ fn feature_support(capabilities: &[FeatureCapability], feature: SysfsFeature) ->
         .map_or(CapabilitySupport::Unsupported, |capability| {
             capability.support
         })
+}
+
+fn set_feature_support(
+    capabilities: &mut [FeatureCapability],
+    feature: SysfsFeature,
+    support: CapabilitySupport,
+) {
+    if let Some(capability) = capabilities
+        .iter_mut()
+        .find(|capability| capability.feature == feature)
+    {
+        capability.support = support;
+    }
 }
 
 fn read_text(path: &Path) -> Result<String> {
@@ -1887,6 +2683,10 @@ pub(crate) mod test_backend {
     struct State {
         nodes: BTreeMap<PathBuf, Node>,
         available_operations: Vec<u8>,
+        recognized_operations: Vec<u8>,
+        expose_available_operations: bool,
+        supported_scheme_filter_types: Vec<u8>,
+        supported_probe_filter_types: Vec<u8>,
         active_files: Option<BTreeMap<PathBuf, Vec<u8>>>,
         next_kdamond_pid: u32,
         tried_regions: Vec<ModelRegion>,
@@ -1896,10 +2696,19 @@ pub(crate) mod test_backend {
     }
 
     impl State {
-        fn new(available_operations: &str) -> Self {
+        fn new(
+            available_operations: &str,
+            recognized_operations: &str,
+            expose_available_operations: bool,
+        ) -> Self {
             let mut state = Self {
                 nodes: BTreeMap::new(),
                 available_operations: available_operations.as_bytes().to_vec(),
+                recognized_operations: recognized_operations.as_bytes().to_vec(),
+                expose_available_operations,
+                supported_scheme_filter_types:
+                    b"anon\nmemcg\nyoung\naddr\ntarget\nhugepage_size\nunmapped\nactive\n".to_vec(),
+                supported_probe_filter_types: b"anon\nmemcg\n".to_vec(),
                 active_files: None,
                 next_kdamond_pid: 10_000,
                 tried_regions: Vec::new(),
@@ -1954,8 +2763,10 @@ pub(crate) mod test_backend {
         fn create_context(&mut self, base: &Path, index: usize) {
             let base = base.join(index.to_string());
             self.directory(&base);
-            let operations = self.available_operations.clone();
-            self.file(base.join("avail_operations"), &operations);
+            if self.expose_available_operations {
+                let operations = self.available_operations.clone();
+                self.file(base.join("avail_operations"), &operations);
+            }
             self.file(base.join("operations"), b"vaddr\n");
             self.file(base.join("addr_unit"), b"1\n");
             self.file(base.join("pause"), b"N\n");
@@ -2340,7 +3151,17 @@ pub(crate) mod test_backend {
             }
         }
 
-        fn start_kdamond(&mut self, kdamond: &Path) {
+        fn start_kdamond(&mut self, kdamond: &Path) -> io::Result<()> {
+            let operations = kdamond.join("contexts/0/operations");
+            let selected = match self.nodes.get(&operations) {
+                Some(Node::File(value)) => std::str::from_utf8(value)
+                    .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?
+                    .trim(),
+                _ => return Err(io::Error::from_raw_os_error(22)),
+            };
+            if !listed_value_contains(&self.available_operations, selected) {
+                return Err(io::Error::from_raw_os_error(22));
+            }
             self.capture_active_files();
             self.next_kdamond_pid += 1;
             self.file(kdamond.join("state"), b"on\n");
@@ -2348,6 +3169,7 @@ pub(crate) mod test_backend {
                 kdamond.join("pid"),
                 format!("{}\n", self.next_kdamond_pid).as_bytes(),
             );
+            Ok(())
         }
 
         fn write_state(&mut self, path: &Path, value: &[u8]) -> io::Result<()> {
@@ -2367,7 +3189,7 @@ pub(crate) mod test_backend {
                     if matches!(self.nodes.get(path), Some(Node::File(value)) if value == b"on\n") {
                         return Err(io::Error::from_raw_os_error(16));
                     }
-                    self.start_kdamond(kdamond);
+                    self.start_kdamond(kdamond)?;
                 }
                 "off" => {
                     if self.active_files.is_none() {
@@ -2444,6 +3266,36 @@ pub(crate) mod test_backend {
                 return self.write_state(path, value);
             }
 
+            if path.file_name().is_some_and(|name| name == "operations") {
+                let requested = std::str::from_utf8(value)
+                    .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?
+                    .trim();
+                if !listed_value_contains(&self.recognized_operations, requested) {
+                    return Err(io::Error::from_raw_os_error(22));
+                }
+            }
+
+            if path.file_name().is_some_and(|name| name == "type") {
+                let requested = std::str::from_utf8(value)
+                    .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?
+                    .trim();
+                let path_text = path.to_string_lossy();
+                let supported = if path_text.contains("/monitoring_attrs/probes/") {
+                    listed_value_contains(&self.supported_probe_filter_types, requested)
+                } else if path_text.contains("/schemes/")
+                    && (path_text.contains("/filters/")
+                        || path_text.contains("/core_filters/")
+                        || path_text.contains("/ops_filters/"))
+                {
+                    listed_value_contains(&self.supported_scheme_filter_types, requested)
+                } else {
+                    true
+                };
+                if !supported {
+                    return Err(io::Error::from_raw_os_error(22));
+                }
+            }
+
             if path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -2469,7 +3321,9 @@ pub(crate) mod test_backend {
                 match mutation {
                     Mutation::SetFile { path, value } => self.file(path, &value),
                     Mutation::RemoveTree { path } => self.remove_tree(&path),
-                    Mutation::StartKdamond { path } => self.start_kdamond(&path),
+                    Mutation::StartKdamond { path } => self
+                        .start_kdamond(&path)
+                        .expect("modeled external kdamond start must be valid"),
                 }
             }
         }
@@ -2483,13 +3337,36 @@ pub(crate) mod test_backend {
 
     impl Model {
         pub(crate) fn new(available_operations: &str) -> Self {
+            Self::with_operation_sets(available_operations, available_operations, true)
+        }
+
+        pub(crate) fn without_available_operations_file(available_operations: &str) -> Self {
+            Self::with_operation_sets(available_operations, available_operations, false)
+        }
+
+        pub(crate) fn with_legacy_operation_sets(
+            available_operations: &str,
+            recognized_operations: &str,
+        ) -> Self {
+            Self::with_operation_sets(available_operations, recognized_operations, false)
+        }
+
+        fn with_operation_sets(
+            available_operations: &str,
+            recognized_operations: &str,
+            expose_available_operations: bool,
+        ) -> Self {
             static NEXT_MODEL: AtomicU64 = AtomicU64::new(0);
             let root = PathBuf::from(format!(
                 "/__damon_rs_model/{}-{}",
                 std::process::id(),
                 NEXT_MODEL.fetch_add(1, Ordering::Relaxed)
             ));
-            let state = Arc::new(Mutex::new(State::new(available_operations)));
+            let state = Arc::new(Mutex::new(State::new(
+                available_operations,
+                recognized_operations,
+                expose_available_operations,
+            )));
             registry()
                 .lock()
                 .expect("test backend registry lock poisoned")
@@ -2511,6 +3388,14 @@ pub(crate) mod test_backend {
 
         pub(crate) fn set_effective_quota_bytes(&self, quotas: Vec<u64>) {
             lock(&self.state).effective_quota_bytes = quotas;
+        }
+
+        pub(crate) fn set_supported_scheme_filter_types(&self, types: &str) {
+            lock(&self.state).supported_scheme_filter_types = types.as_bytes().to_vec();
+        }
+
+        pub(crate) fn set_supported_probe_filter_types(&self, types: &str) {
+            lock(&self.state).supported_probe_filter_types = types.as_bytes().to_vec();
         }
 
         pub(crate) fn active_value(&self, path: impl AsRef<Path>) -> Option<String> {
@@ -2550,6 +3435,14 @@ pub(crate) mod test_backend {
 
     fn lock(state: &Arc<Mutex<State>>) -> MutexGuard<'_, State> {
         state.lock().expect("test backend state lock poisoned")
+    }
+
+    fn listed_value_contains(values: &[u8], requested: &str) -> bool {
+        std::str::from_utf8(values)
+            .expect("modeled capability values are UTF-8")
+            .lines()
+            .map(str::trim)
+            .any(|value| value == requested)
     }
 
     fn resolve(path: &Path) -> Option<(Arc<Mutex<State>>, PathBuf)> {
@@ -2691,6 +3584,173 @@ mod tests {
             "update_schemes_tried_regions"
         );
         assert_eq!(Action::LruDeprioritize.kernel_name(), "lru_deprio");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn semantic_features_match_the_official_damo_sysfs_map() {
+        let expected = [
+            (SysfsFeature::VirtualAddressOperation, "sysfs/vaddr"),
+            (SysfsFeature::SchemeTimeQuota, "sysfs/schemes_time_quota"),
+            (SysfsFeature::PhysicalAddressOperation, "sysfs/paddr"),
+            (SysfsFeature::InitialRegions, "sysfs/init_regions"),
+            (SysfsFeature::Schemes, "sysfs/schemes"),
+            (
+                SysfsFeature::SchemeSuccessfulStats,
+                "sysfs/schemes_stat_succ",
+            ),
+            (SysfsFeature::SchemeSizeQuota, "sysfs/schemes_size_quota"),
+            (
+                SysfsFeature::SchemeQuotaExceededStats,
+                "sysfs/schemes_stat_qt_exceed",
+            ),
+            (SysfsFeature::SchemeWatermarks, "sysfs/schemes_wmarks"),
+            (
+                SysfsFeature::SchemePrioritization,
+                "sysfs/schemes_prioritization",
+            ),
+            (SysfsFeature::AvailableOperations, "sysfs/avail_ops"),
+            (SysfsFeature::FixedVirtualAddressOperation, "sysfs/fvaddr"),
+            (
+                SysfsFeature::OnlineParametersCommit,
+                "sysfs/online_params_commit",
+            ),
+            (SysfsFeature::TriedRegions, "sysfs/schemes_tried_regions"),
+            (SysfsFeature::SchemeFilters, "sysfs/schemes_filters"),
+            (
+                SysfsFeature::SchemeFilterAnonymous,
+                "sysfs/schemes_filters_anon",
+            ),
+            (
+                SysfsFeature::SchemeFilterMemoryControlGroup,
+                "sysfs/schemes_filters_memcg",
+            ),
+            (
+                SysfsFeature::TriedRegionsTotalBytes,
+                "sysfs/schemes_tried_regions_sz",
+            ),
+            (
+                SysfsFeature::SchemeFilterAddress,
+                "sysfs/schemes_filters_addr",
+            ),
+            (
+                SysfsFeature::SchemeFilterTarget,
+                "sysfs/schemes_filters_target",
+            ),
+            (
+                SysfsFeature::SchemeApplyInterval,
+                "sysfs/schemes_apply_interval",
+            ),
+            (SysfsFeature::SchemeQuotaGoals, "sysfs/schemes_quota_goals"),
+            (
+                SysfsFeature::SchemeQuotaEffectiveBytes,
+                "sysfs/schemes_quota_effective_bytes",
+            ),
+            (
+                SysfsFeature::SchemeQuotaGoalMetric,
+                "sysfs/schemes_quota_goal_metric",
+            ),
+            (
+                SysfsFeature::SchemeQuotaGoalSomePsi,
+                "sysfs/schemes_quota_goal_some_psi",
+            ),
+            (
+                SysfsFeature::SchemeFilterYoung,
+                "sysfs/schemes_filters_young",
+            ),
+            (SysfsFeature::SchemeMigration, "sysfs/schemes_migrate"),
+            (
+                SysfsFeature::SchemeOperationsFilterPassedBytes,
+                "sysfs/sz_ops_filter_passed",
+            ),
+            (SysfsFeature::SchemeFilterAllow, "sysfs/allow_filter"),
+            (
+                SysfsFeature::SchemeFilterHugePageSize,
+                "sysfs/schemes_filters_hugepage_size",
+            ),
+            (
+                SysfsFeature::SchemeFilterUnmapped,
+                "sysfs/schemes_filters_unmapped",
+            ),
+            (
+                SysfsFeature::MonitoringIntervalsGoal,
+                "sysfs/intervals_goal",
+            ),
+            (
+                SysfsFeature::SeparateSchemeFilterDirectories,
+                "sysfs/schemes_filters_core_ops_dirs",
+            ),
+            (
+                SysfsFeature::SchemeFilterActive,
+                "sysfs/schemes_filters_active",
+            ),
+            (
+                SysfsFeature::SchemeQuotaGoalNodeMemory,
+                "sysfs/schemes_quota_goal_node_mem_used_free",
+            ),
+            (SysfsFeature::SchemeDestinations, "sysfs/schemes_dests"),
+            (SysfsFeature::PeriodicRefresh, "sysfs/refresh_ms"),
+            (SysfsFeature::AddressUnit, "sysfs/addr_unit"),
+            (
+                SysfsFeature::SchemeQuotaGoalNodeMemoryControlGroup,
+                "sysfs/schemes_quota_goal_node_memcg_used_free",
+            ),
+            (SysfsFeature::ObsoleteTarget, "sysfs/obsolete_target"),
+            (
+                SysfsFeature::SchemeSnapshotCount,
+                "sysfs/damos_stat_nr_snapshots",
+            ),
+            (
+                SysfsFeature::SchemeMaximumSnapshotCount,
+                "sysfs/damos_max_nr_snapshots",
+            ),
+            (
+                SysfsFeature::SchemeQuotaGoalActiveMemory,
+                "sysfs/damos_quota_goal_in_active_mem_bp",
+            ),
+            (
+                SysfsFeature::SchemeQuotaGoalTuner,
+                "sysfs/damos_quota_goal_tuner",
+            ),
+            (SysfsFeature::CollapseAction, "sysfs/damos_action_collapse"),
+            (
+                SysfsFeature::SchemeQuotaGoalNodeEligibleMemory,
+                "sysfs/damos_quota_goal_node_eligible_mem_bp",
+            ),
+            (SysfsFeature::ContextPause, "sysfs/ctx_pause"),
+            (
+                SysfsFeature::SchemeQuotaFailureChargeRatio,
+                "sysfs/damos_quota_fail_charge_ratio",
+            ),
+            (SysfsFeature::AttributeMonitoring, "sysfs/attrs_monitoring"),
+            (SysfsFeature::ProbeTypeAnonymous, "sysfs/probe_type_anon"),
+            (
+                SysfsFeature::ProbeTypeMemoryControlGroup,
+                "sysfs/probe_type_memcg",
+            ),
+            (SysfsFeature::ProbeWeight, "sysfs/probe_weights"),
+            (SysfsFeature::ProbePreparations, "sysfs/probe_preps"),
+            (
+                SysfsFeature::ProbePreparationSetPageIdle,
+                "sysfs/probe_prep_set_pgidle",
+            ),
+            (
+                SysfsFeature::ProbeTypePageIdleUnset,
+                "sysfs/probe_type_pgidle_unset",
+            ),
+            (SysfsFeature::SampleControl, "sysfs/damon_sample_control"),
+            (SysfsFeature::OperationAttributes, "sysfs/ops_attrs"),
+        ];
+
+        assert_eq!(expected.len(), 57);
+        let names = expected
+            .iter()
+            .map(|(feature, expected_name)| {
+                assert_eq!(feature.damo_name(), Some(*expected_name));
+                *expected_name
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names.len(), expected.len());
     }
 
     #[test]

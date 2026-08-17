@@ -76,6 +76,9 @@ simple file. Query-style retrieval uses DAMOS tried regions:
 Kernels with tried-region queries but no `total_bytes` file are supported by
 summing the validated materialized region sizes in userspace. This matches the
 compatibility distinction made by the official `damo` implementation.
+Kernels predating tried-region queries can still start and stop a high-level
+monitor. Only `Monitor::snapshot()` reports that the optional query facility is
+unsupported.
 
 The command can wait until the next scheme apply interval. A zero
 `apply_interval_us` uses the aggregation interval. `nr_accesses` is a count per
@@ -139,11 +142,19 @@ regions. The crate uses the same defaults.
 ## Compatibility policy
 
 The ABI grows over time, so known operation and action names are typed while
-unknown names are preserved. Each `SysfsFeature` is detected from its concrete
-file or directory. Paths below an unstaged probe or filter are reported as
-`CapabilitySupport::RequiresStaging`, distinct from `Unsupported`. This keeps
-the non-mutating Rust query honest while following the same concrete-path
-principle used by official `damo`, whose exhaustive probe temporarily stages
+unknown names are preserved. `SysfsFeature` covers all 57 sysfs capability
+names in the audited official `damo` map. `SysfsFeature::damo_name()` and
+`Capabilities::damo_feature_support()` provide the exact name mapping. The
+crate also retains finer-grained path capabilities for its typed low-level
+surface.
+
+Capability results distinguish four states. `Supported` means the relevant
+path, authoritative operation listing, or accepted semantic value confirmed
+support. `Unsupported` records a confirmed absence or rejection.
+`RequiresStaging` means an indexed child must first be materialized.
+`Unverified` means the visible ABI suggests support but a non-mutating query
+cannot prove semantic usability. This keeps the passive Rust query honest
+while following official `damo`, whose exhaustive probe temporarily stages
 representative children and restores the saved configuration.
 
 `Damon::capabilities()` provides the mutating equivalent under the crate's
@@ -151,8 +162,19 @@ advisory lock. It requires an empty hierarchy, stages representative targets,
 regions, schemes, quota goals, filters, destinations, probes, and probe
 filters, captures a sorted relative path inventory, and then restores zero
 kdamonds. It does not overwrite an existing configuration. The passive query
-falls back to the selected operation when `avail_operations` is absent, which
-supports older kernels without claiming that unobserved operations exist.
+reports the selected operation as unverified when `avail_operations` is
+absent. The exclusive query tests `vaddr`, `paddr`, and `fvaddr` writes and
+restores the original selection. Linux 5.18 accepts recognized operation names
+without checking whether the implementation is registered, so accepted legacy
+writes remain `Unverified`. Only `avail_operations` or a successful high-level
+start upgrades an operation to `Supported`.
+
+The exclusive query also writes candidate DAMOS and monitoring-probe filter
+types into representative children, verifies readback, and reconstructs the
+children to restore their defaults. This distinguishes semantic support such
+as `young`, `addr`, `active`, `anon`, and `memcg` from mere presence of a shared
+`type` file. Other official `damo` capability relationships use the same
+concrete attribute evidence as the upstream tool.
 
 DAMON uses the kernel's `unsigned long` for several values. Userspace pointer
 width does not reveal kernel width when a 32-bit process controls a 64-bit
@@ -168,3 +190,9 @@ monitoring probes are absent and tried-region indexes can be sparse. Kernel
 validation selects behavior from concrete attributes and accepted writes, not
 from `uname`. Kernel-backed VM tests across maintained LTS releases remain
 necessary before declaring a broad support matrix.
+
+This capability-discovery parity claim applies to official `damo`'s admin-sysfs
+backend. It does not claim that this crate implements every feature represented
+by the capability map. `damo` also contains a legacy debugfs backend for
+systems without admin sysfs. Supporting that separate ABI would require
+another crate backend and is not implied by sysfs capability parity.
