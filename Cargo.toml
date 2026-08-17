@@ -1,0 +1,45 @@
+[package]
+name = "damon"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["damon-rs contributors"]
+description = "A safe, typed Rust interface to Linux DAMON"
+documentation = "https://docs.rs/damon"
+repository = "https://github.com/tramasys/damon-rs"
+license = "MIT"
+readme = "README.md"
+keywords = ["damon", "linux", "memory", "monitoring", "sysfs"]
+categories = ["api-bindings", "os::linux-apis"]
+include = [
+    "src/**/*.rs",
+    "tests/**/*.rs",
+    "docs/**/*.md",
+    "Cargo.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE-MIT",
+]
+
+[lib]
+name = "damon"
+path = "src/lib.rs"
+
+[lints.rust]
+missing_docs = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+struct_excessive_bools = "allow"
+struct_field_names = "allow"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
