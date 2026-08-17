@@ -12,6 +12,14 @@ Versioning and the Keep a Changelog structure.
 - High-level single-PID virtual-address monitoring lifecycle.
 - Query snapshots backed by a match-all DAMOS `stat` scheme.
 - Strict CI, MSRV checks, package verification, and dependency policy.
+- Indexed probe results that preserve sparse kernel directory numbers without
+  imposing the current kernel's probe-count limit on the public API.
+- Independent reported and materialized snapshot totals with completeness
+  reporting.
+- Exclusive capability probing that temporarily stages representative indexed
+  children and restores an empty hierarchy.
+- A sorted concrete-attribute inventory that preserves paths unknown to this
+  crate version.
 
 ### Changed
 
@@ -41,8 +49,8 @@ Versioning and the Keep a Changelog structure.
 - Exercise lifecycle behavior with an internal sysfs state-machine backend,
   including staged and active inputs, directory reconstruction, kernel-thread
   identity transitions, and deterministic race hooks.
-- Fingerprint Linux 7.2 pause, probe, initial-region, interval-goal, quota,
-  watermark, filter, destination, and other auxiliary session inputs.
+- Fingerprint every writable configuration attribute materialized by the
+  running kernel while excluding command and result files.
 - Remove the unlocked low-level handle from the high-level `Damon` entry point.
 - Represent scaled regions as allocation-free borrowed views over one owned raw
   snapshot.
@@ -50,7 +58,12 @@ Versioning and the Keep a Changelog structure.
   according to the kernel state machine.
 - Run documentation tests explicitly in CI.
 - Disable and verify periodic sysfs refresh for exclusively owned sessions.
-- Verify auxiliary ownership values without rebuilding or allocating a new
-  fingerprint on each check.
+- Verify captured ownership values with streaming comparisons without
+  rebuilding or allocating a new fingerprint on each check.
 - Match Linux state-transition errors, scheme defaults, and indexed quota,
   filter, and destination layouts in the modeled sysfs backend.
+- Stage optional default-valued attributes only when the running kernel exposes
+  them, including refresh, address unit, pause, probes, obsolete targets,
+  initial regions, and scheme apply intervals.
+- Parse tried-region and probe directories by numerically sorting the entries
+  that actually exist instead of stopping at the first missing index.

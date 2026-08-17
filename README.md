@@ -13,13 +13,15 @@ human-facing [`damo`](https://github.com/damonitor/damo) tool.
 - Linux DAMON admin sysfs (`/sys/kernel/mm/damon/admin`)
 - Virtual-address monitoring of one PID
 - Typed process IDs, intervals, region bounds, operations, actions, and errors
-- Runtime operation and tri-state feature discovery
+- Passive tri-state feature discovery and exclusive staged discovery
+- A sorted inventory of concrete attributes, including unknown future paths
 - Advisory session locking, ownership rechecks, rollback, and cleanup
 - Query snapshots through a match-all `stat` DAMOS scheme
 - Raw low-level DAMON snapshots with explicit effective-unit attachment and
   checked high-level byte conversions
 - Allocation-free scaled region views over the raw snapshot storage
-- Per-probe hit counters in tried-region snapshots
+- Sparse numeric tried-region and per-probe result parsing
+- Independent reported and materialized snapshot totals
 - A public low-level `sysfs` module for specialized callers
 - No unsafe code and one direct Linux-only syscall dependency
 
@@ -38,15 +40,18 @@ CONFIG_DAMON_SYSFS=y
 
 Access to the admin hierarchy generally requires elevated privileges. The
 high-level API takes an advisory lock at `/run/lock/damon-rs.lock`, then starts
-only when `nr_kdamonds` is zero. It fingerprints the Linux 7.2 staged settings
-that can affect monitoring and the running kdamond thread before destructive
-operations. The kernel ABI is global and has no ownership or transaction
-primitive, so tools that ignore the lock can still race. Serialize `damo` and
-other controllers externally on the same lock, or through another system-wide
-coordination mechanism.
+only when `nr_kdamonds` is zero. It fingerprints the writable configuration
+that the running kernel actually materializes and the running kdamond thread
+before destructive operations, including unknown future input attributes. The
+kernel ABI is global and has no ownership or transaction primitive, so tools
+that ignore the lock can still race. Serialize `damo` and other controllers
+externally on the same lock, or through another system-wide coordination
+mechanism.
 
-The ABI foundation was verified against Linux 7.2. Capabilities are discovered
-from sysfs instead of inferred solely from a kernel version. See
+The ABI foundation is source-audited against Linux 7.2 and live-tested against
+Linux 7.1. Capabilities are discovered from sysfs instead of inferred from a
+kernel version. Optional attributes whose absence has the same legacy default
+behavior are written only when present. See
 [`docs/kernel-abi.md`](docs/kernel-abi.md) for the exact source audit.
 
 ## High-level API
@@ -90,6 +95,12 @@ session. Low-level tried-region reads remain raw because the sysfs `addr_unit`
 file can contain an uncommitted value that did not produce the results. Scaled
 regions are borrowed views, so attaching the effective unit does not allocate a
 second region vector.
+
+Call `Damon::capabilities()` while DAMON is otherwise unused to temporarily
+stage representative indexed children, inspect their concrete attributes, and
+restore the empty hierarchy. `Kdamond::capabilities()` remains the passive
+low-level query and reports children that have not been staged as
+`RequiresStaging`.
 
 ## Low-level API
 

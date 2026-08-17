@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::sysfs::{
-    AccessPattern, Action, AuxiliaryConfigFingerprint, CapabilitySupport, DamonAdmin, Kdamond,
-    KdamondCommand, KdamondState, Operation, SysfsFeature,
+    Action, CapabilitySupport, ConfigurationFingerprint, DamonAdmin, Kdamond, KdamondCommand,
+    KdamondState, Operation, SysfsFeature,
 };
 use crate::{
     AddressUnit, Capabilities, Error, MonitoringIntervals, Pid, RegionBounds, Result, Snapshot,
@@ -69,6 +69,83 @@ impl Damon {
             min_regions: RegionBounds::default().min(),
             max_regions: RegionBounds::default().max(),
         }
+    }
+
+    /// Exclusively stages representative nodes and discovers this kernel's
+    /// concrete DAMON sysfs capabilities.
+    ///
+    /// Discovery holds the same advisory lock as a monitor and requires the
+    /// global DAMON hierarchy to be empty. It never starts a kdamond. The
+    /// temporary hierarchy is removed before this method returns. This makes
+    /// capabilities below indexed children observable without replacing
+    /// another controller's configuration.
+    pub fn capabilities(&self) -> Result<Capabilities> {
+        let _session_lock = SessionLock::acquire(&self.lock_path)?;
+        let existing = self.admin.kdamond_count()?;
+        if existing != 0 {
+            return Err(Error::InUse { kdamonds: existing });
+        }
+
+        retry_busy(|| self.admin.set_kdamond_count(1))?;
+        let kdamond = self.admin.kdamond(0);
+        let result = stage_capability_probe(&kdamond);
+        match result {
+            Ok((capabilities, fingerprint)) => {
+                cleanup_capability_probe(&self.admin, &kdamond, &fingerprint)?;
+                Ok(capabilities)
+            }
+            Err(operation) => Err(with_rollback(
+                operation,
+                rollback_unstarted_slot(&self.admin, &kdamond),
+            )),
+        }
+    }
+}
+
+fn stage_capability_probe(kdamond: &Kdamond) -> Result<(Capabilities, ConfigurationFingerprint)> {
+    kdamond.set_default_refresh_interval_if_present()?;
+    retry_busy(|| kdamond.set_context_count(1))?;
+    let context = kdamond.context(0);
+    retry_busy(|| context.set_target_count(1))?;
+    retry_busy(|| context.set_scheme_count(1))?;
+    kdamond.stage_optional_capability_children(0, 0, 0)?;
+
+    let preliminary = kdamond.capabilities(0, 0)?;
+    if preliminary.feature_support(SysfsFeature::AttributeProbeCount)
+        == CapabilitySupport::Supported
+    {
+        retry_busy(|| context.set_probe_count(1))?;
+        let with_probe = kdamond.capabilities(0, 0)?;
+        if with_probe.feature_support(SysfsFeature::ProbeFilterCount)
+            == CapabilitySupport::Supported
+        {
+            retry_busy(|| context.probe(0).set_filter_count(1))?;
+        }
+    }
+
+    let capabilities = kdamond.capabilities(0, 0)?;
+    let fingerprint = kdamond.configuration_fingerprint()?;
+    Ok((capabilities, fingerprint))
+}
+
+fn cleanup_capability_probe(
+    admin: &DamonAdmin,
+    kdamond: &Kdamond,
+    fingerprint: &ConfigurationFingerprint,
+) -> Result<()> {
+    if admin.kdamond_count()? != 1 || !fingerprint.matches_current()? {
+        return Err(Error::OwnershipLost {
+            reason: "the staged capability-probe configuration changed",
+        });
+    }
+    match retry_busy(|| kdamond.state())? {
+        KdamondState::Off => retry_busy(|| admin.set_kdamond_count(0)),
+        KdamondState::On => Err(Error::OwnershipLost {
+            reason: "the capability-probe kdamond was started externally",
+        }),
+        KdamondState::Unknown(_) => Err(Error::OwnershipLost {
+            reason: "the capability-probe kdamond state changed",
+        }),
     }
 }
 
@@ -217,32 +294,38 @@ fn configure_monitor(
     intervals: MonitoringIntervals,
     region_bounds: RegionBounds,
 ) -> Result<(Capabilities, StagedOwnership)> {
-    kdamond.set_refresh_interval(Duration::ZERO)?;
+    kdamond.set_default_refresh_interval_if_present()?;
     retry_busy(|| kdamond.set_context_count(1))?;
     let context = kdamond.context(0);
-    let operations = context.available_operations()?;
-    if !operations.contains(&Operation::VirtualAddress) {
+    if let Some(operations) = context.available_operations_if_present()? {
+        if !operations.contains(&Operation::VirtualAddress) {
+            return Err(Error::UnsupportedOperation {
+                operation: Operation::VirtualAddress,
+            });
+        }
+    }
+
+    context.set_operation(&Operation::VirtualAddress)?;
+    if context.operation()? != Operation::VirtualAddress {
         return Err(Error::UnsupportedOperation {
             operation: Operation::VirtualAddress,
         });
     }
-
-    context.set_operation(&Operation::VirtualAddress)?;
-    context.set_address_unit(AddressUnit::ONE)?;
-    context.set_paused(false)?;
+    context.set_default_address_unit_if_present()?;
+    context.set_unpaused_if_present()?;
     context.set_intervals(intervals)?;
     context.set_region_bounds(region_bounds)?;
-    retry_busy(|| context.set_probe_count(0))?;
+    retry_busy(|| context.clear_probes_if_present())?;
     retry_busy(|| context.set_target_count(1))?;
     let target = context.target(0);
     target.set_pid(pid)?;
-    target.set_obsolete(false)?;
-    retry_busy(|| target.set_initial_region_count(0))?;
+    target.retain_if_supported()?;
+    retry_busy(|| target.clear_initial_regions_if_present())?;
     retry_busy(|| context.set_scheme_count(1))?;
     let scheme = context.scheme(0);
     scheme.set_action(&Action::Stat)?;
     scheme.set_match_all()?;
-    scheme.set_apply_interval(Duration::ZERO)?;
+    scheme.set_default_apply_interval_if_present()?;
 
     let capabilities = kdamond.capabilities(0, 0)?;
     if capabilities.feature_support(SysfsFeature::TriedRegions) != CapabilitySupport::Supported {
@@ -252,98 +335,30 @@ fn configure_monitor(
     }
 
     let staged = StagedOwnership {
-        refresh_interval: Duration::ZERO,
         operation: Operation::VirtualAddress,
-        configured_address_unit: AddressUnit::ONE,
         effective_address_unit: AddressUnit::ONE,
-        target_pid: pid,
-        intervals,
-        region_bounds,
-        access_pattern: scheme.access_pattern()?,
-        paused: false,
-        probe_count: 0,
-        target_obsolete: false,
-        initial_region_count: 0,
-        apply_interval: Duration::ZERO,
-        auxiliary_config: kdamond.auxiliary_config_fingerprint()?,
+        configuration: kdamond.configuration_fingerprint()?,
     };
     Ok((capabilities, staged))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StagedOwnership {
-    refresh_interval: Duration,
     operation: Operation,
-    configured_address_unit: AddressUnit,
     effective_address_unit: AddressUnit,
-    target_pid: Pid,
-    intervals: MonitoringIntervals,
-    region_bounds: RegionBounds,
-    access_pattern: AccessPattern,
-    paused: bool,
-    probe_count: usize,
-    target_obsolete: bool,
-    initial_region_count: usize,
-    apply_interval: Duration,
-    auxiliary_config: AuxiliaryConfigFingerprint,
+    configuration: ConfigurationFingerprint,
 }
 
 impl StagedOwnership {
-    fn verify(&self, admin: &DamonAdmin, kdamond: &Kdamond) -> Result<()> {
+    fn verify(&self, admin: &DamonAdmin, _kdamond: &Kdamond) -> Result<()> {
         if admin.kdamond_count()? != 1 {
             return Err(Error::OwnershipLost {
                 reason: "the staged kdamond count changed",
             });
         }
-        if kdamond.refresh_interval()? != self.refresh_interval {
+        if !self.configuration.matches_current()? {
             return Err(Error::OwnershipLost {
-                reason: "the staged kdamond attributes changed",
-            });
-        }
-        if kdamond.context_count()? != 1 {
-            return Err(Error::OwnershipLost {
-                reason: "the staged context count changed",
-            });
-        }
-        let context = kdamond.context(0);
-        if context.operation()? != self.operation
-            || context.address_unit()? != self.configured_address_unit
-            || context.is_paused()? != self.paused
-            || context.intervals()? != self.intervals
-            || context.region_bounds()? != self.region_bounds
-            || context.probe_count()? != self.probe_count
-        {
-            return Err(Error::OwnershipLost {
-                reason: "the staged monitoring attributes changed",
-            });
-        }
-        let target = context.target(0);
-        if context.target_count()? != 1
-            || target.pid()? != Some(self.target_pid)
-            || target.is_obsolete()? != self.target_obsolete
-            || target.initial_region_count()? != self.initial_region_count
-        {
-            return Err(Error::OwnershipLost {
-                reason: "the staged target changed",
-            });
-        }
-        if context.scheme_count()? != 1 {
-            return Err(Error::OwnershipLost {
-                reason: "the staged scheme count changed",
-            });
-        }
-        let scheme = context.scheme(0);
-        if scheme.action()? != Action::Stat
-            || scheme.access_pattern()? != self.access_pattern
-            || scheme.apply_interval()? != self.apply_interval
-        {
-            return Err(Error::OwnershipLost {
-                reason: "the staged scheme changed",
-            });
-        }
-        if !self.auxiliary_config.matches_current()? {
-            return Err(Error::OwnershipLost {
-                reason: "the staged auxiliary configuration changed",
+                reason: "the staged writable configuration changed",
             });
         }
         Ok(())
@@ -896,7 +911,7 @@ mod tests {
         assert!(matches!(
             error,
             Error::OwnershipLost {
-                reason: "the staged target changed"
+                reason: "the staged writable configuration changed"
             }
         ));
     }
@@ -932,9 +947,49 @@ mod tests {
         assert!(matches!(
             error,
             Error::OwnershipLost {
-                reason: "the staged target changed"
+                reason: "the staged writable configuration changed"
             }
         ));
+    }
+
+    #[test]
+    fn exclusive_capability_probe_materializes_nested_attributes_and_restores_empty_state() {
+        let model = Model::new("vaddr\nfvaddr\npaddr\nfuture_operation\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+
+        let capabilities = damon.capabilities().expect("probe modeled capabilities");
+
+        assert_eq!(damon.admin.kdamond_count().expect("read restored count"), 0);
+        assert_eq!(
+            capabilities.feature_support(SysfsFeature::ProbeFilterPath),
+            CapabilitySupport::Supported
+        );
+        assert!(capabilities.has_attribute("contexts/0/monitoring_attrs/probes/0/filters/0/path"));
+        assert!(capabilities.has_attribute("contexts/0/schemes/0/quotas/goals/0/target_metric"));
+        assert!(
+            capabilities
+                .operations()
+                .contains(&Operation::Unknown("future_operation".into()))
+        );
+    }
+
+    #[test]
+    fn exclusive_capability_probe_preserves_an_existing_hierarchy() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        damon
+            .admin
+            .set_kdamond_count(1)
+            .expect("stage external hierarchy");
+
+        let error = damon
+            .capabilities()
+            .expect_err("capability probing must require an empty hierarchy");
+
+        assert!(matches!(error, Error::InUse { kdamonds: 1 }));
+        assert_eq!(damon.admin.kdamond_count().expect("preserve count"), 1);
     }
 
     fn os_error(code: i32) -> Error {

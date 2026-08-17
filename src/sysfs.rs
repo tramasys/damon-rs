@@ -18,37 +18,6 @@ pub const DEFAULT_ADMIN_PATH: &str = "/sys/kernel/mm/damon/admin";
 
 const MAX_INITIAL_REGION_CAPACITY: usize = 4_096;
 
-const LINUX_7_2_AUXILIARY_CONFIG_PATHS: &[&str] = &[
-    "contexts/0/monitoring_attrs/intervals/intervals_goal/access_bp",
-    "contexts/0/monitoring_attrs/intervals/intervals_goal/aggrs",
-    "contexts/0/monitoring_attrs/intervals/intervals_goal/min_sample_us",
-    "contexts/0/monitoring_attrs/intervals/intervals_goal/max_sample_us",
-    "contexts/0/schemes/0/target_nid",
-    "contexts/0/schemes/0/quotas/ms",
-    "contexts/0/schemes/0/quotas/bytes",
-    "contexts/0/schemes/0/quotas/reset_interval_ms",
-    "contexts/0/schemes/0/quotas/goal_tuner",
-    "contexts/0/schemes/0/quotas/fail_charge_num",
-    "contexts/0/schemes/0/quotas/fail_charge_denom",
-    "contexts/0/schemes/0/quotas/weights/sz_permil",
-    "contexts/0/schemes/0/quotas/weights/nr_accesses_permil",
-    "contexts/0/schemes/0/quotas/weights/age_permil",
-    "contexts/0/schemes/0/quotas/goals/nr_goals",
-    "contexts/0/schemes/0/watermarks/metric",
-    "contexts/0/schemes/0/watermarks/interval_us",
-    "contexts/0/schemes/0/watermarks/high",
-    "contexts/0/schemes/0/watermarks/mid",
-    "contexts/0/schemes/0/watermarks/low",
-    "contexts/0/schemes/0/core_filters/nr_filters",
-    "contexts/0/schemes/0/ops_filters/nr_filters",
-    "contexts/0/schemes/0/filters/nr_filters",
-    "contexts/0/schemes/0/dests/nr_dests",
-    "contexts/0/schemes/0/stats/max_nr_snapshots",
-];
-
-/// Maximum number of monitoring data probes supported by Linux 7.2.
-pub const MAX_PROBES: usize = 4;
-
 /// A DAMON monitoring operations set.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
@@ -252,6 +221,10 @@ pub enum SysfsFeature {
     ProbeFilterPath,
     /// `schemes/<N>/apply_interval_us` is present.
     SchemeApplyInterval,
+    /// `targets/<N>/obsolete_target` is present.
+    ObsoleteTarget,
+    /// `targets/<N>/regions/nr_regions` is present.
+    InitialRegions,
     /// `schemes/<N>/tried_regions` is present.
     TriedRegions,
     /// `schemes/<N>/tried_regions/total_bytes` is present.
@@ -296,16 +269,20 @@ impl FeatureCapability {
 pub struct Capabilities {
     operations: Box<[Operation]>,
     features: Box<[FeatureCapability]>,
+    attribute_paths: Box<[String]>,
 }
 
 impl Capabilities {
-    /// Returns the kernel's available monitoring operations.
+    /// Returns the monitoring operations observed during discovery.
+    ///
+    /// When `avail_operations` is absent, this contains only the selected
+    /// operation that could be read back successfully.
     #[must_use]
     pub fn operations(&self) -> &[Operation] {
         &self.operations
     }
 
-    /// Returns whether an operation is available.
+    /// Returns whether support for an operation was observed.
     #[must_use]
     pub fn supports_operation(&self, operation: &Operation) -> bool {
         self.operations
@@ -328,6 +305,24 @@ impl Capabilities {
             .map_or(CapabilitySupport::Unsupported, |capability| {
                 capability.support
             })
+    }
+
+    /// Returns every concrete attribute path observed below the kdamond.
+    ///
+    /// Paths are relative to `kdamonds/<N>` and preserve unknown attributes
+    /// introduced by newer kernels. Indexed children use the indexes that
+    /// were staged when discovery ran.
+    #[must_use]
+    pub fn attribute_paths(&self) -> &[String] {
+        &self.attribute_paths
+    }
+
+    /// Returns whether a concrete relative attribute path was observed.
+    #[must_use]
+    pub fn has_attribute(&self, relative_path: &str) -> bool {
+        self.attribute_paths
+            .binary_search_by(|path| path.as_str().cmp(relative_path))
+            .is_ok()
     }
 }
 
@@ -574,22 +569,20 @@ pub struct Kdamond {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct AuxiliaryConfigEntry {
+struct ConfigurationEntry {
     path: PathBuf,
-    value: Option<Box<str>>,
+    value: Box<str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AuxiliaryConfigFingerprint(Box<[AuxiliaryConfigEntry]>);
+pub(crate) struct ConfigurationFingerprint {
+    entries: Box<[ConfigurationEntry]>,
+}
 
-impl AuxiliaryConfigFingerprint {
+impl ConfigurationFingerprint {
     pub(crate) fn matches_current(&self) -> Result<bool> {
-        for entry in &self.0 {
-            let matches = match &entry.value {
-                Some(expected) => read_trimmed_equals(&entry.path, expected.as_bytes())?,
-                None => !path_exists(&entry.path)?,
-            };
-            if !matches {
+        for entry in &self.entries {
+            if !read_trimmed_equals(&entry.path, entry.value.as_bytes())? {
                 return Ok(false);
             }
         }
@@ -657,6 +650,10 @@ impl Kdamond {
         write_value(&self.path.join("refresh_ms"), milliseconds)
     }
 
+    pub(crate) fn set_default_refresh_interval_if_present(&self) -> Result<()> {
+        write_value_if_present(&self.path.join("refresh_ms"), 0_u8).map(|_| ())
+    }
+
     /// Reads the number of staged monitoring contexts.
     pub fn context_count(&self) -> Result<usize> {
         read_usize(&self.path.join("contexts/nr_contexts"))
@@ -699,6 +696,8 @@ impl Kdamond {
             });
         }
         let scheme = context.scheme(scheme_index);
+        let target_count = context.target_count()?;
+        let target = context.target(0);
         let probes = context.path.join("monitoring_attrs/probes");
         let probe_filter = probes.join("0/filters/0");
         let mut features = Vec::new();
@@ -720,41 +719,29 @@ impl Kdamond {
             features.push(feature_capability(feature, support_for_path(&path)?));
         }
 
-        let probe_count_support = support_for_path(&probes.join("nr_probes"))?;
-        let probe_filter_count_support = match probe_count_support {
-            CapabilitySupport::Unsupported => CapabilitySupport::Unsupported,
-            CapabilitySupport::RequiresStaging => CapabilitySupport::RequiresStaging,
-            CapabilitySupport::Supported if context.probe_count()? == 0 => {
-                CapabilitySupport::RequiresStaging
-            }
-            CapabilitySupport::Supported => support_for_path(&probes.join("0/filters/nr_filters"))?,
-        };
-        features.push(feature_capability(
-            SysfsFeature::ProbeFilterCount,
-            probe_filter_count_support,
-        ));
-
-        let probe_filter_attribute_support = match probe_filter_count_support {
-            CapabilitySupport::Unsupported => CapabilitySupport::Unsupported,
-            CapabilitySupport::RequiresStaging => CapabilitySupport::RequiresStaging,
-            CapabilitySupport::Supported if context.probe(0).filter_count()? == 0 => {
-                CapabilitySupport::RequiresStaging
-            }
-            CapabilitySupport::Supported => CapabilitySupport::Supported,
-        };
-        for (feature, name) in [
-            (SysfsFeature::ProbeFilterType, "type"),
-            (SysfsFeature::ProbeFilterMatching, "matching"),
-            (SysfsFeature::ProbeFilterAllow, "allow"),
-            (SysfsFeature::ProbeFilterPath, "path"),
+        for (feature, path) in [
+            (
+                SysfsFeature::ObsoleteTarget,
+                target.path.join("obsolete_target"),
+            ),
+            (
+                SysfsFeature::InitialRegions,
+                target.path.join("regions/nr_regions"),
+            ),
         ] {
-            let support = if probe_filter_attribute_support == CapabilitySupport::Supported {
-                support_for_path(&probe_filter.join(name))?
+            let support = if target_count == 0 {
+                CapabilitySupport::RequiresStaging
             } else {
-                probe_filter_attribute_support
+                support_for_path(&path)?
             };
             features.push(feature_capability(feature, support));
         }
+
+        features.extend(probe_feature_capabilities(
+            &context,
+            &probes,
+            &probe_filter,
+        )?);
 
         let tried_regions = scheme.path.join("tried_regions");
         features.push(feature_capability(
@@ -775,27 +762,83 @@ impl Kdamond {
         {
             context.available_operations()?
         } else {
-            Vec::new()
+            vec![context.operation()?]
         };
         Ok(Capabilities {
             operations: operations.into_boxed_slice(),
             features: features.into_boxed_slice(),
+            attribute_paths: observed_attribute_paths(&self.path)?.into_boxed_slice(),
         })
     }
 
-    pub(crate) fn auxiliary_config_fingerprint(&self) -> Result<AuxiliaryConfigFingerprint> {
-        let mut values = Vec::with_capacity(LINUX_7_2_AUXILIARY_CONFIG_PATHS.len());
-        for relative in LINUX_7_2_AUXILIARY_CONFIG_PATHS {
-            let path = self.path.join(relative);
-            let value = if path_exists(&path)? {
-                Some(read_text(&path)?.trim().into())
-            } else {
-                None
-            };
-            values.push(AuxiliaryConfigEntry { path, value });
-        }
-        Ok(AuxiliaryConfigFingerprint(values.into_boxed_slice()))
+    pub(crate) fn configuration_fingerprint(&self) -> Result<ConfigurationFingerprint> {
+        capture_configuration(&self.path)
     }
+
+    pub(crate) fn stage_optional_capability_children(
+        &self,
+        context_index: usize,
+        target_index: usize,
+        scheme_index: usize,
+    ) -> Result<()> {
+        let context = self.context(context_index);
+        let target = context.target(target_index);
+        let scheme = context.scheme(scheme_index);
+        for path in [
+            target.path.join("regions/nr_regions"),
+            scheme.path.join("quotas/goals/nr_goals"),
+            scheme.path.join("core_filters/nr_filters"),
+            scheme.path.join("ops_filters/nr_filters"),
+            scheme.path.join("filters/nr_filters"),
+            scheme.path.join("dests/nr_dests"),
+        ] {
+            write_value_if_present(&path, 1_u8)?;
+        }
+        Ok(())
+    }
+}
+
+fn probe_feature_capabilities(
+    context: &Context,
+    probes: &Path,
+    probe_filter: &Path,
+) -> Result<Vec<FeatureCapability>> {
+    let probe_count_support = support_for_path(&probes.join("nr_probes"))?;
+    let probe_filter_count_support = match probe_count_support {
+        CapabilitySupport::Unsupported => CapabilitySupport::Unsupported,
+        CapabilitySupport::RequiresStaging => CapabilitySupport::RequiresStaging,
+        CapabilitySupport::Supported if context.probe_count()? == 0 => {
+            CapabilitySupport::RequiresStaging
+        }
+        CapabilitySupport::Supported => support_for_path(&probes.join("0/filters/nr_filters"))?,
+    };
+    let mut features = vec![feature_capability(
+        SysfsFeature::ProbeFilterCount,
+        probe_filter_count_support,
+    )];
+
+    let attribute_support = match probe_filter_count_support {
+        CapabilitySupport::Unsupported => CapabilitySupport::Unsupported,
+        CapabilitySupport::RequiresStaging => CapabilitySupport::RequiresStaging,
+        CapabilitySupport::Supported if context.probe(0).filter_count()? == 0 => {
+            CapabilitySupport::RequiresStaging
+        }
+        CapabilitySupport::Supported => CapabilitySupport::Supported,
+    };
+    for (feature, name) in [
+        (SysfsFeature::ProbeFilterType, "type"),
+        (SysfsFeature::ProbeFilterMatching, "matching"),
+        (SysfsFeature::ProbeFilterAllow, "allow"),
+        (SysfsFeature::ProbeFilterPath, "path"),
+    ] {
+        let support = if attribute_support == CapabilitySupport::Supported {
+            support_for_path(&probe_filter.join(name))?
+        } else {
+            attribute_support
+        };
+        features.push(feature_capability(feature, support));
+    }
+    Ok(features)
 }
 
 /// A `contexts/<N>` sysfs directory.
@@ -820,6 +863,15 @@ impl Context {
             .filter(|line| !line.is_empty())
             .map(Operation::parse)
             .collect())
+    }
+
+    pub(crate) fn available_operations_if_present(&self) -> Result<Option<Vec<Operation>>> {
+        let path = self.path.join("avail_operations");
+        if path_exists(&path)? {
+            self.available_operations().map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Reads the selected monitoring operation.
@@ -849,6 +901,10 @@ impl Context {
         write_value(&self.path.join("addr_unit"), address_unit.bytes())
     }
 
+    pub(crate) fn set_default_address_unit_if_present(&self) -> Result<()> {
+        write_value_if_present(&self.path.join("addr_unit"), AddressUnit::ONE.bytes()).map(|_| ())
+    }
+
     /// Reads whether monitoring is paused for this context.
     pub fn is_paused(&self) -> Result<bool> {
         read_bool(&self.path.join("pause"))
@@ -857,6 +913,10 @@ impl Context {
     /// Pauses or resumes monitoring for this context.
     pub fn set_paused(&self, paused: bool) -> Result<()> {
         write_bool(&self.path.join("pause"), paused)
+    }
+
+    pub(crate) fn set_unpaused_if_present(&self) -> Result<()> {
+        write_bool_if_present(&self.path.join("pause"), false).map(|_| ())
     }
 
     /// Reads the monitoring intervals.
@@ -897,14 +957,16 @@ impl Context {
     }
 
     /// Reconstructs the staged monitoring data-probe directories.
+    ///
+    /// The running kernel validates its own supported maximum. The crate does
+    /// not impose a version-specific limit that could reject a future kernel.
     pub fn set_probe_count(&self, count: usize) -> Result<()> {
-        if count > MAX_PROBES {
-            return Err(Error::InvalidConfiguration {
-                field: "probe count",
-                reason: "must not exceed Linux DAMON_MAX_PROBES",
-            });
-        }
         write_value(&self.path.join("monitoring_attrs/probes/nr_probes"), count)
+    }
+
+    pub(crate) fn clear_probes_if_present(&self) -> Result<()> {
+        write_value_if_present(&self.path.join("monitoring_attrs/probes/nr_probes"), 0_u8)
+            .map(|_| ())
     }
 
     /// Returns a typed handle for a staged monitoring data probe.
@@ -1017,12 +1079,22 @@ impl Target {
         write_bool(&self.path.join("obsolete_target"), obsolete)
     }
 
-    pub(crate) fn initial_region_count(&self) -> Result<usize> {
+    pub(crate) fn retain_if_supported(&self) -> Result<()> {
+        write_bool_if_present(&self.path.join("obsolete_target"), false).map(|_| ())
+    }
+
+    /// Reads the number of staged initial monitoring regions.
+    pub fn initial_region_count(&self) -> Result<usize> {
         read_usize(&self.path.join("regions/nr_regions"))
     }
 
-    pub(crate) fn set_initial_region_count(&self, count: usize) -> Result<()> {
+    /// Reconstructs the staged initial monitoring-region directories.
+    pub fn set_initial_region_count(&self, count: usize) -> Result<()> {
         write_value(&self.path.join("regions/nr_regions"), count)
+    }
+
+    pub(crate) fn clear_initial_regions_if_present(&self) -> Result<()> {
+        write_value_if_present(&self.path.join("regions/nr_regions"), 0_u8).map(|_| ())
     }
 }
 
@@ -1197,6 +1269,10 @@ impl Scheme {
         )
     }
 
+    pub(crate) fn set_default_apply_interval_if_present(&self) -> Result<()> {
+        write_value_if_present(&self.path.join("apply_interval_us"), 0_u8).map(|_| ())
+    }
+
     /// Reads the last materialized tried-region results without inferring a
     /// byte scale from staged context attributes.
     ///
@@ -1220,12 +1296,8 @@ impl Scheme {
         let mut computed_total_units = 0_u64;
         let mut regions = Vec::with_capacity(capacity_hint.min(MAX_INITIAL_REGION_CAPACITY));
 
-        for index in 0_usize.. {
-            let mut path = base.join(index.to_string());
+        for (_index, mut path) in numeric_directories(&base)? {
             path.push("start");
-            if !path_exists(&path)? {
-                break;
-            }
             let start = read_u64(&path)?;
             path.pop();
             path.push("end");
@@ -1245,15 +1317,14 @@ impl Scheme {
             };
             path.pop();
             let probes = path.join("probes");
-            let mut probe_hits = [0_u8; MAX_PROBES];
-            let mut probe_count = 0_u8;
-            for (probe_index, hits_value) in probe_hits.iter_mut().enumerate() {
-                let hits = probes.join(probe_index.to_string()).join("hits");
-                if !path_exists(&hits)? {
-                    break;
+            let mut probe_hits = Vec::new();
+            if path_is_dir(&probes)? {
+                for (probe_index, probe_path) in numeric_directories(&probes)? {
+                    let hits = probe_path.join("hits");
+                    if path_exists(&hits)? {
+                        probe_hits.push((probe_index, read_u8(&hits)?));
+                    }
                 }
-                *hits_value = read_u8(&hits)?;
-                probe_count += 1;
             }
 
             let region = RawRegion::from_kernel(
@@ -1262,19 +1333,18 @@ impl Scheme {
                 nr_accesses,
                 age,
                 filter_passed_units,
-                &probe_hits[..usize::from(probe_count)],
+                &probe_hits,
             )?;
-            if reported_total_units.is_none() {
-                computed_total_units = computed_total_units
-                    .checked_add(region.len_units())
-                    .ok_or(Error::SnapshotSizeOverflow)?;
-            }
+            computed_total_units = computed_total_units
+                .checked_add(region.len_units())
+                .ok_or(Error::SnapshotSizeOverflow)?;
             regions.push(region);
         }
 
         Ok(RawSnapshot::from_kernel(
             regions,
-            reported_total_units.unwrap_or(computed_total_units),
+            reported_total_units,
+            computed_total_units,
         ))
     }
 }
@@ -1353,6 +1423,141 @@ fn path_is_dir(path: &Path) -> Result<bool> {
     }
 }
 
+fn numeric_directories(path: &Path) -> Result<Vec<(usize, PathBuf)>> {
+    #[cfg(test)]
+    if let Some(result) = test_backend::numeric_directories(path) {
+        return result.map_err(|error| io_error("list directory", path, error));
+    }
+
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io_error("list directory", path, error)),
+    };
+    let mut numeric = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| io_error("read directory entry", path, error))?;
+        if !entry
+            .file_type()
+            .map_err(|error| io_error("inspect directory entry", entry.path(), error))?
+            .is_dir()
+        {
+            continue;
+        }
+        let Some(index) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        numeric.push((index, entry.path()));
+    }
+    numeric.sort_unstable_by_key(|(index, _)| *index);
+    Ok(numeric)
+}
+
+fn observed_attribute_paths(root: &Path) -> Result<Vec<String>> {
+    let mut paths = all_files_recursive(root)?
+        .into_iter()
+        .filter_map(|path| {
+            path.strip_prefix(root)
+                .ok()
+                .map(|relative| relative.to_string_lossy().into_owned())
+        })
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    Ok(paths)
+}
+
+fn writable_configuration_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for path in all_files_recursive(root)? {
+        let relative = path.strip_prefix(root).map_err(|_| {
+            io_error(
+                "inspect configuration path",
+                &path,
+                io::Error::new(io::ErrorKind::InvalidData, "path escaped kdamond root"),
+            )
+        })?;
+        if is_runtime_attribute(relative) || !path_is_writable(&path)? {
+            continue;
+        }
+        paths.push(path);
+    }
+    paths.sort_unstable();
+    Ok(paths)
+}
+
+fn capture_configuration(root: &Path) -> Result<ConfigurationFingerprint> {
+    let mut entries = Vec::new();
+    for path in writable_configuration_files(root)? {
+        entries.push(ConfigurationEntry {
+            value: read_text(&path)?.trim().into(),
+            path,
+        });
+    }
+    Ok(ConfigurationFingerprint {
+        entries: entries.into_boxed_slice(),
+    })
+}
+
+fn is_runtime_attribute(relative: &Path) -> bool {
+    if matches!(relative.to_str(), Some("state" | "pid"))
+        || relative
+            .file_name()
+            .is_some_and(|name| name == "avail_operations")
+        || relative
+            .components()
+            .any(|component| component.as_os_str() == "tried_regions")
+        || relative.ends_with("quotas/effective_bytes")
+    {
+        return true;
+    }
+
+    relative
+        .parent()
+        .is_some_and(|parent| parent.ends_with("stats"))
+        && !relative.ends_with("stats/max_nr_snapshots")
+}
+
+fn all_files_recursive(root: &Path) -> Result<Vec<PathBuf>> {
+    #[cfg(test)]
+    if let Some(result) = test_backend::all_files_recursive(root) {
+        return result.map_err(|error| io_error("walk hierarchy", root, error));
+    }
+
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| io_error("list directory", &directory, error))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| io_error("read directory entry", &directory, error))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| io_error("inspect directory entry", entry.path(), error))?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn path_is_writable(path: &Path) -> Result<bool> {
+    #[cfg(test)]
+    if let Some(result) = test_backend::path_is_writable(path) {
+        return result.map_err(|error| io_error("inspect permissions", path, error));
+    }
+    path.metadata()
+        .map(|metadata| !metadata.permissions().readonly())
+        .map_err(|error| io_error("inspect permissions", path, error))
+}
+
 fn support_for_path(path: &Path) -> Result<CapabilitySupport> {
     if path_exists(path)? {
         Ok(CapabilitySupport::Supported)
@@ -1388,12 +1593,10 @@ fn read_text(path: &Path) -> Result<String> {
 }
 
 fn read_trimmed_equals(path: &Path, expected: &[u8]) -> Result<bool> {
-    const MAX_AUXILIARY_VALUE_LEN: usize = 64;
-
     #[cfg(test)]
     if let Some(result) = test_backend::read(path) {
         return match result {
-            Ok(bytes) => Ok(trim_ascii_whitespace(&bytes) == expected),
+            Ok(bytes) => Ok(trimmed_bytes_equal(&bytes, expected)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(io_error("read", path, error)),
         };
@@ -1404,37 +1607,51 @@ fn read_trimmed_equals(path: &Path, expected: &[u8]) -> Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(io_error("open for reading", path, error)),
     };
-    let mut bytes = [0_u8; MAX_AUXILIARY_VALUE_LEN];
-    let mut used = 0;
-
+    let mut matched = 0;
+    let mut started = false;
+    let mut bytes = [0_u8; 256];
     loop {
-        if used == bytes.len() {
-            let mut extra = [0_u8; 1];
-            let read = file
-                .read(&mut extra)
-                .map_err(|error| io_error("read", path, error))?;
-            return Ok(read == 0 && trim_ascii_whitespace(&bytes) == expected);
-        }
         let read = file
-            .read(&mut bytes[used..])
+            .read(&mut bytes)
             .map_err(|error| io_error("read", path, error))?;
         if read == 0 {
             break;
         }
-        used += read;
+        if !match_trimmed_chunk(&bytes[..read], expected, &mut matched, &mut started) {
+            return Ok(false);
+        }
     }
-
-    Ok(trim_ascii_whitespace(&bytes[..used]) == expected)
+    Ok(matched == expected.len())
 }
 
-fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
-    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
-        bytes = &bytes[1..];
+#[cfg(test)]
+fn trimmed_bytes_equal(bytes: &[u8], expected: &[u8]) -> bool {
+    let mut matched = 0;
+    let mut started = false;
+    match_trimmed_chunk(bytes, expected, &mut matched, &mut started) && matched == expected.len()
+}
+
+fn match_trimmed_chunk(
+    bytes: &[u8],
+    expected: &[u8],
+    matched: &mut usize,
+    started: &mut bool,
+) -> bool {
+    for &byte in bytes {
+        if !*started && byte.is_ascii_whitespace() {
+            continue;
+        }
+        *started = true;
+        if *matched < expected.len() {
+            if byte != expected[*matched] {
+                return false;
+            }
+            *matched += 1;
+        } else if !byte.is_ascii_whitespace() {
+            return false;
+        }
     }
-    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
-        bytes = &bytes[..bytes.len() - 1];
-    }
-    bytes
+    true
 }
 
 fn read_usize(path: &Path) -> Result<usize> {
@@ -1550,8 +1767,24 @@ fn write_value(path: &Path, value: impl fmt::Display) -> Result<()> {
     write_bytes(path, value.to_string().as_bytes())
 }
 
+fn write_value_if_present(path: &Path, value: impl fmt::Display) -> Result<bool> {
+    if !path_exists(path)? {
+        return Ok(false);
+    }
+    write_value(path, value)?;
+    Ok(true)
+}
+
 fn write_bool(path: &Path, value: bool) -> Result<()> {
     write_bytes(path, if value { b"Y" } else { b"N" })
+}
+
+fn write_bool_if_present(path: &Path, value: bool) -> Result<bool> {
+    if !path_exists(path)? {
+        return Ok(false);
+    }
+    write_bool(path, value)?;
+    Ok(true)
 }
 
 fn write_bytes(path: &Path, value: &[u8]) -> Result<()> {
@@ -1935,12 +2168,6 @@ pub(crate) mod test_backend {
                 return Ok(true);
             }
             if path_text.ends_with("/monitoring_attrs/probes/nr_probes") {
-                if count > super::MAX_PROBES {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "probe count exceeds DAMON_MAX_PROBES",
-                    ));
-                }
                 let parent = path.parent().expect("count path has parent");
                 self.remove_indexed_children(parent);
                 for index in 0..count {
@@ -2360,6 +2587,58 @@ pub(crate) mod test_backend {
         )))
     }
 
+    pub(super) fn numeric_directories(path: &Path) -> Option<io::Result<Vec<(usize, PathBuf)>>> {
+        let (state, relative) = resolve(path)?;
+        let state = lock(&state);
+        if !matches!(state.nodes.get(&relative), Some(Node::Directory)) {
+            return Some(if state.nodes.contains_key(&relative) {
+                Err(io::Error::from(io::ErrorKind::NotADirectory))
+            } else {
+                Ok(Vec::new())
+            });
+        }
+        let mut numeric = state
+            .nodes
+            .iter()
+            .filter_map(|(candidate, node)| {
+                if !matches!(node, Node::Directory) || candidate.parent() != Some(&relative) {
+                    return None;
+                }
+                let index = candidate.file_name()?.to_str()?.parse::<usize>().ok()?;
+                Some((index, path.join(index.to_string())))
+            })
+            .collect::<Vec<_>>();
+        numeric.sort_unstable_by_key(|(index, _)| *index);
+        Some(Ok(numeric))
+    }
+
+    pub(super) fn all_files_recursive(path: &Path) -> Option<io::Result<Vec<PathBuf>>> {
+        let (state, relative) = resolve(path)?;
+        let state = lock(&state);
+        if !matches!(state.nodes.get(&relative), Some(Node::Directory)) {
+            return Some(Err(not_found(&relative)));
+        }
+        Some(Ok(state
+            .nodes
+            .iter()
+            .filter_map(|(candidate, node)| {
+                if !matches!(node, Node::File(_)) || !candidate.starts_with(&relative) {
+                    return None;
+                }
+                Some(path.join(candidate.strip_prefix(&relative).ok()?))
+            })
+            .collect()))
+    }
+
+    pub(super) fn path_is_writable(path: &Path) -> Option<io::Result<bool>> {
+        let (state, relative) = resolve(path)?;
+        Some(match lock(&state).nodes.get(&relative) {
+            Some(Node::File(_)) => Ok(true),
+            Some(Node::Directory) => Err(io::Error::from(io::ErrorKind::IsADirectory)),
+            None => Err(not_found(&relative)),
+        })
+    }
+
     pub(super) fn read(path: &Path) -> Option<io::Result<Vec<u8>>> {
         let (state, relative) = resolve(path)?;
         let mut state = lock(&state);
@@ -2447,6 +2726,18 @@ mod tests {
             let fixture = TempFile::new(value);
             assert_eq!(read_bool(&fixture.path).expect("read boolean"), expected);
         }
+    }
+
+    #[test]
+    fn fingerprint_comparison_streams_long_trimmed_values() {
+        let expected = "x".repeat(600);
+        let fixture = TempFile::new(&format!("  {expected}\n"));
+
+        assert!(
+            read_trimmed_equals(&fixture.path, expected.as_bytes())
+                .expect("compare long unchanged value")
+        );
+        assert!(!read_trimmed_equals(&fixture.path, b"different").expect("detect changed value"));
     }
 
     #[test]

@@ -44,5 +44,7 @@ pub mod sysfs;
 pub use config::{AddressUnit, MonitoringIntervals, Pid, RegionBounds};
 pub use error::{Error, Result};
 pub use monitor::{DEFAULT_SESSION_LOCK_PATH, Damon, Monitor, MonitorBuilder};
-pub use region::{RawRegion, RawSnapshot, Region, RegionIter, Snapshot};
+pub use region::{
+    ProbeHit, RawRegion, RawSnapshot, Region, RegionIter, Snapshot, SnapshotCompleteness,
+};
 pub use sysfs::{Capabilities, CapabilitySupport, Operation, SysfsFeature};

@@ -6,12 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use damon::sysfs::{
-    AccessCountRange, AccessPattern, Action, AgeRange, DamonAdmin, MAX_PROBES, ProbeFilterType,
-    RegionSizeRange,
+    AccessCountRange, AccessPattern, Action, AgeRange, DamonAdmin, ProbeFilterType, RegionSizeRange,
 };
 use damon::{
     AddressUnit, CapabilitySupport, Damon, Error, MonitoringIntervals, Operation, Pid,
-    RegionBounds, SysfsFeature,
+    RegionBounds, SnapshotCompleteness, SysfsFeature,
 };
 
 #[test]
@@ -69,10 +68,15 @@ fn low_level_probe_attributes_and_capabilities_are_individual() {
     kdamond.set_context_count(1).expect("stage context");
     let context = kdamond.context(0);
     context.set_scheme_count(1).expect("stage scheme");
+    context.set_target_count(1).expect("stage target");
 
     context.set_probe_count(1).expect("stage probe");
     assert_eq!(context.probe_count().expect("read probe count"), 1);
-    assert!(context.set_probe_count(MAX_PROBES + 1).is_err());
+    context
+        .set_probe_count(5)
+        .expect("defer the supported probe limit to the running kernel");
+    assert_eq!(context.probe_count().expect("read future probe count"), 5);
+    context.set_probe_count(1).expect("restore staged probe");
     let probe = context.probe(0);
     probe.set_filter_count(1).expect("stage probe filter");
     assert_eq!(probe.filter_count().expect("read filter count"), 1);
@@ -109,6 +113,8 @@ fn low_level_probe_attributes_and_capabilities_are_individual() {
         SysfsFeature::ProbeFilterAllow,
         SysfsFeature::ProbeFilterPath,
         SysfsFeature::SchemeApplyInterval,
+        SysfsFeature::ObsoleteTarget,
+        SysfsFeature::InitialRegions,
         SysfsFeature::TriedRegions,
         SysfsFeature::TriedRegionsTotalBytes,
     ] {
@@ -405,6 +411,110 @@ fn stages_queries_and_cleans_up_a_monitor() {
 }
 
 #[test]
+fn high_level_staging_adapts_to_legacy_optional_attributes() {
+    let fixture = Fixture::new("vaddr\n");
+    for path in [
+        "kdamonds/0/refresh_ms",
+        "kdamonds/0/contexts/0/avail_operations",
+        "kdamonds/0/contexts/0/addr_unit",
+        "kdamonds/0/contexts/0/pause",
+        "kdamonds/0/contexts/0/monitoring_attrs/probes/nr_probes",
+        "kdamonds/0/contexts/0/targets/0/obsolete_target",
+        "kdamonds/0/contexts/0/targets/0/regions/nr_regions",
+        "kdamonds/0/contexts/0/schemes/0/apply_interval_us",
+    ] {
+        fixture.remove(path);
+    }
+
+    let monitor = fixture
+        .damon()
+        .monitor_pid(Pid::new(42).expect("valid pid"))
+        .start()
+        .expect("legacy default attributes may be absent");
+
+    assert_eq!(monitor.operation(), &Operation::VirtualAddress);
+    assert!(
+        monitor
+            .capabilities()
+            .supports_operation(&Operation::VirtualAddress)
+    );
+    for feature in [
+        SysfsFeature::PeriodicRefresh,
+        SysfsFeature::AvailableOperations,
+        SysfsFeature::AddressUnit,
+        SysfsFeature::ContextPause,
+        SysfsFeature::AttributeProbeCount,
+        SysfsFeature::ObsoleteTarget,
+        SysfsFeature::InitialRegions,
+        SysfsFeature::SchemeApplyInterval,
+    ] {
+        assert_eq!(
+            monitor.capabilities().feature_support(feature),
+            CapabilitySupport::Unsupported,
+            "unexpected support for {feature:?}"
+        );
+    }
+
+    monitor.stop().expect("stop legacy-compatible monitor");
+    assert_eq!(fixture.read("kdamonds/nr_kdamonds"), "0");
+}
+
+#[test]
+fn snapshot_parses_sparse_kernel_indexes_and_reports_partial_materialization() {
+    let fixture = Fixture::new("vaddr\n");
+    fixture.add_snapshot_regions();
+    fixture.remove_dir("kdamonds/0/contexts/0/schemes/0/tried_regions/1");
+    let region = "kdamonds/0/contexts/0/schemes/0/tried_regions/4";
+    for (name, value) in [
+        ("start", "8192\n"),
+        ("end", "10240\n"),
+        ("nr_accesses", "2\n"),
+        ("age", "8\n"),
+    ] {
+        fixture.write(&format!("{region}/{name}"), value);
+    }
+    fixture.remove_dir("kdamonds/0/contexts/0/schemes/0/tried_regions/0/probes/1");
+    fixture.write(
+        "kdamonds/0/contexts/0/schemes/0/tried_regions/0/probes/5/hits",
+        "9\n",
+    );
+    fixture.write(
+        "kdamonds/0/contexts/0/schemes/0/tried_regions/total_bytes",
+        "7000\n",
+    );
+
+    let mut monitor = fixture
+        .damon()
+        .monitor_pid(Pid::new(42).expect("valid pid"))
+        .start()
+        .expect("start monitor");
+    let snapshot = monitor.snapshot().expect("read sparse results");
+
+    assert_eq!(snapshot.len(), 2);
+    assert_eq!(
+        snapshot
+            .region(1)
+            .expect("second sparse region")
+            .start_units(),
+        8192
+    );
+    let first = snapshot.region(0).expect("first region");
+    assert_eq!(first.probe_indices(), &[0, 5]);
+    assert_eq!(first.probe_hits(), &[3, 9]);
+    assert_eq!(
+        snapshot.completeness(),
+        SnapshotCompleteness::Partial {
+            reported_units: 7000,
+            materialized_units: 6144,
+        }
+    );
+    assert_eq!(snapshot.total_units(), 7000);
+
+    fixture.write("kdamonds/0/state", "on\n");
+    monitor.stop().expect("stop monitor");
+}
+
+#[test]
 fn refuses_to_replace_an_existing_configuration() {
     let fixture = Fixture::new("vaddr\n");
     fixture.write("kdamonds/nr_kdamonds", "2\n");
@@ -477,7 +587,7 @@ fn refuses_to_stop_an_externally_reconfigured_slot() {
     assert!(matches!(
         error,
         Error::OwnershipLost {
-            reason: "the staged target changed"
+            reason: "the staged writable configuration changed"
         }
     ));
     assert_eq!(fixture.read("kdamonds/0/state"), "on");
@@ -490,32 +600,32 @@ fn refuses_to_stop_when_extended_typed_configuration_changes() {
         (
             "kdamonds/0/refresh_ms",
             "100\n",
-            "the staged kdamond attributes changed",
+            "the staged writable configuration changed",
         ),
         (
             "kdamonds/0/contexts/0/pause",
             "Y\n",
-            "the staged monitoring attributes changed",
+            "the staged writable configuration changed",
         ),
         (
             "kdamonds/0/contexts/0/monitoring_attrs/probes/nr_probes",
             "1\n",
-            "the staged monitoring attributes changed",
+            "the staged writable configuration changed",
         ),
         (
             "kdamonds/0/contexts/0/targets/0/obsolete_target",
             "Y\n",
-            "the staged target changed",
+            "the staged writable configuration changed",
         ),
         (
             "kdamonds/0/contexts/0/targets/0/regions/nr_regions",
             "1\n",
-            "the staged target changed",
+            "the staged writable configuration changed",
         ),
         (
             "kdamonds/0/contexts/0/schemes/0/apply_interval_us",
             "100\n",
-            "the staged scheme changed",
+            "the staged writable configuration changed",
         ),
     ] {
         let fixture = Fixture::new("vaddr\n");
@@ -555,10 +665,33 @@ fn refuses_to_stop_when_auxiliary_scheme_configuration_changes() {
     assert!(matches!(
         error,
         Error::OwnershipLost {
-            reason: "the staged auxiliary configuration changed"
+            reason: "the staged writable configuration changed"
         }
     ));
     assert_eq!(fixture.read("kdamonds/0/state"), "on");
+}
+
+#[test]
+fn ownership_tracks_unknown_future_configuration_attributes() {
+    let fixture = Fixture::new("vaddr\n");
+    fixture.write("kdamonds/0/contexts/0/future_kernel_tunable", "enabled\n");
+    let monitor = fixture
+        .damon()
+        .monitor_pid(Pid::new(42).expect("valid pid"))
+        .start()
+        .expect("start monitor");
+
+    fixture.write("kdamonds/0/contexts/0/future_kernel_tunable", "disabled\n");
+    let error = monitor
+        .stop()
+        .expect_err("an unknown writable input must invalidate ownership");
+
+    assert!(matches!(
+        error,
+        Error::OwnershipLost {
+            reason: "the staged writable configuration changed"
+        }
+    ));
 }
 
 #[test]

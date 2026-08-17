@@ -18,7 +18,7 @@ Primary sources:
 - [Linux 7.2 `mm/damon/sysfs.c`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/mm/damon/sysfs.c?h=v7.2)
 - [Linux 7.2 `mm/damon/sysfs-schemes.c`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/mm/damon/sysfs-schemes.c?h=v7.2)
 - [Linux 7.2 DAMON public header](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/damon.h?h=v7.2)
-- [Official `damo` sysfs implementation](https://github.com/damonitor/damo/blob/next/src/_damon_sysfs.py)
+- [Official `damo` sysfs implementation](https://github.com/damonitor/damo/blob/590207a5e2db8d7dd0911564baff42cce114170c/src/_damon_sysfs.py)
 - [Rust stable release history](https://blog.rust-lang.org/releases/)
 
 ## High-level monitor transaction
@@ -28,23 +28,23 @@ query scheme. Its staging sequence follows the upstream sysfs hierarchy:
 
 ```text
 kdamonds/nr_kdamonds                                      <- 1
-kdamonds/0/refresh_ms                                     <- 0
+kdamonds/0/refresh_ms                                     <- 0 if present
 kdamonds/0/contexts/nr_contexts                           <- 1
-kdamonds/0/contexts/0/avail_operations                    -> require vaddr
+kdamonds/0/contexts/0/avail_operations                    -> require vaddr if present
 kdamonds/0/contexts/0/operations                          <- vaddr
-kdamonds/0/contexts/0/addr_unit                           <- 1
-kdamonds/0/contexts/0/pause                               <- N
+kdamonds/0/contexts/0/addr_unit                           <- 1 if present
+kdamonds/0/contexts/0/pause                               <- N if present
 kdamonds/0/contexts/0/monitoring_attrs/intervals/*         <- intervals
 kdamonds/0/contexts/0/monitoring_attrs/nr_regions/{min,max}<- bounds
-kdamonds/0/contexts/0/monitoring_attrs/probes/nr_probes    <- 0
+kdamonds/0/contexts/0/monitoring_attrs/probes/nr_probes    <- 0 if present
 kdamonds/0/contexts/0/targets/nr_targets                  <- 1
 kdamonds/0/contexts/0/targets/0/pid_target                <- PID
-kdamonds/0/contexts/0/targets/0/obsolete_target           <- N
-kdamonds/0/contexts/0/targets/0/regions/nr_regions         <- 0
+kdamonds/0/contexts/0/targets/0/obsolete_target           <- N if present
+kdamonds/0/contexts/0/targets/0/regions/nr_regions         <- 0 if present
 kdamonds/0/contexts/0/schemes/nr_schemes                  <- 1
 kdamonds/0/contexts/0/schemes/0/action                    <- stat
 kdamonds/0/contexts/0/schemes/0/access_pattern/*/{min,max} <- match all
-kdamonds/0/contexts/0/schemes/0/apply_interval_us         <- 0
+kdamonds/0/contexts/0/schemes/0/apply_interval_us         <- 0 if present
 kdamonds/0/state                                           <- on
 ```
 
@@ -52,15 +52,14 @@ The kernel creates and destroys indexed directories when each `nr_*` file is
 written. The high-level API takes a cooperative `flock`, refuses to begin when
 any kdamond is already staged, and rolls `nr_kdamonds` back to zero if setup
 fails. It also records the kdamond thread ID and fingerprints the staged
-configuration before cleanup. The fingerprint covers periodic refresh, pause
-state, probes, initial regions, interval goals, scheme apply interval, target
-NUMA node, quotas, watermarks, scheme filter counts, destinations, and the
-configured snapshot limit in addition to the primary typed settings. Snapshot
-queries verify that identity before materialization, after the materialization
-command, and again after reading the results. Those checks reduce races among
-cooperating callers but cannot create kernel-enforced ownership or reveal an
-active change that another controller commits and then hides by restoring only
-the staged files.
+configuration before cleanup. The fingerprint recursively discovers every
+writable file in the materialized kdamond hierarchy and excludes command
+and runtime-result files. This covers newer configuration attributes without a
+kernel-version table. Snapshot queries verify that identity before
+materialization, after the materialization command, and again after reading the
+results. Those checks reduce races among cooperating callers but cannot create
+kernel-enforced ownership or reveal an active change that another controller
+commits and then hides by restoring only the staged files.
 
 ## Snapshot semantics
 
@@ -70,9 +69,9 @@ simple file. Query-style retrieval uses DAMOS tried regions:
 1. Configure a `stat` scheme whose access pattern covers the desired regions.
 2. Write `update_schemes_tried_regions` to `kdamonds/0/state`.
 3. Read `schemes/0/tried_regions/total_bytes` when the kernel exposes it.
-4. Read consecutive indexed region directories containing `start`, `end`,
-   `nr_accesses`, `age`, `sz_filter_passed`, and `probes/<N>/hits` when those
-   fields are exposed.
+4. Numerically sort and read the indexed region directories that exist. Each
+   can contain `start`, `end`, `nr_accesses`, `age`, `sz_filter_passed`, and
+   `probes/<N>/hits` when those fields are exposed.
 
 Kernels with tried-region queries but no `total_bytes` file are supported by
 summing the validated materialized region sizes in userspace. This matches the
@@ -82,7 +81,14 @@ The command can wait until the next scheme apply interval. A zero
 `apply_interval_us` uses the aggregation interval. `nr_accesses` is a count per
 aggregation interval and `age` is measured in aggregation intervals. Neither
 is a byte-normalized density. Linux 7.2 stores each tried-region probe hit in
-an `unsigned char`, which the crate preserves as `u8` in probe-index order.
+an `unsigned char`, which the crate preserves as `u8` together with its numeric
+probe index. Up to four results use inline storage. Additional results from a
+future kernel use an owned fallback rather than being rejected.
+
+The parser always sums materialized regions and separately retains
+`total_bytes` when that file exists. `SnapshotCompleteness` reports whether the
+two totals agree, whether materialization is partial, whether the totals are
+inconsistent, or whether no independent kernel total is available.
 
 ## Address units
 
@@ -140,6 +146,14 @@ the non-mutating Rust query honest while following the same concrete-path
 principle used by official `damo`, whose exhaustive probe temporarily stages
 representative children and restores the saved configuration.
 
+`Damon::capabilities()` provides the mutating equivalent under the crate's
+advisory lock. It requires an empty hierarchy, stages representative targets,
+regions, schemes, quota goals, filters, destinations, probes, and probe
+filters, captures a sorted relative path inventory, and then restores zero
+kdamonds. It does not overwrite an existing configuration. The passive query
+falls back to the selected operation when `avail_operations` is absent, which
+supports older kernels without claiming that unobserved operations exist.
+
 DAMON uses the kernel's `unsigned long` for several values. Userspace pointer
 width does not reveal kernel width when a 32-bit process controls a 64-bit
 kernel. The match-all helper therefore probes `u64::MAX` and falls back to
@@ -148,7 +162,9 @@ values, including monitoring-region bounds, are represented as `u64` and sent
 without a userspace-`usize` restriction. The kernel validates its native
 range.
 
-Linux 7.2 is the source-verified baseline, not a hard-coded version gate. Older
-kernels may work when they expose the required paths. Kernel-backed VM tests
-across maintained LTS releases are planned before declaring a broad kernel
-support matrix.
+Linux 7.2 is the source-verified baseline, not a hard-coded version gate. The
+adaptive high-level path is also live-tested on Linux 7.1, where pause and
+monitoring probes are absent and tried-region indexes can be sparse. Kernel
+validation selects behavior from concrete attributes and accepted writes, not
+from `uname`. Kernel-backed VM tests across maintained LTS releases remain
+necessary before declaring a broad support matrix.
