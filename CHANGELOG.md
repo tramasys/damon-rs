@@ -32,3 +32,20 @@ Versioning and the Keep a Changelog structure.
 - Distinguish unsupported capabilities from paths requiring staged children.
 - Serialize cooperating sessions with an advisory lock and verify staged
   configuration and kdamond identity before destructive lifecycle operations.
+- Return raw low-level snapshots without inferring a byte scale from mutable
+  staged context attributes.
+- Track the effective committed address unit in high-level sessions and
+  recheck ownership after snapshot materialization and result reads.
+- Enforce region and snapshot invariants through private fields and checked
+  crate-internal construction.
+- Exercise lifecycle behavior with an internal sysfs state-machine backend,
+  including staged and active inputs, directory reconstruction, kernel-thread
+  identity transitions, and deterministic race hooks.
+- Fingerprint Linux 7.2 pause, probe, initial-region, interval-goal, quota,
+  watermark, filter, destination, and other auxiliary session inputs.
+- Remove the unlocked low-level handle from the high-level `Damon` entry point.
+- Represent scaled regions as allocation-free borrowed views over one owned raw
+  snapshot.
+- Model quota-goal-only commits and running-kdamond reconstruction failures
+  according to the kernel state machine.
+- Run documentation tests explicitly in CI.

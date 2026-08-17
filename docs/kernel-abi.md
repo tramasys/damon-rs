@@ -32,13 +32,18 @@ kdamonds/0/contexts/nr_contexts                           <- 1
 kdamonds/0/contexts/0/avail_operations                    -> require vaddr
 kdamonds/0/contexts/0/operations                          <- vaddr
 kdamonds/0/contexts/0/addr_unit                           <- 1
+kdamonds/0/contexts/0/pause                               <- N
 kdamonds/0/contexts/0/monitoring_attrs/intervals/*         <- intervals
 kdamonds/0/contexts/0/monitoring_attrs/nr_regions/{min,max}<- bounds
+kdamonds/0/contexts/0/monitoring_attrs/probes/nr_probes    <- 0
 kdamonds/0/contexts/0/targets/nr_targets                  <- 1
 kdamonds/0/contexts/0/targets/0/pid_target                <- PID
+kdamonds/0/contexts/0/targets/0/obsolete_target           <- N
+kdamonds/0/contexts/0/targets/0/regions/nr_regions         <- 0
 kdamonds/0/contexts/0/schemes/nr_schemes                  <- 1
 kdamonds/0/contexts/0/schemes/0/action                    <- stat
 kdamonds/0/contexts/0/schemes/0/access_pattern/*/{min,max} <- match all
+kdamonds/0/contexts/0/schemes/0/apply_interval_us         <- 0
 kdamonds/0/state                                           <- on
 ```
 
@@ -46,8 +51,15 @@ The kernel creates and destroys indexed directories when each `nr_*` file is
 written. The high-level API takes a cooperative `flock`, refuses to begin when
 any kdamond is already staged, and rolls `nr_kdamonds` back to zero if setup
 fails. It also records the kdamond thread ID and fingerprints the staged
-configuration before cleanup. Those checks reduce races among cooperating
-callers but cannot create kernel-enforced ownership.
+configuration before cleanup. The fingerprint covers pause state, probes,
+initial regions, interval goals, scheme apply interval, target NUMA node,
+quotas, watermarks, scheme filter counts, destinations, and the configured
+snapshot limit in addition to the primary typed settings. Snapshot queries
+verify that identity before materialization, after the materialization command,
+and again after reading the results. Those checks reduce races among
+cooperating callers but cannot create kernel-enforced ownership or reveal an
+active change that another controller commits and then hides by restoring only
+the staged files.
 
 ## Snapshot semantics
 
@@ -73,12 +85,24 @@ an `unsigned char`, which the crate preserves as `u8` in probe-index order.
 
 ## Address units
 
-DAMON core addresses and sizes use `unsigned long`. A context's `addr_unit`
-scales those raw values to bytes, and Linux 7.2 supports a non-default unit for
-physical-address monitoring. The low-level Rust API therefore names raw
-accessors with an `_units` suffix, stores the `AddressUnit` in each snapshot,
-and provides checked `_bytes` conversions. Virtual-address high-level
-sessions explicitly stage an address unit of one.
+DAMON core addresses and sizes use `unsigned long`. Linux 7.2 applies a
+context's `addr_unit` only to physical-address monitoring. The sysfs file is a
+staging input and can differ from the active configuration until `commit`, so
+reading it while materializing results cannot establish the scale that
+produced those results.
+
+The low-level Rust API therefore returns `RawSnapshot` and `RawRegion`, names
+raw accessors with an `_units` suffix, and performs no implicit conversion.
+Callers that know the active committed operation and unit can explicitly
+attach its effective unit. Exclusive high-level sessions record the committed
+operation and effective unit, using one for virtual and fixed-virtual address
+monitoring and the configured unit for physical-address monitoring. Scaled
+snapshots provide checked `_bytes` conversions.
+
+A scaled `Snapshot` owns the original raw region vector and one address unit.
+Its `Region` values are borrowed views created by an allocation-free iterator,
+so attaching a known unit neither duplicates the vector nor stores the same
+unit in every region.
 
 ## Access-pattern widths
 

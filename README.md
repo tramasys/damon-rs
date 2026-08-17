@@ -16,7 +16,9 @@ human-facing [`damo`](https://github.com/damonitor/damo) tool.
 - Runtime operation and tri-state feature discovery
 - Advisory session locking, ownership rechecks, rollback, and cleanup
 - Query snapshots through a match-all `stat` DAMOS scheme
-- Raw DAMON address units with checked byte conversions
+- Raw low-level DAMON snapshots with explicit effective-unit attachment and
+  checked high-level byte conversions
+- Allocation-free scaled region views over the raw snapshot storage
 - Per-probe hit counters in tried-region snapshots
 - A public low-level `sysfs` module for specialized callers
 - No unsafe code and one direct Linux-only syscall dependency
@@ -36,11 +38,12 @@ CONFIG_DAMON_SYSFS=y
 
 Access to the admin hierarchy generally requires elevated privileges. The
 high-level API takes an advisory lock at `/run/lock/damon-rs.lock`, then starts
-only when `nr_kdamonds` is zero. It fingerprints the staged configuration and
-running kdamond thread before destructive operations. The kernel ABI is global
-and has no ownership or transaction primitive, so tools that ignore the lock
-can still race. Serialize `damo` and other controllers externally on the same
-lock, or through another system-wide coordination mechanism.
+only when `nr_kdamonds` is zero. It fingerprints the Linux 7.2 staged settings
+that can affect monitoring and the running kdamond thread before destructive
+operations. The kernel ABI is global and has no ownership or transaction
+primitive, so tools that ignore the lock can still race. Serialize `damo` and
+other controllers externally on the same lock, or through another system-wide
+coordination mechanism.
 
 The ABI foundation was verified against Linux 7.2. Capabilities are discovered
 from sysfs instead of inferred solely from a kernel version. See
@@ -81,6 +84,12 @@ fn main() -> Result<(), damon::Error> {
 
 Dropping a `Monitor` performs best-effort shutdown. Use `stop()` when shutdown
 errors must be observed.
+
+High-level snapshots carry the effective address unit of the committed
+session. Low-level tried-region reads remain raw because the sysfs `addr_unit`
+file can contain an uncommitted value that did not produce the results. Scaled
+regions are borrowed views, so attaching the effective unit does not allocate a
+second region vector.
 
 ## Low-level API
 

@@ -11,12 +11,40 @@ use std::time::Duration;
 
 use crate::config::{AddressUnit, MonitoringIntervals, Pid, RegionBounds};
 use crate::error::io_error;
-use crate::{Error, Region, Result, Snapshot};
+use crate::{Error, RawRegion, RawSnapshot, Result};
 
 /// Default location of DAMON's privileged admin interface.
 pub const DEFAULT_ADMIN_PATH: &str = "/sys/kernel/mm/damon/admin";
 
 const MAX_INITIAL_REGION_CAPACITY: usize = 4_096;
+
+const LINUX_7_2_AUXILIARY_CONFIG_PATHS: &[&str] = &[
+    "contexts/0/monitoring_attrs/intervals/intervals_goal/access_bp",
+    "contexts/0/monitoring_attrs/intervals/intervals_goal/aggrs",
+    "contexts/0/monitoring_attrs/intervals/intervals_goal/min_sample_us",
+    "contexts/0/monitoring_attrs/intervals/intervals_goal/max_sample_us",
+    "contexts/0/schemes/0/target_nid",
+    "contexts/0/schemes/0/quotas/ms",
+    "contexts/0/schemes/0/quotas/bytes",
+    "contexts/0/schemes/0/quotas/reset_interval_ms",
+    "contexts/0/schemes/0/quotas/goal_tuner",
+    "contexts/0/schemes/0/quotas/fail_charge_num",
+    "contexts/0/schemes/0/quotas/fail_charge_denom",
+    "contexts/0/schemes/0/quotas/weights/sz_permil",
+    "contexts/0/schemes/0/quotas/weights/nr_accesses_permil",
+    "contexts/0/schemes/0/quotas/weights/age_permil",
+    "contexts/0/schemes/0/quotas/goals/nr_goals",
+    "contexts/0/schemes/0/watermarks/metric",
+    "contexts/0/schemes/0/watermarks/interval_us",
+    "contexts/0/schemes/0/watermarks/high",
+    "contexts/0/schemes/0/watermarks/mid",
+    "contexts/0/schemes/0/watermarks/low",
+    "contexts/0/schemes/0/core_filters/nr_filters",
+    "contexts/0/schemes/0/ops_filters/nr_filters",
+    "contexts/0/schemes/0/filters/nr_filters",
+    "contexts/0/schemes/0/dests/nr_dests",
+    "contexts/0/schemes/0/stats/max_nr_snapshots",
+];
 
 /// Maximum number of monitoring data probes supported by Linux 7.2.
 pub const MAX_PROBES: usize = 4;
@@ -496,9 +524,7 @@ impl DamonAdmin {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let root = path.as_ref().to_path_buf();
         let count_path = root.join("kdamonds/nr_kdamonds");
-        let exists = count_path
-            .try_exists()
-            .map_err(|error| io_error("inspect", &count_path, error))?;
+        let exists = path_exists(&count_path)?;
         if !exists {
             return Err(Error::Unavailable { path: root });
         }
@@ -546,6 +572,9 @@ impl DamonAdmin {
 pub struct Kdamond {
     path: PathBuf,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuxiliaryConfigFingerprint(Box<[Option<Box<str>>]>);
 
 impl Kdamond {
     /// Returns this kdamond's sysfs path.
@@ -732,6 +761,19 @@ impl Kdamond {
             features: features.into_boxed_slice(),
         })
     }
+
+    pub(crate) fn auxiliary_config_fingerprint(&self) -> Result<AuxiliaryConfigFingerprint> {
+        let mut values = Vec::with_capacity(LINUX_7_2_AUXILIARY_CONFIG_PATHS.len());
+        for relative in LINUX_7_2_AUXILIARY_CONFIG_PATHS {
+            let path = self.path.join(relative);
+            values.push(if path_exists(&path)? {
+                Some(read_text(&path)?.trim().into())
+            } else {
+                None
+            });
+        }
+        Ok(AuxiliaryConfigFingerprint(values.into_boxed_slice()))
+    }
 }
 
 /// A `contexts/<N>` sysfs directory.
@@ -887,7 +929,6 @@ impl Context {
     pub fn scheme(&self, index: usize) -> Scheme {
         Scheme {
             path: self.path.join("schemes").join(index.to_string()),
-            address_unit_path: self.path.join("addr_unit"),
         }
     }
 }
@@ -942,6 +983,24 @@ impl Target {
     /// Clears the process selection back to the kernel's staged default.
     pub fn clear_pid(&self) -> Result<()> {
         write_value(&self.path.join("pid_target"), 0_u8)
+    }
+
+    /// Reads whether this target is staged for removal on the next commit.
+    pub fn is_obsolete(&self) -> Result<bool> {
+        read_bool(&self.path.join("obsolete_target"))
+    }
+
+    /// Marks or unmarks this target for removal on the next commit.
+    pub fn set_obsolete(&self, obsolete: bool) -> Result<()> {
+        write_bool(&self.path.join("obsolete_target"), obsolete)
+    }
+
+    pub(crate) fn initial_region_count(&self) -> Result<usize> {
+        read_usize(&self.path.join("regions/nr_regions"))
+    }
+
+    pub(crate) fn set_initial_region_count(&self, count: usize) -> Result<()> {
+        write_value(&self.path.join("regions/nr_regions"), count)
     }
 }
 
@@ -1040,7 +1099,6 @@ impl ProbeFilter {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Scheme {
     path: PathBuf,
-    address_unit_path: PathBuf,
 }
 
 impl Scheme {
@@ -1117,25 +1175,19 @@ impl Scheme {
         )
     }
 
-    /// Reads the last materialized tried-region results.
+    /// Reads the last materialized tried-region results without inferring a
+    /// byte scale from staged context attributes.
     ///
     /// Call [`Kdamond::command`] with
     /// [`KdamondCommand::UpdateSchemesTriedRegions`] first. `capacity_hint`
     /// only controls userspace allocation and does not limit results. The
     /// initial allocation is capped to avoid excessive eager allocation. When
     /// the kernel does not expose `total_bytes`, the total is computed from
-    /// the validated materialized regions. Despite the sysfs filename, a
-    /// non-default address unit makes the reported value a count of core
-    /// address units; use [`Snapshot::total_bytes`] for checked conversion.
-    pub fn tried_regions(&self, capacity_hint: usize) -> Result<Snapshot> {
-        let address_unit_bytes = read_u64(&self.address_unit_path)?;
-        let address_unit = AddressUnit::new(address_unit_bytes).map_err(|_| {
-            invalid_kernel_value(
-                &self.address_unit_path,
-                address_unit_bytes.to_string(),
-                "a non-zero address unit",
-            )
-        })?;
+    /// the validated materialized regions. Despite the sysfs filename, the
+    /// reported total is a count of DAMON core address units. Convert the raw
+    /// result with [`RawSnapshot::with_effective_address_unit`] only when the
+    /// operation and address unit of the active committed context are known.
+    pub fn tried_regions(&self, capacity_hint: usize) -> Result<RawSnapshot> {
         let base = self.path.join("tried_regions");
         let total_bytes_path = base.join("total_bytes");
         let reported_total_units = if path_exists(&total_bytes_path)? {
@@ -1156,14 +1208,6 @@ impl Scheme {
             path.pop();
             path.push("end");
             let end = read_u64(&path)?;
-            if end < start {
-                return Err(Error::InvalidRegion { start, end });
-            }
-            if reported_total_units.is_none() {
-                computed_total_units = computed_total_units
-                    .checked_add(end - start)
-                    .ok_or(Error::SnapshotSizeOverflow)?;
-            }
             path.pop();
             path.push("nr_accesses");
             let nr_accesses = read_u32(&path)?;
@@ -1190,23 +1234,26 @@ impl Scheme {
                 probe_count += 1;
             }
 
-            regions.push(Region {
+            let region = RawRegion::from_kernel(
                 start,
                 end,
                 nr_accesses,
                 age,
                 filter_passed_units,
-                probe_hits,
-                probe_count,
-                address_unit,
-            });
+                &probe_hits[..usize::from(probe_count)],
+            )?;
+            if reported_total_units.is_none() {
+                computed_total_units = computed_total_units
+                    .checked_add(region.len_units())
+                    .ok_or(Error::SnapshotSizeOverflow)?;
+            }
+            regions.push(region);
         }
 
-        Ok(Snapshot {
+        Ok(RawSnapshot::from_kernel(
             regions,
-            total_units: reported_total_units.unwrap_or(computed_total_units),
-            address_unit,
-        })
+            reported_total_units.unwrap_or(computed_total_units),
+        ))
     }
 }
 
@@ -1264,11 +1311,19 @@ fn is_kernel_ulong_width_error(error: &Error) -> bool {
 }
 
 fn path_exists(path: &Path) -> Result<bool> {
+    #[cfg(test)]
+    if let Some(result) = test_backend::path_exists(path) {
+        return result.map_err(|error| io_error("inspect", path, error));
+    }
     path.try_exists()
         .map_err(|error| io_error("inspect", path, error))
 }
 
 fn path_is_dir(path: &Path) -> Result<bool> {
+    #[cfg(test)]
+    if let Some(result) = test_backend::path_is_dir(path) {
+        return result.map_err(|error| io_error("inspect", path, error));
+    }
     match path.metadata() {
         Ok(metadata) => Ok(metadata.is_dir()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -1301,6 +1356,12 @@ fn feature_support(capabilities: &[FeatureCapability], feature: SysfsFeature) ->
 }
 
 fn read_text(path: &Path) -> Result<String> {
+    #[cfg(test)]
+    if let Some(result) = test_backend::read(path) {
+        let bytes = result.map_err(|error| io_error("read", path, error))?;
+        return String::from_utf8(bytes)
+            .map_err(|_| invalid_kernel_value(path, "<non-UTF-8 value>", "UTF-8 text"));
+    }
     std::fs::read_to_string(path).map_err(|error| io_error("read", path, error))
 }
 
@@ -1338,6 +1399,19 @@ fn read_bool(path: &Path) -> Result<bool> {
 }
 
 fn read_u64(path: &Path) -> Result<u64> {
+    #[cfg(test)]
+    if let Some(result) = test_backend::read(path) {
+        let bytes = result.map_err(|error| io_error("read", path, error))?;
+        if bytes.len() > 64 {
+            return Err(invalid_kernel_value(path, "<value too long>", "u64"));
+        }
+        let value = std::str::from_utf8(&bytes)
+            .map_err(|_| invalid_kernel_value(path, "<non-UTF-8 value>", "u64"))?
+            .trim();
+        return value
+            .parse()
+            .map_err(|_| invalid_kernel_value(path, value, "u64"));
+    }
     let mut file = File::open(path).map_err(|error| io_error("open for reading", path, error))?;
     let mut bytes = [0_u8; 64];
     let mut used = 0;
@@ -1409,6 +1483,10 @@ fn write_bool(path: &Path, value: bool) -> Result<()> {
 }
 
 fn write_bytes(path: &Path, value: &[u8]) -> Result<()> {
+    #[cfg(test)]
+    if let Some(result) = test_backend::write(path, value) {
+        return result.map_err(|error| io_error("write", path, error));
+    }
     let mut file = open_for_write(path)?;
     write_once(&mut file, path, value)
 }
@@ -1443,6 +1521,643 @@ fn open_for_write(path: &Path) -> Result<File> {
         .truncate(true)
         .open(path)
         .map_err(|error| io_error("open for writing", path, error))
+}
+
+#[cfg(test)]
+#[allow(dead_code, missing_docs)]
+pub(crate) mod test_backend {
+    use std::collections::BTreeMap;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum Node {
+        Directory,
+        File(Vec<u8>),
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct ModelRegion {
+        pub(crate) start: u64,
+        pub(crate) end: u64,
+        pub(crate) nr_accesses: u32,
+        pub(crate) age: u32,
+        pub(crate) filter_passed_units: Option<u64>,
+        pub(crate) probe_hits: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum Mutation {
+        SetFile { path: PathBuf, value: Vec<u8> },
+        RemoveTree { path: PathBuf },
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum HookEvent {
+        Read(PathBuf),
+        Write(PathBuf, Vec<u8>),
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct Hook {
+        event: HookEvent,
+        mutations: Vec<Mutation>,
+    }
+
+    #[derive(Debug)]
+    struct State {
+        nodes: BTreeMap<PathBuf, Node>,
+        available_operations: Vec<u8>,
+        active_files: Option<BTreeMap<PathBuf, Vec<u8>>>,
+        next_kdamond_pid: u32,
+        tried_regions: Vec<ModelRegion>,
+        hooks: Vec<Hook>,
+    }
+
+    impl State {
+        fn new(available_operations: &str) -> Self {
+            let mut state = Self {
+                nodes: BTreeMap::new(),
+                available_operations: available_operations.as_bytes().to_vec(),
+                active_files: None,
+                next_kdamond_pid: 10_000,
+                tried_regions: Vec::new(),
+                hooks: Vec::new(),
+            };
+            state.directory("");
+            state.directory("kdamonds");
+            state.file("kdamonds/nr_kdamonds", b"0\n");
+            state
+        }
+
+        fn directory(&mut self, path: impl Into<PathBuf>) {
+            self.nodes.insert(path.into(), Node::Directory);
+        }
+
+        fn file(&mut self, path: impl Into<PathBuf>, value: &[u8]) {
+            self.nodes.insert(path.into(), Node::File(value.to_vec()));
+        }
+
+        fn remove_tree(&mut self, path: &Path) {
+            self.nodes
+                .retain(|candidate, _| candidate != path && !candidate.starts_with(path));
+        }
+
+        fn remove_indexed_children(&mut self, parent: &Path) {
+            self.nodes.retain(|candidate, _| {
+                let Ok(relative) = candidate.strip_prefix(parent) else {
+                    return true;
+                };
+                let Some(first) = relative.components().next() else {
+                    return true;
+                };
+                first
+                    .as_os_str()
+                    .to_str()
+                    .is_none_or(|component| component.parse::<usize>().is_err())
+            });
+        }
+
+        fn create_kdamond(&mut self, index: usize) {
+            let base = PathBuf::from(format!("kdamonds/{index}"));
+            self.directory(&base);
+            self.file(base.join("state"), b"off\n");
+            self.file(base.join("pid"), b"-1\n");
+            self.file(base.join("refresh_ms"), b"0\n");
+            self.directory(base.join("contexts"));
+            self.file(base.join("contexts/nr_contexts"), b"0\n");
+        }
+
+        fn create_context(&mut self, base: &Path, index: usize) {
+            let base = base.join(index.to_string());
+            self.directory(&base);
+            let operations = self.available_operations.clone();
+            self.file(base.join("avail_operations"), &operations);
+            self.file(base.join("operations"), b"vaddr\n");
+            self.file(base.join("addr_unit"), b"1\n");
+            self.file(base.join("pause"), b"N\n");
+            self.directory(base.join("monitoring_attrs"));
+            self.directory(base.join("monitoring_attrs/intervals"));
+            self.file(base.join("monitoring_attrs/intervals/sample_us"), b"5000\n");
+            self.file(base.join("monitoring_attrs/intervals/aggr_us"), b"100000\n");
+            self.file(
+                base.join("monitoring_attrs/intervals/update_us"),
+                b"60000000\n",
+            );
+            self.directory(base.join("monitoring_attrs/intervals/intervals_goal"));
+            for name in ["access_bp", "aggrs", "min_sample_us", "max_sample_us"] {
+                self.file(
+                    base.join("monitoring_attrs/intervals/intervals_goal")
+                        .join(name),
+                    b"0\n",
+                );
+            }
+            self.directory(base.join("monitoring_attrs/nr_regions"));
+            self.file(base.join("monitoring_attrs/nr_regions/min"), b"10\n");
+            self.file(base.join("monitoring_attrs/nr_regions/max"), b"1000\n");
+            self.directory(base.join("monitoring_attrs/probes"));
+            self.file(base.join("monitoring_attrs/probes/nr_probes"), b"0\n");
+            self.directory(base.join("targets"));
+            self.file(base.join("targets/nr_targets"), b"0\n");
+            self.directory(base.join("schemes"));
+            self.file(base.join("schemes/nr_schemes"), b"0\n");
+        }
+
+        fn create_target(&mut self, base: &Path, index: usize) {
+            let base = base.join(index.to_string());
+            self.directory(&base);
+            self.file(base.join("pid_target"), b"0\n");
+            self.file(base.join("obsolete_target"), b"N\n");
+            self.directory(base.join("regions"));
+            self.file(base.join("regions/nr_regions"), b"0\n");
+        }
+
+        fn create_target_region(&mut self, base: &Path, index: usize) {
+            let base = base.join(index.to_string());
+            self.directory(&base);
+            self.file(base.join("start"), b"0\n");
+            self.file(base.join("end"), b"0\n");
+        }
+
+        fn create_scheme(&mut self, base: &Path, index: usize) {
+            let base = base.join(index.to_string());
+            self.directory(&base);
+            self.file(base.join("action"), b"stat\n");
+            self.file(base.join("target_nid"), b"0\n");
+            self.file(base.join("apply_interval_us"), b"0\n");
+            self.directory(base.join("access_pattern"));
+            for range in ["sz", "nr_accesses", "age"] {
+                self.directory(base.join("access_pattern").join(range));
+                self.file(base.join("access_pattern").join(range).join("min"), b"0\n");
+                self.file(base.join("access_pattern").join(range).join("max"), b"0\n");
+            }
+            self.directory(base.join("quotas"));
+            for name in [
+                "ms",
+                "bytes",
+                "reset_interval_ms",
+                "fail_charge_num",
+                "fail_charge_denom",
+            ] {
+                self.file(base.join("quotas").join(name), b"0\n");
+            }
+            self.file(base.join("quotas/goal_tuner"), b"none\n");
+            self.directory(base.join("quotas/weights"));
+            for name in ["sz_permil", "nr_accesses_permil", "age_permil"] {
+                self.file(base.join("quotas/weights").join(name), b"0\n");
+            }
+            self.directory(base.join("quotas/goals"));
+            self.file(base.join("quotas/goals/nr_goals"), b"0\n");
+            self.directory(base.join("watermarks"));
+            self.file(base.join("watermarks/metric"), b"none\n");
+            for name in ["interval_us", "high", "mid", "low"] {
+                self.file(base.join("watermarks").join(name), b"0\n");
+            }
+            for filters in ["core_filters", "ops_filters", "filters"] {
+                self.directory(base.join(filters));
+                self.file(base.join(filters).join("nr_filters"), b"0\n");
+            }
+            self.directory(base.join("dests"));
+            self.file(base.join("dests/nr_dests"), b"0\n");
+            self.directory(base.join("stats"));
+            self.file(base.join("stats/max_nr_snapshots"), b"0\n");
+            self.directory(base.join("tried_regions"));
+            self.file(base.join("tried_regions/total_bytes"), b"0\n");
+        }
+
+        fn create_probe(&mut self, base: &Path, index: usize) {
+            let base = base.join(index.to_string());
+            self.directory(&base);
+            self.directory(base.join("filters"));
+            self.file(base.join("filters/nr_filters"), b"0\n");
+        }
+
+        fn create_probe_filter(&mut self, base: &Path, index: usize) {
+            let base = base.join(index.to_string());
+            self.directory(&base);
+            self.file(base.join("type"), b"anon\n");
+            self.file(base.join("matching"), b"N\n");
+            self.file(base.join("allow"), b"N\n");
+            self.file(base.join("path"), b"\n");
+        }
+
+        fn parse_count(value: &[u8]) -> io::Result<usize> {
+            let value = std::str::from_utf8(value)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 count"))?
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid count"))?;
+            if value > 128 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "test model count limit exceeded",
+                ));
+            }
+            Ok(value)
+        }
+
+        fn reconstruct_count(&mut self, path: &Path, count: usize) -> io::Result<bool> {
+            let path_text = path.to_string_lossy();
+            if path_text == "kdamonds/nr_kdamonds" {
+                if self.nodes.iter().any(|(candidate, node)| {
+                    candidate.file_name().is_some_and(|name| name == "state")
+                        && matches!(node, Node::File(value) if value == b"on\n")
+                }) {
+                    return Err(io::Error::from_raw_os_error(16));
+                }
+                let parent = Path::new("kdamonds");
+                self.remove_indexed_children(parent);
+                self.active_files = None;
+                for index in 0..count {
+                    self.create_kdamond(index);
+                }
+                return Ok(true);
+            }
+            if path_text.ends_with("/contexts/nr_contexts") {
+                if count > 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Linux 7.2 supports at most one context",
+                    ));
+                }
+                let parent = path.parent().expect("count path has parent");
+                self.remove_indexed_children(parent);
+                for index in 0..count {
+                    self.create_context(parent, index);
+                }
+                return Ok(true);
+            }
+            if path_text.ends_with("/targets/nr_targets") {
+                let parent = path.parent().expect("count path has parent");
+                self.remove_indexed_children(parent);
+                for index in 0..count {
+                    self.create_target(parent, index);
+                }
+                return Ok(true);
+            }
+            if path_text.ends_with("/schemes/nr_schemes") {
+                let parent = path.parent().expect("count path has parent");
+                self.remove_indexed_children(parent);
+                for index in 0..count {
+                    self.create_scheme(parent, index);
+                }
+                return Ok(true);
+            }
+            if path_text.ends_with("/monitoring_attrs/probes/nr_probes") {
+                if count > super::MAX_PROBES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "probe count exceeds DAMON_MAX_PROBES",
+                    ));
+                }
+                let parent = path.parent().expect("count path has parent");
+                self.remove_indexed_children(parent);
+                for index in 0..count {
+                    self.create_probe(parent, index);
+                }
+                return Ok(true);
+            }
+            if path_text.ends_with("/filters/nr_filters") {
+                let parent = path.parent().expect("count path has parent");
+                self.remove_indexed_children(parent);
+                for index in 0..count {
+                    self.create_probe_filter(parent, index);
+                }
+                return Ok(true);
+            }
+            if path_text.ends_with("/regions/nr_regions") {
+                let parent = path.parent().expect("count path has parent");
+                self.remove_indexed_children(parent);
+                for index in 0..count {
+                    self.create_target_region(parent, index);
+                }
+                return Ok(true);
+            }
+            Ok(false)
+        }
+
+        fn capture_active_files(&mut self) {
+            self.active_files = Some(
+                self.nodes
+                    .iter()
+                    .filter_map(|(path, node)| match node {
+                        Node::File(value) => Some((path.clone(), value.clone())),
+                        Node::Directory => None,
+                    })
+                    .collect(),
+            );
+        }
+
+        fn commit_quota_goals(&mut self) {
+            let staged_goals: Vec<_> = self
+                .nodes
+                .iter()
+                .filter_map(|(path, node)| {
+                    if !path.to_string_lossy().contains("/quotas/goals/") {
+                        return None;
+                    }
+                    match node {
+                        Node::File(value) => Some((path.clone(), value.clone())),
+                        Node::Directory => None,
+                    }
+                })
+                .collect();
+            let active = self
+                .active_files
+                .as_mut()
+                .expect("running model has active files");
+            active.retain(|path, _| !path.to_string_lossy().contains("/quotas/goals/"));
+            active.extend(staged_goals);
+        }
+
+        fn materialize_tried_regions(&mut self, kdamond: &Path) -> io::Result<()> {
+            let base = kdamond.join("contexts/0/schemes/0/tried_regions");
+            if !self.nodes.contains_key(&base) {
+                return Err(not_found(&base));
+            }
+            self.remove_indexed_children(&base);
+            let regions = self.tried_regions.clone();
+            let total = regions.iter().try_fold(0_u64, |total, region| {
+                let size = region.end.checked_sub(region.start).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid modeled region")
+                })?;
+                total.checked_add(size).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "modeled total overflow")
+                })
+            })?;
+            self.file(base.join("total_bytes"), format!("{total}\n").as_bytes());
+            for (index, region) in regions.iter().enumerate() {
+                let region_base = base.join(index.to_string());
+                self.directory(&region_base);
+                self.file(
+                    region_base.join("start"),
+                    format!("{}\n", region.start).as_bytes(),
+                );
+                self.file(
+                    region_base.join("end"),
+                    format!("{}\n", region.end).as_bytes(),
+                );
+                self.file(
+                    region_base.join("nr_accesses"),
+                    format!("{}\n", region.nr_accesses).as_bytes(),
+                );
+                self.file(
+                    region_base.join("age"),
+                    format!("{}\n", region.age).as_bytes(),
+                );
+                if let Some(units) = region.filter_passed_units {
+                    self.file(
+                        region_base.join("sz_filter_passed"),
+                        format!("{units}\n").as_bytes(),
+                    );
+                }
+                self.directory(region_base.join("probes"));
+                for (probe_index, hits) in region.probe_hits.iter().enumerate() {
+                    let probe_base = region_base.join("probes").join(probe_index.to_string());
+                    self.directory(&probe_base);
+                    self.file(probe_base.join("hits"), format!("{hits}\n").as_bytes());
+                }
+            }
+            Ok(())
+        }
+
+        fn write_state(&mut self, path: &Path, value: &[u8]) -> io::Result<()> {
+            let command = std::str::from_utf8(value)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 command"))?
+                .trim();
+            let kdamond = path.parent().expect("state path has parent");
+            match command {
+                "on" => {
+                    self.capture_active_files();
+                    self.next_kdamond_pid += 1;
+                    self.file(path, b"on\n");
+                    self.file(
+                        kdamond.join("pid"),
+                        format!("{}\n", self.next_kdamond_pid).as_bytes(),
+                    );
+                }
+                "off" => {
+                    self.active_files = None;
+                    self.file(path, b"off\n");
+                    self.file(kdamond.join("pid"), b"-1\n");
+                }
+                "commit" => {
+                    self.ensure_running(path)?;
+                    self.capture_active_files();
+                }
+                "commit_schemes_quota_goals" => {
+                    self.ensure_running(path)?;
+                    self.commit_quota_goals();
+                }
+                "update_schemes_tried_regions" => {
+                    self.ensure_running(path)?;
+                    self.materialize_tried_regions(kdamond)?;
+                }
+                "update_schemes_tried_bytes" => {
+                    self.ensure_running(path)?;
+                    self.materialize_tried_regions(kdamond)?;
+                    let base = kdamond.join("contexts/0/schemes/0/tried_regions");
+                    self.remove_indexed_children(&base);
+                }
+                "clear_schemes_tried_regions" => {
+                    self.ensure_running(path)?;
+                    let base = kdamond.join("contexts/0/schemes/0/tried_regions");
+                    self.remove_indexed_children(&base);
+                    self.file(base.join("total_bytes"), b"0\n");
+                }
+                "update_schemes_stats"
+                | "update_schemes_effective_quotas"
+                | "update_tuned_intervals" => self.ensure_running(path)?,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unknown modeled state command",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        fn ensure_running(&self, state_path: &Path) -> io::Result<()> {
+            match self.nodes.get(state_path) {
+                Some(Node::File(value)) if value == b"on\n" => Ok(()),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "modeled kdamond is not running",
+                )),
+            }
+        }
+
+        fn write(&mut self, path: &Path, value: &[u8]) -> io::Result<()> {
+            match self.nodes.get(path) {
+                Some(Node::File(_)) => {}
+                Some(Node::Directory) => return Err(io::Error::from(io::ErrorKind::IsADirectory)),
+                None => return Err(not_found(path)),
+            }
+
+            if path.file_name().is_some_and(|name| name == "state") {
+                return self.write_state(path, value);
+            }
+
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("nr_"))
+            {
+                let count = Self::parse_count(value)?;
+                if self.reconstruct_count(path, count)? {
+                    self.file(path, format!("{count}\n").as_bytes());
+                    return Ok(());
+                }
+            }
+
+            self.file(path, value);
+            Ok(())
+        }
+
+        fn apply_hooks(&mut self, event: &HookEvent) {
+            let Some(index) = self.hooks.iter().position(|hook| &hook.event == event) else {
+                return;
+            };
+            let hook = self.hooks.remove(index);
+            for mutation in hook.mutations {
+                match mutation {
+                    Mutation::SetFile { path, value } => self.file(path, &value),
+                    Mutation::RemoveTree { path } => self.remove_tree(&path),
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct Model {
+        root: PathBuf,
+        state: Arc<Mutex<State>>,
+    }
+
+    impl Model {
+        pub(crate) fn new(available_operations: &str) -> Self {
+            static NEXT_MODEL: AtomicU64 = AtomicU64::new(0);
+            let root = PathBuf::from(format!(
+                "/__damon_rs_model/{}-{}",
+                std::process::id(),
+                NEXT_MODEL.fetch_add(1, Ordering::Relaxed)
+            ));
+            let state = Arc::new(Mutex::new(State::new(available_operations)));
+            registry()
+                .lock()
+                .expect("test backend registry lock poisoned")
+                .push((root.clone(), Arc::downgrade(&state)));
+            Self { root, state }
+        }
+
+        pub(crate) fn root(&self) -> &Path {
+            &self.root
+        }
+
+        pub(crate) fn set_tried_regions(&self, regions: Vec<ModelRegion>) {
+            lock(&self.state).tried_regions = regions;
+        }
+
+        pub(crate) fn active_value(&self, path: impl AsRef<Path>) -> Option<String> {
+            lock(&self.state)
+                .active_files
+                .as_ref()?
+                .get(path.as_ref())
+                .map(|value| String::from_utf8_lossy(value).trim().to_owned())
+        }
+
+        pub(crate) fn after_next_read(&self, path: impl Into<PathBuf>, mutations: Vec<Mutation>) {
+            lock(&self.state).hooks.push(Hook {
+                event: HookEvent::Read(path.into()),
+                mutations,
+            });
+        }
+
+        pub(crate) fn after_next_write(
+            &self,
+            path: impl Into<PathBuf>,
+            value: impl Into<Vec<u8>>,
+            mutations: Vec<Mutation>,
+        ) {
+            lock(&self.state).hooks.push(Hook {
+                event: HookEvent::Write(path.into(), value.into()),
+                mutations,
+            });
+        }
+    }
+
+    type Registry = Vec<(PathBuf, Weak<Mutex<State>>)>;
+
+    fn registry() -> &'static Mutex<Registry> {
+        static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    fn lock(state: &Arc<Mutex<State>>) -> MutexGuard<'_, State> {
+        state.lock().expect("test backend state lock poisoned")
+    }
+
+    fn resolve(path: &Path) -> Option<(Arc<Mutex<State>>, PathBuf)> {
+        let mut registry = registry()
+            .lock()
+            .expect("test backend registry lock poisoned");
+        registry.retain(|(_, state)| state.strong_count() > 0);
+        registry
+            .iter()
+            .filter_map(|(root, state)| {
+                let relative = path.strip_prefix(root).ok()?.to_path_buf();
+                Some((root.components().count(), state.upgrade()?, relative))
+            })
+            .max_by_key(|(depth, _, _)| *depth)
+            .map(|(_, state, relative)| (state, relative))
+    }
+
+    fn not_found(path: &Path) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("modeled sysfs path {} does not exist", path.display()),
+        )
+    }
+
+    pub(super) fn path_exists(path: &Path) -> Option<io::Result<bool>> {
+        let (state, relative) = resolve(path)?;
+        Some(Ok(lock(&state).nodes.contains_key(&relative)))
+    }
+
+    pub(super) fn path_is_dir(path: &Path) -> Option<io::Result<bool>> {
+        let (state, relative) = resolve(path)?;
+        Some(Ok(matches!(
+            lock(&state).nodes.get(&relative),
+            Some(Node::Directory)
+        )))
+    }
+
+    pub(super) fn read(path: &Path) -> Option<io::Result<Vec<u8>>> {
+        let (state, relative) = resolve(path)?;
+        let mut state = lock(&state);
+        let result = match state.nodes.get(&relative) {
+            Some(Node::File(value)) => Ok(value.clone()),
+            Some(Node::Directory) => Err(io::Error::from(io::ErrorKind::IsADirectory)),
+            None => Err(not_found(&relative)),
+        };
+        if result.is_ok() {
+            state.apply_hooks(&HookEvent::Read(relative));
+        }
+        Some(result)
+    }
+
+    pub(super) fn write(path: &Path, value: &[u8]) -> Option<io::Result<()>> {
+        let (state, relative) = resolve(path)?;
+        let mut state = lock(&state);
+        let result = state.write(&relative, value);
+        if result.is_ok() {
+            state.apply_hooks(&HookEvent::Write(relative, value.to_vec()));
+        }
+        Some(result)
+    }
 }
 
 #[cfg(test)]
@@ -1558,6 +2273,112 @@ mod tests {
                 ..
             } if source.kind() == io::ErrorKind::WriteZero
         ));
+    }
+
+    #[test]
+    fn modeled_sysfs_reconstructs_children_and_separates_active_inputs() {
+        let model = test_backend::Model::new("vaddr\nfvaddr\npaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        assert_eq!(admin.kdamond_count().expect("read initial count"), 0);
+
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        kdamond.set_context_count(1).expect("stage context");
+        let context = kdamond.context(0);
+        context
+            .set_operation(&Operation::PhysicalAddress)
+            .expect("stage operation");
+        context
+            .set_address_unit(AddressUnit::new(4_096).expect("valid unit"))
+            .expect("stage address unit");
+
+        kdamond.command(KdamondCommand::On).expect("start model");
+        let first_pid = kdamond.pid().expect("read modeled pid");
+        assert!(first_pid.is_some());
+        assert_eq!(
+            model.active_value("kdamonds/0/contexts/0/addr_unit"),
+            Some("4096".to_owned())
+        );
+
+        context
+            .set_address_unit(AddressUnit::ONE)
+            .expect("change only staged unit");
+        assert_eq!(
+            context.address_unit().expect("read staged unit"),
+            AddressUnit::ONE
+        );
+        assert_eq!(
+            model.active_value("kdamonds/0/contexts/0/addr_unit"),
+            Some("4096".to_owned())
+        );
+
+        kdamond
+            .command(KdamondCommand::UpdateSchemesStats)
+            .expect("state command is accepted");
+        assert_eq!(
+            kdamond.state().expect("state remains running"),
+            KdamondState::On
+        );
+        kdamond
+            .command(KdamondCommand::Commit)
+            .expect("commit staged values");
+        assert_eq!(
+            model.active_value("kdamonds/0/contexts/0/addr_unit"),
+            Some("1".to_owned())
+        );
+
+        kdamond.command(KdamondCommand::Off).expect("stop model");
+        assert_eq!(kdamond.pid().expect("read stopped pid"), None);
+        kdamond.set_context_count(0).expect("remove context");
+        assert!(!path_exists(context.path()).expect("inspect removed child"));
+    }
+
+    #[test]
+    fn modeled_quota_goal_commit_does_not_commit_other_staged_inputs() {
+        let model = test_backend::Model::new("vaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        kdamond.set_context_count(1).expect("stage context");
+        let context = kdamond.context(0);
+        context.set_scheme_count(1).expect("stage scheme");
+        kdamond.command(KdamondCommand::On).expect("start model");
+
+        let scheme = context.scheme(0);
+        write_bytes(&scheme.path().join("quotas/ms"), b"99").expect("stage non-goal quota");
+        write_bytes(&scheme.path().join("quotas/goals/nr_goals"), b"1")
+            .expect("stage quota goal count");
+        kdamond
+            .command(KdamondCommand::CommitSchemesQuotaGoals)
+            .expect("commit only quota goals");
+
+        assert_eq!(
+            model.active_value("kdamonds/0/contexts/0/schemes/0/quotas/ms"),
+            Some("0".to_owned())
+        );
+        assert_eq!(
+            model.active_value("kdamonds/0/contexts/0/schemes/0/quotas/goals/nr_goals"),
+            Some("1".to_owned())
+        );
+    }
+
+    #[test]
+    fn modeled_kdamond_reconstruction_is_busy_while_running() {
+        let model = test_backend::Model::new("vaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        kdamond.set_context_count(1).expect("stage context");
+        kdamond.command(KdamondCommand::On).expect("start model");
+
+        let error = admin
+            .set_kdamond_count(0)
+            .expect_err("running kdamond reconstruction must be busy");
+        assert!(error.is_resource_busy());
+        assert_eq!(admin.kdamond_count().expect("preserve count"), 1);
+
+        kdamond.command(KdamondCommand::Off).expect("stop model");
+        admin.set_kdamond_count(0).expect("remove stopped model");
     }
 
     #[derive(Default)]

@@ -174,6 +174,9 @@ fn low_level_target_and_scheme_attributes_round_trip() {
     assert_eq!(target.pid().expect("read target PID"), Some(pid));
     target.clear_pid().expect("clear target PID");
     assert_eq!(target.pid().expect("read cleared PID"), None);
+    target.set_obsolete(true).expect("mark target obsolete");
+    assert!(target.is_obsolete().expect("read obsolete target"));
+    target.set_obsolete(false).expect("retain target");
 
     let scheme = context.scheme(0);
     let future_action = Action::Unknown("future_action".into());
@@ -235,17 +238,18 @@ fn snapshot_preserves_raw_address_units_and_checks_byte_conversions() {
     let unit = AddressUnit::new(4_096).expect("valid address unit");
     context.set_address_unit(unit).expect("set address unit");
 
-    let snapshot = context
+    let raw_snapshot = context
         .scheme(0)
         .tried_regions(2)
         .expect("read raw snapshot");
+    assert_eq!(raw_snapshot.total_units(), 6_144);
+    let snapshot = raw_snapshot.with_effective_address_unit(unit);
     assert_eq!(snapshot.address_unit(), unit);
-    assert_eq!(snapshot.total_units(), 6_144);
     assert_eq!(
         snapshot.total_bytes().expect("checked byte conversion"),
         25_165_824
     );
-    let region = &snapshot.regions()[0];
+    let region = snapshot.region(0).expect("first region");
     assert_eq!(region.start_units(), 4_096);
     assert_eq!(region.start_bytes().expect("convert start"), 16_777_216);
     assert_eq!(region.len_units(), 4_096);
@@ -270,7 +274,8 @@ fn snapshot_reports_address_conversion_overflow() {
     let snapshot = context
         .scheme(0)
         .tried_regions(2)
-        .expect("read raw snapshot");
+        .expect("read raw snapshot")
+        .with_effective_address_unit(AddressUnit::new(u64::MAX).expect("valid unit"));
     assert!(matches!(
         snapshot.total_bytes(),
         Err(Error::AddressConversionOverflow { .. })
@@ -311,11 +316,30 @@ fn stages_queries_and_cleans_up_a_monitor() {
         .start()
         .expect("start monitor");
 
+    assert_eq!(monitor.operation(), &Operation::VirtualAddress);
+    assert_eq!(monitor.effective_address_unit(), AddressUnit::ONE);
     assert_eq!(fixture.read("kdamonds/nr_kdamonds"), "1");
     assert_eq!(fixture.read("kdamonds/0/contexts/0/operations"), "vaddr");
+    assert_eq!(fixture.read("kdamonds/0/contexts/0/pause"), "N");
+    assert_eq!(
+        fixture.read("kdamonds/0/contexts/0/monitoring_attrs/probes/nr_probes"),
+        "0"
+    );
     assert_eq!(
         fixture.read("kdamonds/0/contexts/0/targets/0/pid_target"),
         "42"
+    );
+    assert_eq!(
+        fixture.read("kdamonds/0/contexts/0/targets/0/obsolete_target"),
+        "N"
+    );
+    assert_eq!(
+        fixture.read("kdamonds/0/contexts/0/targets/0/regions/nr_regions"),
+        "0"
+    );
+    assert_eq!(
+        fixture.read("kdamonds/0/contexts/0/schemes/0/apply_interval_us"),
+        "0"
     );
     assert!(
         monitor
@@ -354,28 +378,23 @@ fn stages_queries_and_cleans_up_a_monitor() {
     let snapshot = monitor.snapshot().expect("query snapshot");
     assert_eq!(snapshot.total_bytes().expect("convert total"), 6_144);
     assert_eq!(snapshot.len(), 2);
-    assert_eq!(snapshot.regions()[0].start_units(), 4_096);
-    assert_eq!(snapshot.regions()[0].end_units(), 8_192);
-    assert_eq!(snapshot.regions()[0].len_units(), 4_096);
+    let first = snapshot.region(0).expect("first region");
+    let second = snapshot.region(1).expect("second region");
+    assert_eq!(first.start_units(), 4_096);
+    assert_eq!(first.end_units(), 8_192);
+    assert_eq!(first.len_units(), 4_096);
+    assert_eq!(first.len_bytes().expect("convert length"), 4_096);
+    assert_eq!(first.nr_accesses(), 7);
+    assert_eq!(first.age(), 3);
     assert_eq!(
-        snapshot.regions()[0].len_bytes().expect("convert length"),
-        4_096
-    );
-    assert_eq!(snapshot.regions()[0].nr_accesses(), 7);
-    assert_eq!(snapshot.regions()[0].age(), 3);
-    assert_eq!(
-        snapshot.regions()[0]
-            .filter_passed_bytes()
-            .expect("convert filtered size"),
+        first.filter_passed_bytes().expect("convert filtered size"),
         Some(4_096)
     );
     assert_eq!(
-        snapshot.regions()[1]
-            .filter_passed_bytes()
-            .expect("convert filtered size"),
+        second.filter_passed_bytes().expect("convert filtered size"),
         None
     );
-    assert_eq!(snapshot.regions()[0].probe_hits(), &[3, 7]);
+    assert_eq!(first.probe_hits(), &[3, 7]);
 
     fixture.write("kdamonds/0/state", "on\n");
     monitor.stop().expect("stop monitor");
@@ -461,6 +480,78 @@ fn refuses_to_stop_an_externally_reconfigured_slot() {
     ));
     assert_eq!(fixture.read("kdamonds/0/state"), "on");
     assert_eq!(fixture.read("kdamonds/nr_kdamonds"), "1");
+}
+
+#[test]
+fn refuses_to_stop_when_extended_typed_configuration_changes() {
+    for (path, value, expected_reason) in [
+        (
+            "kdamonds/0/contexts/0/pause",
+            "Y\n",
+            "the staged monitoring attributes changed",
+        ),
+        (
+            "kdamonds/0/contexts/0/monitoring_attrs/probes/nr_probes",
+            "1\n",
+            "the staged monitoring attributes changed",
+        ),
+        (
+            "kdamonds/0/contexts/0/targets/0/obsolete_target",
+            "Y\n",
+            "the staged target changed",
+        ),
+        (
+            "kdamonds/0/contexts/0/targets/0/regions/nr_regions",
+            "1\n",
+            "the staged target changed",
+        ),
+        (
+            "kdamonds/0/contexts/0/schemes/0/apply_interval_us",
+            "100\n",
+            "the staged scheme changed",
+        ),
+    ] {
+        let fixture = Fixture::new("vaddr\n");
+        let monitor = fixture
+            .damon()
+            .monitor_pid(Pid::new(42).expect("valid pid"))
+            .start()
+            .expect("start monitor");
+
+        fixture.write(path, value);
+        let error = monitor
+            .stop()
+            .expect_err("changed staged input must invalidate ownership");
+
+        match error {
+            Error::OwnershipLost { reason } => assert_eq!(reason, expected_reason, "{path}"),
+            other => panic!("unexpected ownership error for {path}: {other:?}"),
+        }
+        assert_eq!(fixture.read("kdamonds/0/state"), "on");
+    }
+}
+
+#[test]
+fn refuses_to_stop_when_auxiliary_scheme_configuration_changes() {
+    let fixture = Fixture::new("vaddr\n");
+    let monitor = fixture
+        .damon()
+        .monitor_pid(Pid::new(42).expect("valid pid"))
+        .start()
+        .expect("start monitor");
+
+    fixture.write("kdamonds/0/contexts/0/schemes/0/target_nid", "7\n");
+    let error = monitor
+        .stop()
+        .expect_err("changed auxiliary scheme input must invalidate ownership");
+
+    assert!(matches!(
+        error,
+        Error::OwnershipLost {
+            reason: "the staged auxiliary configuration changed"
+        }
+    ));
+    assert_eq!(fixture.read("kdamonds/0/state"), "on");
 }
 
 #[test]
@@ -819,8 +910,11 @@ impl Fixture {
             ),
             ("kdamonds/0/contexts/0/targets/nr_targets", "0\n"),
             ("kdamonds/0/contexts/0/targets/0/pid_target", "0\n"),
+            ("kdamonds/0/contexts/0/targets/0/obsolete_target", "N\n"),
+            ("kdamonds/0/contexts/0/targets/0/regions/nr_regions", "0\n"),
             ("kdamonds/0/contexts/0/schemes/nr_schemes", "0\n"),
             ("kdamonds/0/contexts/0/schemes/0/action", "stat\n"),
+            ("kdamonds/0/contexts/0/schemes/0/target_nid", "0\n"),
             ("kdamonds/0/contexts/0/schemes/0/apply_interval_us", "0\n"),
             (
                 "kdamonds/0/contexts/0/schemes/0/tried_regions/total_bytes",
