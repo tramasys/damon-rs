@@ -1,7 +1,7 @@
 # damon
 
 `damon` is a safe, typed Rust interface to Linux DAMON (Data Access
-Monitor). The repository is named `damon-rs`; the published library and crate
+Monitor). The repository is named `damon-rs`. The published library and crate
 are named `damon`.
 
 This initial foundation focuses on the privileged sysfs ABI and process
@@ -95,23 +95,6 @@ fn inspect() -> Result<(), damon::Error> {
     Ok(())
 }
 ```
-
-## Performance policy
-
-DAMON is designed for low-overhead monitoring, and this crate avoids hiding
-unbounded background work:
-
-- configuration is synchronous and allocation is kept off repeated numeric
-  sysfs parsing paths;
-- numeric snapshot fields are read into fixed stack buffers;
-- snapshot storage is preallocated from the configured maximum-region hint;
-- the crate has no runtime dependencies, executor, polling thread, or unsafe
-  code;
-- release builds use thin LTO and one codegen unit.
-
-The kernel sysfs ABI still requires one open/read per exposed field. A future
-tracepoint/perf transport should be a separate, explicitly selected data path
-rather than hidden behind this API.
 
 ## Toolchain and compatibility
 

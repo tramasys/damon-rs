@@ -66,7 +66,8 @@ impl Snapshot {
         &self.regions
     }
 
-    /// Returns the sum reported by the kernel for all matched regions.
+    /// Returns the matched byte total reported by the kernel or, on kernels
+    /// without that field, computed from the materialized regions.
     #[must_use]
     pub const fn total_bytes(&self) -> u64 {
         self.total_bytes

@@ -57,9 +57,9 @@ pub struct MonitoringIntervals {
 impl MonitoringIntervals {
     /// Creates and validates a set of monitoring intervals.
     ///
-    /// Values must be positive, exactly representable as whole microseconds,
-    /// fit the kernel's native unsigned-long range, and the sampling interval
-    /// must not exceed the aggregation interval.
+    /// Values must be exactly representable as whole microseconds, fit the
+    /// kernel's native unsigned-long range, and the sampling interval must not
+    /// exceed the aggregation interval. Linux accepts zero intervals.
     pub fn new(sample: Duration, aggregation: Duration, update: Duration) -> Result<Self> {
         let sample_us = duration_micros("sample interval", sample)?;
         let aggregation_us = duration_micros("aggregation interval", aggregation)?;
@@ -118,12 +118,6 @@ fn duration_micros(field: &'static str, duration: Duration) -> Result<u64> {
         reason: "does not fit in 64-bit microseconds",
     })?;
 
-    if micros == 0 {
-        return Err(Error::InvalidConfiguration {
-            field,
-            reason: "must be at least one microsecond",
-        });
-    }
     if Duration::from_micros(micros) != duration {
         return Err(Error::InvalidConfiguration {
             field,
@@ -199,6 +193,7 @@ mod tests {
 
     #[test]
     fn intervals_match_kernel_invariants() {
+        assert!(MonitoringIntervals::new(Duration::ZERO, Duration::ZERO, Duration::ZERO).is_ok());
         assert!(
             MonitoringIntervals::new(
                 Duration::from_micros(5),

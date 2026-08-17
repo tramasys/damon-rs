@@ -5,7 +5,7 @@
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config::{MonitoringIntervals, Pid, RegionBounds};
@@ -14,6 +14,8 @@ use crate::{Error, Region, Result, Snapshot};
 
 /// Default location of DAMON's privileged admin interface.
 pub const DEFAULT_ADMIN_PATH: &str = "/sys/kernel/mm/damon/admin";
+
+const MAX_INITIAL_REGION_CAPACITY: usize = 4_096;
 
 /// A DAMON monitoring operations set.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -172,6 +174,7 @@ pub struct Capabilities {
     probes: bool,
     apply_interval: bool,
     tried_regions: bool,
+    tried_regions_total_bytes: bool,
 }
 
 impl Capabilities {
@@ -223,6 +226,12 @@ impl Capabilities {
     #[must_use]
     pub const fn has_tried_regions(&self) -> bool {
         self.tried_regions
+    }
+
+    /// Returns whether tried-region total bytes are reported by the kernel.
+    #[must_use]
+    pub const fn has_tried_regions_total_bytes(&self) -> bool {
+        self.tried_regions_total_bytes
     }
 }
 
@@ -340,7 +349,8 @@ impl Kdamond {
             address_unit: path_exists(&context.path.join("addr_unit"))?,
             probes: path_exists(&context.path.join("monitoring_attrs/probes/nr_probes"))?,
             apply_interval: path_exists(&scheme.path.join("apply_interval_us"))?,
-            tried_regions: path_exists(&scheme.path.join("tried_regions/total_bytes"))?,
+            tried_regions: path_is_dir(&scheme.path.join("tried_regions"))?,
+            tried_regions_total_bytes: path_exists(&scheme.path.join("tried_regions/total_bytes"))?,
         })
     }
 }
@@ -483,11 +493,20 @@ impl Scheme {
     ///
     /// Call [`Kdamond::command`] with
     /// [`KdamondCommand::UpdateSchemesTriedRegions`] first. `capacity_hint`
-    /// only controls userspace allocation and does not limit results.
+    /// only controls userspace allocation and does not limit results. The
+    /// initial allocation is capped to avoid excessive eager allocation. When
+    /// the kernel does not expose `total_bytes`, the total is computed from
+    /// the validated materialized regions.
     pub fn tried_regions(&self, capacity_hint: usize) -> Result<Snapshot> {
         let base = self.path.join("tried_regions");
-        let total_bytes = read_u64(&base.join("total_bytes"))?;
-        let mut regions = Vec::with_capacity(capacity_hint);
+        let total_bytes_path = base.join("total_bytes");
+        let reported_total_bytes = if path_exists(&total_bytes_path)? {
+            Some(read_u64(&total_bytes_path)?)
+        } else {
+            None
+        };
+        let mut computed_total_bytes = 0_u64;
+        let mut regions = Vec::with_capacity(capacity_hint.min(MAX_INITIAL_REGION_CAPACITY));
 
         for index in 0_usize.. {
             let mut path = base.join(index.to_string());
@@ -501,6 +520,11 @@ impl Scheme {
             let end = read_u64(&path)?;
             if end < start {
                 return Err(Error::InvalidRegion { start, end });
+            }
+            if reported_total_bytes.is_none() {
+                computed_total_bytes = computed_total_bytes
+                    .checked_add(end - start)
+                    .ok_or(Error::SnapshotSizeOverflow)?;
             }
             path.pop();
             path.push("nr_accesses");
@@ -527,7 +551,7 @@ impl Scheme {
 
         Ok(Snapshot {
             regions,
-            total_bytes,
+            total_bytes: reported_total_bytes.unwrap_or(computed_total_bytes),
         })
     }
 }
@@ -535,6 +559,14 @@ impl Scheme {
 fn path_exists(path: &Path) -> Result<bool> {
     path.try_exists()
         .map_err(|error| io_error("inspect", path, error))
+}
+
+fn path_is_dir(path: &Path) -> Result<bool> {
+    match path.metadata() {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error("inspect", path, error)),
+    }
 }
 
 fn read_text(path: &Path) -> Result<String> {
@@ -581,15 +613,36 @@ fn invalid_kernel_value(path: &Path, value: impl Into<Box<str>>, expected: &'sta
 }
 
 fn write_value(path: &Path, value: impl fmt::Display) -> Result<()> {
-    let mut file = open_for_write(path)?;
-    file.write_fmt(format_args!("{value}"))
-        .map_err(|error| io_error("write", path, error))
+    write_bytes(path, value.to_string().as_bytes())
 }
 
 fn write_bytes(path: &Path, value: &[u8]) -> Result<()> {
     let mut file = open_for_write(path)?;
-    file.write_all(value)
-        .map_err(|error| io_error("write", path, error))
+    write_once(&mut file, path, value)
+}
+
+fn write_once(writer: &mut impl Write, path: &Path, value: &[u8]) -> Result<()> {
+    let written = loop {
+        match writer.write(value) {
+            Ok(written) => break written,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(io_error("write", path, error)),
+        }
+    };
+    if written != value.len() {
+        return Err(io_error(
+            "write complete value",
+            path,
+            io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!(
+                    "short sysfs write: wrote {written} of {} bytes",
+                    value.len()
+                ),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn open_for_write(path: &Path) -> Result<File> {
@@ -626,6 +679,111 @@ mod tests {
     fn numeric_reader_rejects_oversized_input() {
         let fixture = TempFile::new(&"9".repeat(65));
         assert!(read_u64(&fixture.path).is_err());
+    }
+
+    #[test]
+    fn numeric_reader_accepts_kernel_whitespace() {
+        let fixture = TempFile::new("  18446744073709551615\n");
+        assert_eq!(read_u64(&fixture.path).expect("read u64::MAX"), u64::MAX);
+    }
+
+    #[test]
+    fn numeric_reader_reports_malformed_values() {
+        let fixture = TempFile::new("not-a-number\n");
+        let error = read_u64(&fixture.path).expect_err("reject malformed value");
+
+        assert!(matches!(
+            error,
+            Error::InvalidKernelValue {
+                value,
+                expected: "u64",
+                ..
+            } if &*value == "not-a-number"
+        ));
+    }
+
+    #[test]
+    fn sysfs_write_is_submitted_in_one_call() {
+        let mut writer = RecordingWriter::default();
+        write_once(&mut writer, Path::new("state"), b"on").expect("write complete value");
+
+        assert_eq!(writer.calls, 1);
+        assert_eq!(writer.bytes, b"on");
+    }
+
+    #[test]
+    fn sysfs_write_retries_interruption_before_submitting_bytes() {
+        let mut writer = InterruptedWriter::default();
+        write_once(&mut writer, Path::new("state"), b"off").expect("retry interruption");
+
+        assert_eq!(writer.calls, 2);
+        assert_eq!(writer.bytes, b"off");
+    }
+
+    #[test]
+    fn sysfs_write_rejects_a_short_first_write() {
+        let error = write_once(&mut ShortWriter, Path::new("state"), b"commit")
+            .expect_err("short sysfs write must fail");
+
+        assert!(matches!(
+            error,
+            Error::Io {
+                operation: "write complete value",
+                source,
+                ..
+            } if source.kind() == io::ErrorKind::WriteZero
+        ));
+    }
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        calls: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct InterruptedWriter {
+        calls: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for InterruptedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 1 {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ShortWriter;
+
+    impl Write for ShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len().saturating_sub(1))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     struct TempFile {

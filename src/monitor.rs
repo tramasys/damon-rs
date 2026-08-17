@@ -115,13 +115,13 @@ impl MonitorBuilder<'_> {
             return Err(Error::InUse { kdamonds: existing });
         }
 
-        self.damon.admin.set_kdamond_count(1)?;
+        retry_busy(|| self.damon.admin.set_kdamond_count(1))?;
         let kdamond = self.damon.admin.kdamond(0);
         let setup = configure_monitor(&kdamond, self.pid, intervals, region_bounds);
         let capabilities = match setup {
             Ok(capabilities) => capabilities,
             Err(operation) => {
-                return match self.damon.admin.set_kdamond_count(0) {
+                return match retry_busy(|| self.damon.admin.set_kdamond_count(0)) {
                     Ok(()) => Err(operation),
                     Err(rollback) => Err(Error::Rollback {
                         operation: Box::new(operation),
@@ -148,7 +148,7 @@ fn configure_monitor(
     intervals: MonitoringIntervals,
     region_bounds: RegionBounds,
 ) -> Result<Capabilities> {
-    kdamond.set_context_count(1)?;
+    retry_busy(|| kdamond.set_context_count(1))?;
     let context = kdamond.context(0);
     let operations = context.available_operations()?;
     if !operations.contains(&Operation::VirtualAddress) {
@@ -160,9 +160,9 @@ fn configure_monitor(
     context.set_operation(&Operation::VirtualAddress)?;
     context.set_intervals(intervals)?;
     context.set_region_bounds(region_bounds)?;
-    context.set_target_count(1)?;
+    retry_busy(|| context.set_target_count(1))?;
     context.target(0).set_pid(pid)?;
-    context.set_scheme_count(1)?;
+    retry_busy(|| context.set_scheme_count(1))?;
     let scheme = context.scheme(0);
     scheme.set_action(Action::Stat)?;
     scheme.set_match_all()?;
@@ -174,8 +174,32 @@ fn configure_monitor(
         });
     }
 
-    kdamond.command(KdamondCommand::On)?;
+    retry_busy(|| kdamond.command(KdamondCommand::On))?;
     Ok(capabilities)
+}
+
+fn retry_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    const MAX_RETRIES: usize = 5;
+    const INITIAL_DELAY_MS: u64 = 10;
+    let mut retries = 0;
+
+    loop {
+        match operation() {
+            Err(error) if error.is_resource_busy() && retries < MAX_RETRIES => {
+                std::thread::sleep(Duration::from_millis(INITIAL_DELAY_MS << retries));
+                retries += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn kdamond_is_running(kdamond: &Kdamond) -> Result<bool> {
+    match retry_busy(|| kdamond.state())? {
+        KdamondState::On => Ok(true),
+        KdamondState::Off => Ok(false),
+        KdamondState::Unknown(state) => Err(Error::UnexpectedKdamondState { state }),
+    }
 }
 
 /// A running, exclusively owned high-level DAMON monitor.
@@ -205,8 +229,14 @@ impl Monitor {
         if !self.running {
             return Err(Error::NotRunning);
         }
-        self.kdamond
-            .command(KdamondCommand::UpdateSchemesTriedRegions)?;
+        if !kdamond_is_running(&self.kdamond)? {
+            self.running = false;
+            return Err(Error::NotRunning);
+        }
+        retry_busy(|| {
+            self.kdamond
+                .command(KdamondCommand::UpdateSchemesTriedRegions)
+        })?;
         self.kdamond
             .context(0)
             .scheme(0)
@@ -215,7 +245,10 @@ impl Monitor {
 
     /// Reads whether the kernel monitoring thread is running.
     pub fn is_running(&self) -> Result<bool> {
-        Ok(matches!(self.kdamond.state()?, KdamondState::On))
+        if !self.running {
+            return Ok(false);
+        }
+        kdamond_is_running(&self.kdamond)
     }
 
     /// Stops monitoring and removes the crate-owned kdamond slot.
@@ -225,8 +258,8 @@ impl Monitor {
 
     fn stop_inner(&mut self) -> Result<()> {
         if self.running {
-            if !matches!(self.kdamond.state()?, KdamondState::Off) {
-                self.kdamond.command(KdamondCommand::Off)?;
+            if kdamond_is_running(&self.kdamond)? {
+                retry_busy(|| self.kdamond.command(KdamondCommand::Off))?;
             }
             self.running = false;
         }
@@ -235,7 +268,7 @@ impl Monitor {
             match count {
                 0 => self.owns_slot = false,
                 1 => {
-                    self.admin.set_kdamond_count(0)?;
+                    retry_busy(|| self.admin.set_kdamond_count(0))?;
                     self.owns_slot = false;
                 }
                 kdamonds => return Err(Error::InUse { kdamonds }),
@@ -248,5 +281,64 @@ impl Monitor {
 impl Drop for Monitor {
     fn drop(&mut self) {
         let _ = self.stop_inner();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn busy_operations_are_retried() {
+        let mut attempts = 0;
+        let value = retry_busy(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(os_error(16))
+            } else {
+                Ok(42)
+            }
+        })
+        .expect("eventual success");
+
+        assert_eq!(value, 42);
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn busy_retries_are_bounded() {
+        let mut attempts = 0;
+        let error = retry_busy(|| {
+            attempts += 1;
+            Err::<(), _>(os_error(16))
+        })
+        .expect_err("persistent busy error");
+
+        assert!(error.is_resource_busy());
+        assert_eq!(attempts, 6);
+    }
+
+    #[test]
+    fn other_io_errors_are_not_retried() {
+        let mut attempts = 0;
+        let error = retry_busy(|| {
+            attempts += 1;
+            Err::<(), _>(os_error(13))
+        })
+        .expect_err("permission error");
+
+        assert!(!error.is_resource_busy());
+        assert_eq!(attempts, 1);
+    }
+
+    fn os_error(code: i32) -> Error {
+        Error::Io {
+            operation: "test",
+            path: PathBuf::from("fixture"),
+            source: io::Error::from_raw_os_error(code),
+        }
     }
 }

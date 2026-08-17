@@ -18,6 +18,7 @@ Primary sources:
 - [Linux 7.2 `mm/damon/sysfs.c`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/mm/damon/sysfs.c?h=v7.2)
 - [Linux 7.2 `mm/damon/sysfs-schemes.c`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/mm/damon/sysfs-schemes.c?h=v7.2)
 - [Linux 7.2 DAMON public header](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/damon.h?h=v7.2)
+- [Official `damo` sysfs implementation](https://github.com/damonitor/damo/blob/next/src/_damon_sysfs.py)
 - [Rust stable release history](https://blog.rust-lang.org/releases/)
 
 ## High-level monitor transaction
@@ -51,13 +52,17 @@ simple file. Query-style retrieval uses DAMOS tried regions:
 
 1. Configure a `stat` scheme whose access pattern covers the desired regions.
 2. Write `update_schemes_tried_regions` to `kdamonds/0/state`.
-3. Read `schemes/0/tried_regions/total_bytes`.
+3. Read `schemes/0/tried_regions/total_bytes` when the kernel exposes it.
 4. Read consecutive indexed region directories containing `start`, `end`,
    `nr_accesses`, `age`, and, on newer kernels, `sz_filter_passed`.
 
+Kernels with tried-region queries but no `total_bytes` file are supported by
+summing the validated materialized region sizes in userspace. This matches the
+compatibility distinction made by the official `damo` implementation.
+
 The command can wait until the next scheme apply interval. A zero
 `apply_interval_us` uses the aggregation interval. `nr_accesses` is a count per
-aggregation interval and `age` is measured in aggregation intervals; neither
+aggregation interval and `age` is measured in aggregation intervals. Neither
 is a byte-normalized density.
 
 ## Validated invariants
@@ -65,10 +70,10 @@ is a byte-normalized density.
 The userspace types enforce kernel invariants before writing:
 
 - PID is in `1..=i32::MAX`.
-- intervals are positive whole microseconds that fit `unsigned long`;
-- sampling interval does not exceed aggregation interval;
-- minimum regions is at least three;
-- minimum regions does not exceed maximum regions;
+- intervals are whole microseconds that fit `unsigned long`. Zero is valid.
+- sampling interval does not exceed aggregation interval.
+- minimum regions is at least three.
+- minimum regions does not exceed maximum regions.
 - returned region end is not below its start.
 
 Linux 7.2 defaults are 5,000 microseconds sampling, 100,000 microseconds
@@ -86,4 +91,3 @@ Linux 7.2 is the source-verified baseline, not a hard-coded version gate. Older
 kernels may work when they expose the required paths. Kernel-backed VM tests
 across maintained LTS releases are planned before declaring a broad kernel
 support matrix.
-

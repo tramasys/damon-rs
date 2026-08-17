@@ -43,6 +43,11 @@ pub enum Error {
     },
     /// An operation requires a running monitor.
     NotRunning,
+    /// The kernel reported an unknown kdamond state.
+    UnexpectedKdamondState {
+        /// The unknown state string.
+        state: Box<str>,
+    },
     /// A kernel sysfs value was malformed or outside the userspace type range.
     InvalidKernelValue {
         /// The file containing the invalid value.
@@ -59,6 +64,8 @@ pub enum Error {
         /// Exclusive end address.
         end: u64,
     },
+    /// Summing tried-region sizes overflowed the snapshot representation.
+    SnapshotSizeOverflow,
     /// A filesystem operation failed.
     Io {
         /// The operation being performed.
@@ -108,6 +115,9 @@ impl fmt::Display for Error {
                 "DAMON is already configured with {kdamonds} kdamond(s)"
             ),
             Self::NotRunning => formatter.write_str("the DAMON monitor is not running"),
+            Self::UnexpectedKdamondState { state } => {
+                write!(formatter, "kernel returned unknown kdamond state {state:?}")
+            }
             Self::InvalidKernelValue {
                 path,
                 value,
@@ -122,6 +132,9 @@ impl fmt::Display for Error {
                     formatter,
                     "kernel returned invalid region {start:#x}-{end:#x}"
                 )
+            }
+            Self::SnapshotSizeOverflow => {
+                formatter.write_str("DAMON snapshot total size exceeds u64::MAX")
             }
             Self::Io {
                 operation,
@@ -140,6 +153,19 @@ impl fmt::Display for Error {
                 "DAMON setup failed ({operation}); rollback also failed ({rollback})"
             ),
         }
+    }
+}
+
+impl Error {
+    /// Returns whether this error represents Linux `EBUSY`.
+    #[must_use]
+    pub fn is_resource_busy(&self) -> bool {
+        const LINUX_EBUSY: i32 = 16;
+
+        matches!(
+            self,
+            Self::Io { source, .. } if source.raw_os_error() == Some(LINUX_EBUSY)
+        )
     }
 }
 
