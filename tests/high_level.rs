@@ -3,8 +3,157 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use damon::{Damon, Error, Operation, Pid};
+use damon::sysfs::{
+    AccessPattern, AccessPatternRange, Action, DamonAdmin, MAX_PROBES, ProbeFilterType,
+};
+use damon::{Damon, Error, MonitoringIntervals, Operation, Pid, RegionBounds, SysfsFeature};
+
+#[test]
+fn low_level_context_attributes_round_trip() {
+    let fixture = Fixture::new("vaddr\nfvaddr\npaddr\n");
+    let admin = DamonAdmin::open(fixture.path()).expect("open fixture");
+    let kdamond = admin.kdamond(0);
+    assert_eq!(kdamond.pid().expect("read stopped PID"), None);
+    kdamond
+        .set_refresh_interval(Duration::from_millis(250))
+        .expect("set refresh interval");
+    assert_eq!(
+        kdamond.refresh_interval().expect("read refresh interval"),
+        Duration::from_millis(250)
+    );
+
+    let context = kdamond.context(0);
+    context
+        .set_operation(&Operation::FixedVirtualAddress)
+        .expect("set operation");
+    assert_eq!(
+        context.operation().expect("read operation"),
+        Operation::FixedVirtualAddress
+    );
+    context.set_address_unit(4_096).expect("set address unit");
+    assert_eq!(context.address_unit().expect("read address unit"), 4_096);
+    context.set_paused(true).expect("pause context");
+    assert!(context.is_paused().expect("read pause state"));
+
+    let intervals = MonitoringIntervals::new(
+        Duration::from_micros(10),
+        Duration::from_micros(100),
+        Duration::from_secs(1),
+    )
+    .expect("valid intervals");
+    context.set_intervals(intervals).expect("set intervals");
+    assert_eq!(context.intervals().expect("read intervals"), intervals);
+    let bounds = RegionBounds::new(3, 128).expect("valid bounds");
+    context.set_region_bounds(bounds).expect("set bounds");
+    assert_eq!(context.region_bounds().expect("read bounds"), bounds);
+}
+
+#[test]
+fn low_level_probe_attributes_and_capabilities_are_individual() {
+    let fixture = Fixture::new("vaddr\n");
+    fixture.add_probe_filter_files();
+    let admin = DamonAdmin::open(fixture.path()).expect("open fixture");
+    let kdamond = admin.kdamond(0);
+    let context = kdamond.context(0);
+
+    context.set_probe_count(1).expect("stage probe");
+    assert_eq!(context.probe_count().expect("read probe count"), 1);
+    assert!(context.set_probe_count(MAX_PROBES + 1).is_err());
+    let probe = context.probe(0);
+    probe.set_filter_count(1).expect("stage probe filter");
+    assert_eq!(probe.filter_count().expect("read filter count"), 1);
+    let filter = probe.filter(0);
+    filter
+        .set_filter_type(&ProbeFilterType::MemoryControlGroup)
+        .expect("set filter type");
+    filter.set_matching(true).expect("set matching");
+    filter.set_allowed(true).expect("set allow");
+    filter
+        .set_cgroup_path("/sys/fs/cgroup/workload")
+        .expect("set cgroup path");
+    assert_eq!(
+        filter.filter_type().expect("read filter type"),
+        ProbeFilterType::MemoryControlGroup
+    );
+    assert!(filter.matching().expect("read matching"));
+    assert!(filter.allowed().expect("read allow"));
+    assert_eq!(
+        filter.cgroup_path().expect("read cgroup path"),
+        "/sys/fs/cgroup/workload"
+    );
+
+    let capabilities = kdamond.capabilities(0, 0).expect("discover features");
+    for feature in [
+        SysfsFeature::PeriodicRefresh,
+        SysfsFeature::AvailableOperations,
+        SysfsFeature::AddressUnit,
+        SysfsFeature::ContextPause,
+        SysfsFeature::AttributeProbeCount,
+        SysfsFeature::ProbeFilterCount,
+        SysfsFeature::ProbeFilterType,
+        SysfsFeature::ProbeFilterMatching,
+        SysfsFeature::ProbeFilterAllow,
+        SysfsFeature::ProbeFilterPath,
+        SysfsFeature::SchemeApplyInterval,
+        SysfsFeature::TriedRegions,
+        SysfsFeature::TriedRegionsTotalBytes,
+    ] {
+        assert!(capabilities.has(feature), "missing {feature:?}");
+    }
+
+    fixture.remove("kdamonds/0/contexts/0/monitoring_attrs/probes/0/filters/0/allow");
+    let capabilities = kdamond
+        .capabilities(0, 0)
+        .expect("rediscover individual paths");
+    assert!(!capabilities.has(SysfsFeature::ProbeFilterAllow));
+    assert!(capabilities.has(SysfsFeature::ProbeFilterMatching));
+}
+
+#[test]
+fn low_level_target_and_scheme_attributes_round_trip() {
+    let fixture = Fixture::new("vaddr\n");
+    let admin = DamonAdmin::open(fixture.path()).expect("open fixture");
+    let context = admin.kdamond(0).context(0);
+
+    let target = context.target(0);
+    let pid = Pid::new(42).expect("valid PID");
+    target.set_pid(pid).expect("set target PID");
+    assert_eq!(target.pid().expect("read target PID"), Some(pid));
+    target.clear_pid().expect("clear target PID");
+    assert_eq!(target.pid().expect("read cleared PID"), None);
+
+    let scheme = context.scheme(0);
+    let future_action = Action::Unknown("future_action".into());
+    scheme
+        .set_action(&future_action)
+        .expect("set future action in fixture");
+    assert_eq!(scheme.action().expect("read action"), future_action);
+    let pattern = AccessPattern::new(
+        AccessPatternRange::new(1, 10).expect("valid size range"),
+        AccessPatternRange::new(2, 20).expect("valid access range"),
+        AccessPatternRange::new(3, 30).expect("valid age range"),
+    );
+    scheme.set_access_pattern(pattern).expect("set pattern");
+    assert_eq!(scheme.access_pattern().expect("read pattern"), pattern);
+    scheme.set_match_all().expect("set match-all pattern");
+    assert_eq!(
+        scheme
+            .access_pattern()
+            .expect("read match-all pattern")
+            .size()
+            .max(),
+        u64::MAX
+    );
+    scheme
+        .set_apply_interval(Duration::from_micros(500))
+        .expect("set apply interval");
+    assert_eq!(
+        scheme.apply_interval().expect("read apply interval"),
+        Duration::from_micros(500)
+    );
+}
 
 #[test]
 fn stages_queries_and_cleans_up_a_monitor() {
@@ -24,11 +173,23 @@ fn stages_queries_and_cleans_up_a_monitor() {
         fixture.read("kdamonds/0/contexts/0/targets/0/pid_target"),
         "42"
     );
-    assert!(monitor.capabilities().supports(&Operation::VirtualAddress));
-    assert!(monitor.capabilities().has_pause());
-    assert!(monitor.capabilities().has_probes());
-    assert!(monitor.capabilities().has_tried_regions());
-    assert!(monitor.capabilities().has_tried_regions_total_bytes());
+    assert!(
+        monitor
+            .capabilities()
+            .supports_operation(&Operation::VirtualAddress)
+    );
+    assert!(monitor.capabilities().has(SysfsFeature::ContextPause));
+    assert!(
+        monitor
+            .capabilities()
+            .has(SysfsFeature::AttributeProbeCount)
+    );
+    assert!(monitor.capabilities().has(SysfsFeature::TriedRegions));
+    assert!(
+        monitor
+            .capabilities()
+            .has(SysfsFeature::TriedRegionsTotalBytes)
+    );
     assert_eq!(
         monitor.capabilities().operations()[2],
         Operation::Unknown("future_ops".into())
@@ -132,8 +293,12 @@ fn supports_tried_regions_without_total_bytes() {
         .start()
         .expect("tried-region directory provides query support");
 
-    assert!(monitor.capabilities().has_tried_regions());
-    assert!(!monitor.capabilities().has_tried_regions_total_bytes());
+    assert!(monitor.capabilities().has(SysfsFeature::TriedRegions));
+    assert!(
+        !monitor
+            .capabilities()
+            .has(SysfsFeature::TriedRegionsTotalBytes)
+    );
     let snapshot = monitor.snapshot().expect("query snapshot");
     assert_eq!(snapshot.total_bytes(), 6_144);
 
@@ -337,6 +502,7 @@ impl Fixture {
         for (path, value) in [
             ("kdamonds/nr_kdamonds", "0\n"),
             ("kdamonds/0/state", "off\n"),
+            ("kdamonds/0/pid", "-1\n"),
             ("kdamonds/0/refresh_ms", "0\n"),
             ("kdamonds/0/contexts/nr_contexts", "0\n"),
             (
@@ -395,6 +561,33 @@ impl Fixture {
         }
 
         fixture
+    }
+
+    fn add_probe_filter_files(&self) {
+        for (path, value) in [
+            (
+                "kdamonds/0/contexts/0/monitoring_attrs/probes/0/filters/nr_filters",
+                "0\n",
+            ),
+            (
+                "kdamonds/0/contexts/0/monitoring_attrs/probes/0/filters/0/type",
+                "anon\n",
+            ),
+            (
+                "kdamonds/0/contexts/0/monitoring_attrs/probes/0/filters/0/matching",
+                "N\n",
+            ),
+            (
+                "kdamonds/0/contexts/0/monitoring_attrs/probes/0/filters/0/allow",
+                "N\n",
+            ),
+            (
+                "kdamonds/0/contexts/0/monitoring_attrs/probes/0/filters/0/path",
+                "\n",
+            ),
+        ] {
+            self.write(path, value);
+        }
     }
 
     fn add_snapshot_regions(&self) {

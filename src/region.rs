@@ -60,7 +60,11 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Returns the monitored regions in address order.
+    /// Returns the monitored regions in the kernel's materialization order.
+    ///
+    /// Regions for one target are normally address ordered. Low-level callers
+    /// can configure multiple targets, however, and the flattened sysfs result
+    /// does not promise global address ordering across those targets.
     #[must_use]
     pub fn regions(&self) -> &[Region] {
         &self.regions

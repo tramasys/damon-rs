@@ -15,6 +15,11 @@ Versioning and the Keep a Changelog structure.
 
 ### Changed
 
+- Discover optional sysfs support as concrete `SysfsFeature` paths.
+- Preserve unknown future DAMOS actions and expose symmetric low-level reads.
+- Select match-all limits from the kernel ABI width instead of userspace
+  `usize`.
+- Document tried regions in kernel materialization order across targets.
 - Submit every sysfs attribute value in one complete write.
 - Retry transient kernel busy responses during lifecycle operations.
 - Support tried-region snapshots on kernels without `total_bytes`.

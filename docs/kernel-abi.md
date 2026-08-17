@@ -70,7 +70,7 @@ is a byte-normalized density.
 The userspace types enforce kernel invariants before writing:
 
 - PID is in `1..=i32::MAX`.
-- intervals are whole microseconds that fit `unsigned long`. Zero is valid.
+- intervals are whole microseconds represented as `u64`. Zero is valid.
 - sampling interval does not exceed aggregation interval.
 - minimum regions is at least three.
 - minimum regions does not exceed maximum regions.
@@ -82,10 +82,19 @@ regions. The crate uses the same defaults.
 
 ## Compatibility policy
 
-The ABI grows over time, so known operation names are typed while unknown names
-are preserved. Optional paths such as `refresh_ms`, context `pause`,
-`addr_unit`, probes, scheme apply intervals, and tried-region queries are
-detected from the populated hierarchy.
+The ABI grows over time, so known operation and action names are typed while
+unknown names are preserved. Optional support is represented as a set of
+`SysfsFeature` values. Each value is detected from its concrete file or
+directory in the populated hierarchy, following the official `damo`
+implementation. Features below an indexed child are discoverable after that
+child is staged.
+
+DAMON uses the kernel's `unsigned long` for several values. Userspace pointer
+width does not reveal kernel width when a 32-bit process controls a 64-bit
+kernel. The match-all helper therefore probes `u64::MAX` and falls back to
+`u32::MAX` only when the kernel reports a numeric range rejection. Other `u64`
+values are sent to the kernel without a userspace-`usize` restriction, and the
+kernel validates its native range.
 
 Linux 7.2 is the source-verified baseline, not a hard-coded version gate. Older
 kernels may work when they expose the required paths. Kernel-backed VM tests

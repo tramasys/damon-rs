@@ -57,9 +57,14 @@ pub struct MonitoringIntervals {
 impl MonitoringIntervals {
     /// Creates and validates a set of monitoring intervals.
     ///
-    /// Values must be exactly representable as whole microseconds, fit the
-    /// kernel's native unsigned-long range, and the sampling interval must not
-    /// exceed the aggregation interval. Linux accepts zero intervals.
+    /// Values must be exactly representable as whole microseconds, and the
+    /// sampling interval must not exceed the aggregation interval. Linux
+    /// accepts zero intervals.
+    ///
+    /// DAMON stores these values as the kernel's `unsigned long`. A 32-bit
+    /// userspace process can control a 64-bit kernel, so validation cannot use
+    /// userspace's `usize` width. The kernel reports an error on write when a
+    /// value exceeds its native range.
     pub fn new(sample: Duration, aggregation: Duration, update: Duration) -> Result<Self> {
         let sample_us = duration_micros("sample interval", sample)?;
         let aggregation_us = duration_micros("aggregation interval", aggregation)?;
@@ -124,13 +129,6 @@ fn duration_micros(field: &'static str, duration: Duration) -> Result<u64> {
             reason: "must be exactly representable in whole microseconds",
         });
     }
-    if micros > usize::MAX as u64 {
-        return Err(Error::InvalidConfiguration {
-            field,
-            reason: "does not fit in the kernel unsigned-long range",
-        });
-    }
-
     Ok(micros)
 }
 

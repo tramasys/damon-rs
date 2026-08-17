@@ -39,4 +39,4 @@ pub use config::{MonitoringIntervals, Pid, RegionBounds};
 pub use error::{Error, Result};
 pub use monitor::{Damon, Monitor, MonitorBuilder};
 pub use region::{Region, Snapshot};
-pub use sysfs::{Capabilities, Operation};
+pub use sysfs::{Capabilities, Operation, SysfsFeature};

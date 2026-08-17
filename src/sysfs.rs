@@ -7,6 +7,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::config::{MonitoringIntervals, Pid, RegionBounds};
 use crate::error::io_error;
@@ -16,6 +17,9 @@ use crate::{Error, Region, Result, Snapshot};
 pub const DEFAULT_ADMIN_PATH: &str = "/sys/kernel/mm/damon/admin";
 
 const MAX_INITIAL_REGION_CAPACITY: usize = 4_096;
+
+/// Maximum number of monitoring data probes supported by Linux 7.2.
+pub const MAX_PROBES: usize = 4;
 
 /// A DAMON monitoring operations set.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -116,8 +120,8 @@ pub enum KdamondState {
     Unknown(Box<str>),
 }
 
-/// A DAMOS action supported by Linux 7.2.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// A DAMOS action.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum Action {
     /// Mark matching memory as likely to be needed.
@@ -142,12 +146,14 @@ pub enum Action {
     MigrateCold,
     /// Collect statistics without modifying memory.
     Stat,
+    /// An action introduced by a newer kernel.
+    Unknown(Box<str>),
 }
 
 impl Action {
     /// Returns the name used by the kernel ABI.
     #[must_use]
-    pub const fn kernel_name(self) -> &'static str {
+    pub fn kernel_name(&self) -> &str {
         match self {
             Self::WillNeed => "willneed",
             Self::Cold => "cold",
@@ -160,21 +166,76 @@ impl Action {
             Self::MigrateHot => "migrate_hot",
             Self::MigrateCold => "migrate_cold",
             Self::Stat => "stat",
+            Self::Unknown(name) => name,
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "willneed" => Self::WillNeed,
+            "cold" => Self::Cold,
+            "pageout" => Self::PageOut,
+            "hugepage" => Self::HugePage,
+            "nohugepage" => Self::NoHugePage,
+            "collapse" => Self::Collapse,
+            "lru_prio" => Self::LruPrioritize,
+            "lru_deprio" => Self::LruDeprioritize,
+            "migrate_hot" => Self::MigrateHot,
+            "migrate_cold" => Self::MigrateCold,
+            "stat" => Self::Stat,
+            other => Self::Unknown(other.into()),
         }
     }
 }
 
-/// Runtime capabilities discovered from a populated DAMON context.
+impl fmt::Display for Action {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.kernel_name())
+    }
+}
+
+/// An optional DAMON sysfs feature detected from a concrete ABI path.
+///
+/// Discovery is based on populated sysfs paths rather than the running kernel
+/// version. Features below an indexed child, such as a probe filter, can only
+/// be discovered after that child has been staged.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
+pub enum SysfsFeature {
+    /// `contexts/<N>/avail_operations` is present.
+    AvailableOperations,
+    /// `kdamonds/<N>/refresh_ms` is present.
+    PeriodicRefresh,
+    /// `contexts/<N>/addr_unit` is present.
+    AddressUnit,
+    /// `contexts/<N>/pause` is present.
+    ContextPause,
+    /// `monitoring_attrs/probes/nr_probes` is present.
+    AttributeProbeCount,
+    /// `probes/<N>/filters/nr_filters` is present.
+    ProbeFilterCount,
+    /// `probes/<N>/filters/<N>/type` is present.
+    ProbeFilterType,
+    /// `probes/<N>/filters/<N>/matching` is present.
+    ProbeFilterMatching,
+    /// `probes/<N>/filters/<N>/allow` is present.
+    ProbeFilterAllow,
+    /// `probes/<N>/filters/<N>/path` is present.
+    ProbeFilterPath,
+    /// `schemes/<N>/apply_interval_us` is present.
+    SchemeApplyInterval,
+    /// `schemes/<N>/tried_regions` is present.
+    TriedRegions,
+    /// `schemes/<N>/tried_regions/total_bytes` is present.
+    TriedRegionsTotalBytes,
+}
+
+/// Runtime capabilities discovered from individual paths in a populated
+/// DAMON hierarchy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Capabilities {
     operations: Box<[Operation]>,
-    refresh_ms: bool,
-    pause: bool,
-    address_unit: bool,
-    probes: bool,
-    apply_interval: bool,
-    tried_regions: bool,
-    tried_regions_total_bytes: bool,
+    features: Box<[SysfsFeature]>,
 }
 
 impl Capabilities {
@@ -186,52 +247,134 @@ impl Capabilities {
 
     /// Returns whether an operation is available.
     #[must_use]
-    pub fn supports(&self, operation: &Operation) -> bool {
+    pub fn supports_operation(&self, operation: &Operation) -> bool {
         self.operations
             .iter()
             .any(|candidate| candidate == operation)
     }
 
-    /// Returns whether periodic sysfs refresh is exposed.
+    /// Returns every optional feature whose concrete path was found.
     #[must_use]
-    pub const fn has_periodic_refresh(&self) -> bool {
-        self.refresh_ms
+    pub fn features(&self) -> &[SysfsFeature] {
+        &self.features
     }
 
-    /// Returns whether context pause control is exposed.
+    /// Returns whether a concrete optional sysfs feature is present.
     #[must_use]
-    pub const fn has_pause(&self) -> bool {
-        self.pause
+    pub fn has(&self, feature: SysfsFeature) -> bool {
+        self.features.contains(&feature)
+    }
+}
+
+/// A minimum and maximum value in a DAMOS access pattern.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccessPatternRange {
+    min: u64,
+    max: u64,
+}
+
+impl AccessPatternRange {
+    /// Creates a validated inclusive range.
+    pub const fn new(min: u64, max: u64) -> Result<Self> {
+        if min > max {
+            return Err(Error::InvalidConfiguration {
+                field: "access pattern range",
+                reason: "minimum must not exceed maximum",
+            });
+        }
+        Ok(Self { min, max })
     }
 
-    /// Returns whether configurable address units are exposed.
+    /// Returns the inclusive minimum.
     #[must_use]
-    pub const fn has_address_unit(&self) -> bool {
-        self.address_unit
+    pub const fn min(self) -> u64 {
+        self.min
     }
 
-    /// Returns whether data-attribute probes are exposed.
+    /// Returns the inclusive maximum.
     #[must_use]
-    pub const fn has_probes(&self) -> bool {
-        self.probes
+    pub const fn max(self) -> u64 {
+        self.max
+    }
+}
+
+/// A DAMOS region access pattern.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccessPattern {
+    size: AccessPatternRange,
+    accesses: AccessPatternRange,
+    age: AccessPatternRange,
+}
+
+impl AccessPattern {
+    /// Creates a pattern from size, access-count, and age ranges.
+    #[must_use]
+    pub const fn new(
+        size: AccessPatternRange,
+        accesses: AccessPatternRange,
+        age: AccessPatternRange,
+    ) -> Self {
+        Self {
+            size,
+            accesses,
+            age,
+        }
     }
 
-    /// Returns whether per-scheme apply intervals are exposed.
+    /// Returns the region-size range in bytes.
     #[must_use]
-    pub const fn has_apply_interval(&self) -> bool {
-        self.apply_interval
+    pub const fn size(self) -> AccessPatternRange {
+        self.size
     }
 
-    /// Returns whether DAMOS tried-region queries are exposed.
+    /// Returns the access-count range.
     #[must_use]
-    pub const fn has_tried_regions(&self) -> bool {
-        self.tried_regions
+    pub const fn accesses(self) -> AccessPatternRange {
+        self.accesses
     }
 
-    /// Returns whether tried-region total bytes are reported by the kernel.
+    /// Returns the age range in aggregation intervals.
     #[must_use]
-    pub const fn has_tried_regions_total_bytes(&self) -> bool {
-        self.tried_regions_total_bytes
+    pub const fn age(self) -> AccessPatternRange {
+        self.age
+    }
+}
+
+/// A monitoring data-probe filter type.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum ProbeFilterType {
+    /// Match anonymous pages.
+    Anonymous,
+    /// Match pages belonging to a memory control group.
+    MemoryControlGroup,
+    /// A filter type introduced by a newer kernel.
+    Unknown(Box<str>),
+}
+
+impl ProbeFilterType {
+    /// Returns the name used by the kernel ABI.
+    #[must_use]
+    pub fn kernel_name(&self) -> &str {
+        match self {
+            Self::Anonymous => "anon",
+            Self::MemoryControlGroup => "memcg",
+            Self::Unknown(name) => name,
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "anon" => Self::Anonymous,
+            "memcg" => Self::MemoryControlGroup,
+            other => Self::Unknown(other.into()),
+        }
+    }
+}
+
+impl fmt::Display for ProbeFilterType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.kernel_name())
     }
 }
 
@@ -320,6 +463,43 @@ impl Kdamond {
         write_bytes(&self.path.join("state"), command.kernel_name().as_bytes())
     }
 
+    /// Reads the kernel thread ID, or `None` while the thread is stopped.
+    pub fn pid(&self) -> Result<Option<Pid>> {
+        let raw = read_i32(&self.path.join("pid"))?;
+        if raw < 0 {
+            return Ok(None);
+        }
+        let raw = u32::try_from(raw).map_err(|_| {
+            invalid_kernel_value(
+                &self.path.join("pid"),
+                raw.to_string(),
+                "a process ID or -1",
+            )
+        })?;
+        Pid::new(raw).map(Some).map_err(|_| {
+            invalid_kernel_value(
+                &self.path.join("pid"),
+                raw.to_string(),
+                "a process ID or -1",
+            )
+        })
+    }
+
+    /// Reads the periodic sysfs refresh interval.
+    pub fn refresh_interval(&self) -> Result<Duration> {
+        let milliseconds = read_u32(&self.path.join("refresh_ms"))?;
+        Ok(Duration::from_millis(u64::from(milliseconds)))
+    }
+
+    /// Sets the periodic sysfs refresh interval.
+    ///
+    /// Zero disables periodic refresh. The duration must be exactly
+    /// representable in milliseconds and fit the kernel's `unsigned int`.
+    pub fn set_refresh_interval(&self, interval: Duration) -> Result<()> {
+        let milliseconds = duration_millis(interval)?;
+        write_value(&self.path.join("refresh_ms"), milliseconds)
+    }
+
     /// Reads the number of staged monitoring contexts.
     pub fn context_count(&self) -> Result<usize> {
         read_usize(&self.path.join("contexts/nr_contexts"))
@@ -338,19 +518,65 @@ impl Kdamond {
         }
     }
 
-    /// Discovers features from an already populated context and scheme.
+    /// Discovers features from individual paths in an already populated
+    /// context and scheme.
+    ///
+    /// This follows the official `damo` strategy of inspecting concrete ABI
+    /// nodes. Paths below indexed children are reported only when the caller
+    /// has staged those children.
     pub fn capabilities(&self, context_index: usize, scheme_index: usize) -> Result<Capabilities> {
         let context = self.context(context_index);
         let scheme = context.scheme(scheme_index);
+        let probes = context.path.join("monitoring_attrs/probes");
+        let probe_filter = probes.join("0/filters/0");
+        let mut features = Vec::new();
+
+        for (feature, path) in [
+            (SysfsFeature::PeriodicRefresh, self.path.join("refresh_ms")),
+            (
+                SysfsFeature::AvailableOperations,
+                context.path.join("avail_operations"),
+            ),
+            (SysfsFeature::AddressUnit, context.path.join("addr_unit")),
+            (SysfsFeature::ContextPause, context.path.join("pause")),
+            (SysfsFeature::AttributeProbeCount, probes.join("nr_probes")),
+            (
+                SysfsFeature::ProbeFilterCount,
+                probes.join("0/filters/nr_filters"),
+            ),
+            (SysfsFeature::ProbeFilterType, probe_filter.join("type")),
+            (
+                SysfsFeature::ProbeFilterMatching,
+                probe_filter.join("matching"),
+            ),
+            (SysfsFeature::ProbeFilterAllow, probe_filter.join("allow")),
+            (SysfsFeature::ProbeFilterPath, probe_filter.join("path")),
+            (
+                SysfsFeature::SchemeApplyInterval,
+                scheme.path.join("apply_interval_us"),
+            ),
+            (
+                SysfsFeature::TriedRegionsTotalBytes,
+                scheme.path.join("tried_regions/total_bytes"),
+            ),
+        ] {
+            if path_exists(&path)? {
+                features.push(feature);
+            }
+        }
+        if path_is_dir(&scheme.path.join("tried_regions"))? {
+            features.push(SysfsFeature::TriedRegions);
+        }
+        features.sort_unstable();
+
+        let operations = if features.contains(&SysfsFeature::AvailableOperations) {
+            context.available_operations()?
+        } else {
+            Vec::new()
+        };
         Ok(Capabilities {
-            operations: context.available_operations()?.into_boxed_slice(),
-            refresh_ms: path_exists(&self.path.join("refresh_ms"))?,
-            pause: path_exists(&context.path.join("pause"))?,
-            address_unit: path_exists(&context.path.join("addr_unit"))?,
-            probes: path_exists(&context.path.join("monitoring_attrs/probes/nr_probes"))?,
-            apply_interval: path_exists(&scheme.path.join("apply_interval_us"))?,
-            tried_regions: path_is_dir(&scheme.path.join("tried_regions"))?,
-            tried_regions_total_bytes: path_exists(&scheme.path.join("tried_regions/total_bytes"))?,
+            operations: operations.into_boxed_slice(),
+            features: features.into_boxed_slice(),
         })
     }
 }
@@ -379,11 +605,53 @@ impl Context {
             .collect())
     }
 
+    /// Reads the selected monitoring operation.
+    pub fn operation(&self) -> Result<Operation> {
+        let value = read_text(&self.path.join("operations"))?;
+        Ok(Operation::parse(value.trim()))
+    }
+
     /// Selects a monitoring operation.
     pub fn set_operation(&self, operation: &Operation) -> Result<()> {
         write_bytes(
             &self.path.join("operations"),
             operation.kernel_name().as_bytes(),
+        )
+    }
+
+    /// Reads the address-unit size in bytes.
+    pub fn address_unit(&self) -> Result<u64> {
+        read_u64(&self.path.join("addr_unit"))
+    }
+
+    /// Sets the address-unit size in bytes.
+    pub fn set_address_unit(&self, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Err(Error::InvalidConfiguration {
+                field: "address unit",
+                reason: "must be greater than zero",
+            });
+        }
+        write_value(&self.path.join("addr_unit"), bytes)
+    }
+
+    /// Reads whether monitoring is paused for this context.
+    pub fn is_paused(&self) -> Result<bool> {
+        read_bool(&self.path.join("pause"))
+    }
+
+    /// Pauses or resumes monitoring for this context.
+    pub fn set_paused(&self, paused: bool) -> Result<()> {
+        write_bool(&self.path.join("pause"), paused)
+    }
+
+    /// Reads the monitoring intervals.
+    pub fn intervals(&self) -> Result<MonitoringIntervals> {
+        let path = self.path.join("monitoring_attrs/intervals");
+        MonitoringIntervals::new(
+            Duration::from_micros(read_u64(&path.join("sample_us"))?),
+            Duration::from_micros(read_u64(&path.join("aggr_us"))?),
+            Duration::from_micros(read_u64(&path.join("update_us"))?),
         )
     }
 
@@ -396,11 +664,47 @@ impl Context {
         write_value(&path.join("update_us"), update_us)
     }
 
+    /// Reads the adaptive monitoring-region count bounds.
+    pub fn region_bounds(&self) -> Result<RegionBounds> {
+        let path = self.path.join("monitoring_attrs/nr_regions");
+        RegionBounds::new(
+            read_usize(&path.join("min"))?,
+            read_usize(&path.join("max"))?,
+        )
+    }
+
     /// Writes the adaptive monitoring-region count bounds.
     pub fn set_region_bounds(&self, bounds: RegionBounds) -> Result<()> {
         let path = self.path.join("monitoring_attrs/nr_regions");
         write_value(&path.join("min"), bounds.min())?;
         write_value(&path.join("max"), bounds.max())
+    }
+
+    /// Reads the number of staged monitoring data probes.
+    pub fn probe_count(&self) -> Result<usize> {
+        read_usize(&self.path.join("monitoring_attrs/probes/nr_probes"))
+    }
+
+    /// Reconstructs the staged monitoring data-probe directories.
+    pub fn set_probe_count(&self, count: usize) -> Result<()> {
+        if count > MAX_PROBES {
+            return Err(Error::InvalidConfiguration {
+                field: "probe count",
+                reason: "must not exceed Linux DAMON_MAX_PROBES",
+            });
+        }
+        write_value(&self.path.join("monitoring_attrs/probes/nr_probes"), count)
+    }
+
+    /// Returns a typed handle for a staged monitoring data probe.
+    #[must_use]
+    pub fn probe(&self, index: usize) -> Probe {
+        Probe {
+            path: self
+                .path
+                .join("monitoring_attrs/probes")
+                .join(index.to_string()),
+        }
     }
 
     /// Reads the number of staged targets.
@@ -453,9 +757,134 @@ impl Target {
         &self.path
     }
 
+    /// Reads the selected process, or `None` for an unconfigured target.
+    pub fn pid(&self) -> Result<Option<Pid>> {
+        let raw = read_i32(&self.path.join("pid_target"))?;
+        if raw == 0 {
+            return Ok(None);
+        }
+        if raw < 0 {
+            return Err(invalid_kernel_value(
+                &self.path.join("pid_target"),
+                raw.to_string(),
+                "a process ID or zero",
+            ));
+        }
+        let raw = u32::try_from(raw).map_err(|_| {
+            invalid_kernel_value(
+                &self.path.join("pid_target"),
+                raw.to_string(),
+                "a process ID",
+            )
+        })?;
+        Pid::new(raw).map(Some).map_err(|_| {
+            invalid_kernel_value(
+                &self.path.join("pid_target"),
+                raw.to_string(),
+                "a process ID",
+            )
+        })
+    }
+
     /// Selects the process monitored by virtual-address operations.
     pub fn set_pid(&self, pid: Pid) -> Result<()> {
         write_value(&self.path.join("pid_target"), pid.get())
+    }
+
+    /// Clears the process selection back to the kernel's staged default.
+    pub fn clear_pid(&self) -> Result<()> {
+        write_value(&self.path.join("pid_target"), 0_u8)
+    }
+}
+
+/// A `monitoring_attrs/probes/<N>` sysfs directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Probe {
+    path: PathBuf,
+}
+
+impl Probe {
+    /// Returns this probe's sysfs path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Reads the number of staged probe filters.
+    pub fn filter_count(&self) -> Result<usize> {
+        read_usize(&self.path.join("filters/nr_filters"))
+    }
+
+    /// Reconstructs the staged probe-filter directories.
+    pub fn set_filter_count(&self, count: usize) -> Result<()> {
+        write_value(&self.path.join("filters/nr_filters"), count)
+    }
+
+    /// Returns a typed handle for a staged probe filter.
+    #[must_use]
+    pub fn filter(&self, index: usize) -> ProbeFilter {
+        ProbeFilter {
+            path: self.path.join("filters").join(index.to_string()),
+        }
+    }
+}
+
+/// A `monitoring_attrs/probes/<N>/filters/<N>` sysfs directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProbeFilter {
+    path: PathBuf,
+}
+
+impl ProbeFilter {
+    /// Returns this probe filter's sysfs path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Reads the filter type.
+    pub fn filter_type(&self) -> Result<ProbeFilterType> {
+        let value = read_text(&self.path.join("type"))?;
+        Ok(ProbeFilterType::parse(value.trim()))
+    }
+
+    /// Sets the filter type.
+    pub fn set_filter_type(&self, filter_type: &ProbeFilterType) -> Result<()> {
+        write_bytes(
+            &self.path.join("type"),
+            filter_type.kernel_name().as_bytes(),
+        )
+    }
+
+    /// Reads whether the filter selects matching or non-matching pages.
+    pub fn matching(&self) -> Result<bool> {
+        read_bool(&self.path.join("matching"))
+    }
+
+    /// Selects matching or non-matching pages.
+    pub fn set_matching(&self, matching: bool) -> Result<()> {
+        write_bool(&self.path.join("matching"), matching)
+    }
+
+    /// Reads whether matching pages are allowed to contribute probe hits.
+    pub fn allowed(&self) -> Result<bool> {
+        read_bool(&self.path.join("allow"))
+    }
+
+    /// Sets whether matching pages may contribute probe hits.
+    pub fn set_allowed(&self, allowed: bool) -> Result<()> {
+        write_bool(&self.path.join("allow"), allowed)
+    }
+
+    /// Reads the memory-control-group path used by a `memcg` filter.
+    pub fn cgroup_path(&self) -> Result<String> {
+        let value = read_text(&self.path.join("path"))?;
+        Ok(value.strip_suffix('\n').unwrap_or(&value).to_owned())
+    }
+
+    /// Sets the memory-control-group path used by a `memcg` filter.
+    pub fn set_cgroup_path(&self, path: &str) -> Result<()> {
+        write_bytes(&self.path.join("path"), path.as_bytes())
     }
 }
 
@@ -472,21 +901,71 @@ impl Scheme {
         &self.path
     }
 
+    /// Reads the selected scheme action.
+    pub fn action(&self) -> Result<Action> {
+        let value = read_text(&self.path.join("action"))?;
+        Ok(Action::parse(value.trim()))
+    }
+
     /// Selects the scheme action.
-    pub fn set_action(&self, action: Action) -> Result<()> {
+    pub fn set_action(&self, action: &Action) -> Result<()> {
         write_bytes(&self.path.join("action"), action.kernel_name().as_bytes())
     }
 
-    /// Configures a pattern that matches every representable region.
+    /// Reads this scheme's access pattern.
+    pub fn access_pattern(&self) -> Result<AccessPattern> {
+        let pattern = self.path.join("access_pattern");
+        Ok(AccessPattern::new(
+            read_access_pattern_range(&pattern.join("sz"))?,
+            read_access_pattern_range(&pattern.join("nr_accesses"))?,
+            read_access_pattern_range(&pattern.join("age"))?,
+        ))
+    }
+
+    /// Sets this scheme's access pattern.
+    pub fn set_access_pattern(&self, pattern: AccessPattern) -> Result<()> {
+        let path = self.path.join("access_pattern");
+        write_access_pattern_range(&path.join("sz"), pattern.size())?;
+        write_access_pattern_range(&path.join("nr_accesses"), pattern.accesses())?;
+        write_access_pattern_range(&path.join("age"), pattern.age())
+    }
+
+    /// Configures a pattern that matches every kernel-representable region.
+    ///
+    /// DAMON stores each maximum as the kernel's `unsigned long`. This method
+    /// tries the 64-bit maximum and falls back to the 32-bit maximum only when
+    /// the kernel rejects the wider value as out of range. It therefore works
+    /// correctly for a 32-bit process controlling a 64-bit kernel.
     pub fn set_match_all(&self) -> Result<()> {
         let pattern = self.path.join("access_pattern");
-        let native_max = usize::MAX;
-        for range in ["sz", "nr_accesses", "age"] {
-            let path = pattern.join(range);
-            write_value(&path.join("min"), 0_u8)?;
-            write_value(&path.join("max"), native_max)?;
+        let size = pattern.join("sz");
+        write_value(&size.join("min"), 0_u8)?;
+        let kernel_max = write_kernel_ulong_max(&size.join("max"))?;
+
+        for name in ["nr_accesses", "age"] {
+            let range = pattern.join(name);
+            write_value(&range.join("min"), 0_u8)?;
+            write_value(&range.join("max"), kernel_max)?;
         }
         Ok(())
+    }
+
+    /// Reads the minimum interval between applications of this scheme.
+    pub fn apply_interval(&self) -> Result<Duration> {
+        Ok(Duration::from_micros(read_u64(
+            &self.path.join("apply_interval_us"),
+        )?))
+    }
+
+    /// Sets the minimum interval between applications of this scheme.
+    ///
+    /// Zero uses the context's aggregation interval. The duration must be
+    /// exactly representable in whole microseconds.
+    pub fn set_apply_interval(&self, interval: Duration) -> Result<()> {
+        write_value(
+            &self.path.join("apply_interval_us"),
+            duration_micros(interval)?,
+        )
     }
 
     /// Reads the last materialized tried-region results.
@@ -556,6 +1035,41 @@ impl Scheme {
     }
 }
 
+fn read_access_pattern_range(path: &Path) -> Result<AccessPatternRange> {
+    AccessPatternRange::new(read_u64(&path.join("min"))?, read_u64(&path.join("max"))?)
+}
+
+fn write_access_pattern_range(path: &Path, range: AccessPatternRange) -> Result<()> {
+    write_value(&path.join("min"), range.min())?;
+    write_value(&path.join("max"), range.max())
+}
+
+fn write_kernel_ulong_max(path: &Path) -> Result<u64> {
+    select_kernel_ulong_max(|value| write_value(path, value))
+}
+
+fn select_kernel_ulong_max(mut write: impl FnMut(u64) -> Result<()>) -> Result<u64> {
+    match write(u64::MAX) {
+        Ok(()) => Ok(u64::MAX),
+        Err(error) if is_kernel_ulong_width_error(&error) => {
+            write(u64::from(u32::MAX))?;
+            Ok(u64::from(u32::MAX))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_kernel_ulong_width_error(error: &Error) -> bool {
+    const LINUX_EINVAL: i32 = 22;
+    const LINUX_ERANGE: i32 = 34;
+
+    matches!(
+        error,
+        Error::Io { source, .. }
+            if matches!(source.raw_os_error(), Some(LINUX_EINVAL | LINUX_ERANGE))
+    )
+}
+
 fn path_exists(path: &Path) -> Result<bool> {
     path.try_exists()
         .map_err(|error| io_error("inspect", path, error))
@@ -576,6 +1090,29 @@ fn read_text(path: &Path) -> Result<String> {
 fn read_usize(path: &Path) -> Result<usize> {
     let value = read_u64(path)?;
     usize::try_from(value).map_err(|_| invalid_kernel_value(path, value.to_string(), "usize"))
+}
+
+fn read_u32(path: &Path) -> Result<u32> {
+    let value = read_u64(path)?;
+    u32::try_from(value).map_err(|_| invalid_kernel_value(path, value.to_string(), "u32"))
+}
+
+fn read_i32(path: &Path) -> Result<i32> {
+    let value = read_text(path)?;
+    let value = value.trim();
+    value
+        .parse()
+        .map_err(|_| invalid_kernel_value(path, value, "i32"))
+}
+
+fn read_bool(path: &Path) -> Result<bool> {
+    let value = read_text(path)?;
+    let value = value.trim();
+    match value {
+        "1" | "Y" | "y" | "yes" | "true" | "on" => Ok(true),
+        "0" | "N" | "n" | "no" | "false" | "off" => Ok(false),
+        _ => Err(invalid_kernel_value(path, value, "a Linux boolean")),
+    }
 }
 
 fn read_u64(path: &Path) -> Result<u64> {
@@ -612,8 +1149,41 @@ fn invalid_kernel_value(path: &Path, value: impl Into<Box<str>>, expected: &'sta
     }
 }
 
+fn duration_micros(duration: Duration) -> Result<u64> {
+    let micros = u64::try_from(duration.as_micros()).map_err(|_| Error::InvalidConfiguration {
+        field: "apply interval",
+        reason: "does not fit in 64-bit microseconds",
+    })?;
+    if Duration::from_micros(micros) != duration {
+        return Err(Error::InvalidConfiguration {
+            field: "apply interval",
+            reason: "must be exactly representable in whole microseconds",
+        });
+    }
+    Ok(micros)
+}
+
+fn duration_millis(duration: Duration) -> Result<u32> {
+    let milliseconds =
+        u32::try_from(duration.as_millis()).map_err(|_| Error::InvalidConfiguration {
+            field: "refresh interval",
+            reason: "does not fit in the kernel unsigned-int range",
+        })?;
+    if Duration::from_millis(u64::from(milliseconds)) != duration {
+        return Err(Error::InvalidConfiguration {
+            field: "refresh interval",
+            reason: "must be exactly representable in whole milliseconds",
+        });
+    }
+    Ok(milliseconds)
+}
+
 fn write_value(path: &Path, value: impl fmt::Display) -> Result<()> {
     write_bytes(path, value.to_string().as_bytes())
+}
+
+fn write_bool(path: &Path, value: bool) -> Result<()> {
+    write_bytes(path, if value { b"Y" } else { b"N" })
 }
 
 fn write_bytes(path: &Path, value: &[u8]) -> Result<()> {
@@ -667,6 +1237,15 @@ mod tests {
     }
 
     #[test]
+    fn action_parser_preserves_new_kernel_values() {
+        assert_eq!(Action::parse("stat"), Action::Stat);
+        assert_eq!(
+            Action::parse("future_action"),
+            Action::Unknown("future_action".into())
+        );
+    }
+
+    #[test]
     fn commands_match_linux_7_2_abi() {
         assert_eq!(
             KdamondCommand::UpdateSchemesTriedRegions.kernel_name(),
@@ -700,6 +1279,30 @@ mod tests {
                 ..
             } if &*value == "not-a-number"
         ));
+    }
+
+    #[test]
+    fn bool_reader_accepts_values_emitted_and_accepted_by_linux() {
+        for (value, expected) in [("Y\n", true), ("N\n", false), ("1\n", true), ("0\n", false)] {
+            let fixture = TempFile::new(value);
+            assert_eq!(read_bool(&fixture.path).expect("read boolean"), expected);
+        }
+    }
+
+    #[test]
+    fn kernel_ulong_max_falls_back_after_kernel_range_error() {
+        let mut attempted = Vec::new();
+        let selected = select_kernel_ulong_max(|value| {
+            attempted.push(value);
+            if value == u64::MAX {
+                return Err(io_error("write", "max", io::Error::from_raw_os_error(34)));
+            }
+            Ok(())
+        })
+        .expect("fall back to 32-bit kernel maximum");
+
+        assert_eq!(selected, u64::from(u32::MAX));
+        assert_eq!(attempted, [u64::MAX, u64::from(u32::MAX)]);
     }
 
     #[test]

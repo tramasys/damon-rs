@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::sysfs::{Action, DamonAdmin, Kdamond, KdamondCommand, KdamondState, Operation};
+use crate::sysfs::{
+    Action, DamonAdmin, Kdamond, KdamondCommand, KdamondState, Operation, SysfsFeature,
+};
 use crate::{Capabilities, Error, MonitoringIntervals, Pid, RegionBounds, Result, Snapshot};
 
 /// Entry point for high-level DAMON monitoring.
@@ -164,11 +166,11 @@ fn configure_monitor(
     context.target(0).set_pid(pid)?;
     retry_busy(|| context.set_scheme_count(1))?;
     let scheme = context.scheme(0);
-    scheme.set_action(Action::Stat)?;
+    scheme.set_action(&Action::Stat)?;
     scheme.set_match_all()?;
 
     let capabilities = kdamond.capabilities(0, 0)?;
-    if !capabilities.has_tried_regions() {
+    if !capabilities.has(SysfsFeature::TriedRegions) {
         return Err(Error::UnsupportedFeature {
             feature: "DAMOS tried-region queries",
         });
