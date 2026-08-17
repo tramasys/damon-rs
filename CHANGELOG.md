@@ -49,3 +49,8 @@ Versioning and the Keep a Changelog structure.
 - Model quota-goal-only commits and running-kdamond reconstruction failures
   according to the kernel state machine.
 - Run documentation tests explicitly in CI.
+- Disable and verify periodic sysfs refresh for exclusively owned sessions.
+- Verify auxiliary ownership values without rebuilding or allocating a new
+  fingerprint on each check.
+- Match Linux state-transition errors, scheme defaults, and indexed quota,
+  filter, and destination layouts in the modeled sysfs backend.

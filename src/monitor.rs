@@ -214,6 +214,7 @@ fn configure_monitor(
     intervals: MonitoringIntervals,
     region_bounds: RegionBounds,
 ) -> Result<(Capabilities, StagedOwnership)> {
+    kdamond.set_refresh_interval(Duration::ZERO)?;
     retry_busy(|| kdamond.set_context_count(1))?;
     let context = kdamond.context(0);
     let operations = context.available_operations()?;
@@ -248,6 +249,7 @@ fn configure_monitor(
     }
 
     let staged = StagedOwnership {
+        refresh_interval: Duration::ZERO,
         operation: Operation::VirtualAddress,
         configured_address_unit: AddressUnit::ONE,
         effective_address_unit: AddressUnit::ONE,
@@ -267,6 +269,7 @@ fn configure_monitor(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StagedOwnership {
+    refresh_interval: Duration,
     operation: Operation,
     configured_address_unit: AddressUnit,
     effective_address_unit: AddressUnit,
@@ -287,6 +290,11 @@ impl StagedOwnership {
         if admin.kdamond_count()? != 1 {
             return Err(Error::OwnershipLost {
                 reason: "the staged kdamond count changed",
+            });
+        }
+        if kdamond.refresh_interval()? != self.refresh_interval {
+            return Err(Error::OwnershipLost {
+                reason: "the staged kdamond attributes changed",
             });
         }
         if kdamond.context_count()? != 1 {
@@ -330,7 +338,7 @@ impl StagedOwnership {
                 reason: "the staged scheme changed",
             });
         }
-        if kdamond.auxiliary_config_fingerprint()? != self.auxiliary_config {
+        if !self.auxiliary_config.matches_current()? {
             return Err(Error::OwnershipLost {
                 reason: "the staged auxiliary configuration changed",
             });

@@ -308,6 +308,7 @@ fn access_and_age_ranges_reject_values_the_active_kernel_type_cannot_hold() {
 fn stages_queries_and_cleans_up_a_monitor() {
     let fixture = Fixture::new("vaddr\npaddr\nfuture_ops\n");
     fixture.add_snapshot_regions();
+    fixture.write("kdamonds/0/refresh_ms", "250\n");
 
     let damon = fixture.damon();
     let mut monitor = damon
@@ -319,6 +320,7 @@ fn stages_queries_and_cleans_up_a_monitor() {
     assert_eq!(monitor.operation(), &Operation::VirtualAddress);
     assert_eq!(monitor.effective_address_unit(), AddressUnit::ONE);
     assert_eq!(fixture.read("kdamonds/nr_kdamonds"), "1");
+    assert_eq!(fixture.read("kdamonds/0/refresh_ms"), "0");
     assert_eq!(fixture.read("kdamonds/0/contexts/0/operations"), "vaddr");
     assert_eq!(fixture.read("kdamonds/0/contexts/0/pause"), "N");
     assert_eq!(
@@ -485,6 +487,11 @@ fn refuses_to_stop_an_externally_reconfigured_slot() {
 #[test]
 fn refuses_to_stop_when_extended_typed_configuration_changes() {
     for (path, value, expected_reason) in [
+        (
+            "kdamonds/0/refresh_ms",
+            "100\n",
+            "the staged kdamond attributes changed",
+        ),
         (
             "kdamonds/0/contexts/0/pause",
             "Y\n",
@@ -914,7 +921,7 @@ impl Fixture {
             ("kdamonds/0/contexts/0/targets/0/regions/nr_regions", "0\n"),
             ("kdamonds/0/contexts/0/schemes/nr_schemes", "0\n"),
             ("kdamonds/0/contexts/0/schemes/0/action", "stat\n"),
-            ("kdamonds/0/contexts/0/schemes/0/target_nid", "0\n"),
+            ("kdamonds/0/contexts/0/schemes/0/target_nid", "-1\n"),
             ("kdamonds/0/contexts/0/schemes/0/apply_interval_us", "0\n"),
             (
                 "kdamonds/0/contexts/0/schemes/0/tried_regions/total_bytes",

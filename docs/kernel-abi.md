@@ -28,6 +28,7 @@ query scheme. Its staging sequence follows the upstream sysfs hierarchy:
 
 ```text
 kdamonds/nr_kdamonds                                      <- 1
+kdamonds/0/refresh_ms                                     <- 0
 kdamonds/0/contexts/nr_contexts                           <- 1
 kdamonds/0/contexts/0/avail_operations                    -> require vaddr
 kdamonds/0/contexts/0/operations                          <- vaddr
@@ -51,12 +52,12 @@ The kernel creates and destroys indexed directories when each `nr_*` file is
 written. The high-level API takes a cooperative `flock`, refuses to begin when
 any kdamond is already staged, and rolls `nr_kdamonds` back to zero if setup
 fails. It also records the kdamond thread ID and fingerprints the staged
-configuration before cleanup. The fingerprint covers pause state, probes,
-initial regions, interval goals, scheme apply interval, target NUMA node,
-quotas, watermarks, scheme filter counts, destinations, and the configured
-snapshot limit in addition to the primary typed settings. Snapshot queries
-verify that identity before materialization, after the materialization command,
-and again after reading the results. Those checks reduce races among
+configuration before cleanup. The fingerprint covers periodic refresh, pause
+state, probes, initial regions, interval goals, scheme apply interval, target
+NUMA node, quotas, watermarks, scheme filter counts, destinations, and the
+configured snapshot limit in addition to the primary typed settings. Snapshot
+queries verify that identity before materialization, after the materialization
+command, and again after reading the results. Those checks reduce races among
 cooperating callers but cannot create kernel-enforced ownership or reveal an
 active change that another controller commits and then hides by restoring only
 the staged files.

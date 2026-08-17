@@ -574,7 +574,28 @@ pub struct Kdamond {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AuxiliaryConfigFingerprint(Box<[Option<Box<str>>]>);
+struct AuxiliaryConfigEntry {
+    path: PathBuf,
+    value: Option<Box<str>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuxiliaryConfigFingerprint(Box<[AuxiliaryConfigEntry]>);
+
+impl AuxiliaryConfigFingerprint {
+    pub(crate) fn matches_current(&self) -> Result<bool> {
+        for entry in &self.0 {
+            let matches = match &entry.value {
+                Some(expected) => read_trimmed_equals(&entry.path, expected.as_bytes())?,
+                None => !path_exists(&entry.path)?,
+            };
+            if !matches {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
 
 impl Kdamond {
     /// Returns this kdamond's sysfs path.
@@ -766,11 +787,12 @@ impl Kdamond {
         let mut values = Vec::with_capacity(LINUX_7_2_AUXILIARY_CONFIG_PATHS.len());
         for relative in LINUX_7_2_AUXILIARY_CONFIG_PATHS {
             let path = self.path.join(relative);
-            values.push(if path_exists(&path)? {
+            let value = if path_exists(&path)? {
                 Some(read_text(&path)?.trim().into())
             } else {
                 None
-            });
+            };
+            values.push(AuxiliaryConfigEntry { path, value });
         }
         Ok(AuxiliaryConfigFingerprint(values.into_boxed_slice()))
     }
@@ -1365,6 +1387,56 @@ fn read_text(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).map_err(|error| io_error("read", path, error))
 }
 
+fn read_trimmed_equals(path: &Path, expected: &[u8]) -> Result<bool> {
+    const MAX_AUXILIARY_VALUE_LEN: usize = 64;
+
+    #[cfg(test)]
+    if let Some(result) = test_backend::read(path) {
+        return match result {
+            Ok(bytes) => Ok(trim_ascii_whitespace(&bytes) == expected),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(io_error("read", path, error)),
+        };
+    }
+
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error("open for reading", path, error)),
+    };
+    let mut bytes = [0_u8; MAX_AUXILIARY_VALUE_LEN];
+    let mut used = 0;
+
+    loop {
+        if used == bytes.len() {
+            let mut extra = [0_u8; 1];
+            let read = file
+                .read(&mut extra)
+                .map_err(|error| io_error("read", path, error))?;
+            return Ok(read == 0 && trim_ascii_whitespace(&bytes) == expected);
+        }
+        let read = file
+            .read(&mut bytes[used..])
+            .map_err(|error| io_error("read", path, error))?;
+        if read == 0 {
+            break;
+        }
+        used += read;
+    }
+
+    Ok(trim_ascii_whitespace(&bytes[..used]) == expected)
+}
+
+fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
 fn read_usize(path: &Path) -> Result<usize> {
     let value = read_u64(path)?;
     usize::try_from(value).map_err(|_| invalid_kernel_value(path, value.to_string(), "usize"))
@@ -1685,7 +1757,7 @@ pub(crate) mod test_backend {
             let base = base.join(index.to_string());
             self.directory(&base);
             self.file(base.join("action"), b"stat\n");
-            self.file(base.join("target_nid"), b"0\n");
+            self.file(base.join("target_nid"), b"-1\n");
             self.file(base.join("apply_interval_us"), b"0\n");
             self.directory(base.join("access_pattern"));
             for range in ["sz", "nr_accesses", "age"] {
@@ -1741,6 +1813,35 @@ pub(crate) mod test_backend {
             self.file(base.join("matching"), b"N\n");
             self.file(base.join("allow"), b"N\n");
             self.file(base.join("path"), b"\n");
+        }
+
+        fn create_scheme_filter(&mut self, base: &Path, index: usize) {
+            let base = base.join(index.to_string());
+            self.directory(&base);
+            self.file(base.join("type"), b"anon\n");
+            self.file(base.join("matching"), b"N\n");
+            self.file(base.join("allow"), b"N\n");
+            self.file(base.join("memcg_path"), b"\n");
+            for name in ["addr_start", "addr_end", "damon_target_idx", "min", "max"] {
+                self.file(base.join(name), b"0\n");
+            }
+        }
+
+        fn create_quota_goal(&mut self, base: &Path, index: usize) {
+            let base = base.join(index.to_string());
+            self.directory(&base);
+            self.file(base.join("target_metric"), b"user_input\n");
+            for name in ["target_value", "current_value", "nid"] {
+                self.file(base.join(name), b"0\n");
+            }
+            self.file(base.join("path"), b"\n");
+        }
+
+        fn create_destination(&mut self, base: &Path, index: usize) {
+            let base = base.join(index.to_string());
+            self.directory(&base);
+            self.file(base.join("id"), b"0\n");
+            self.file(base.join("weight"), b"0\n");
         }
 
         fn parse_count(value: &[u8]) -> io::Result<usize> {
@@ -1819,11 +1920,34 @@ pub(crate) mod test_backend {
                 }
                 return Ok(true);
             }
-            if path_text.ends_with("/filters/nr_filters") {
+            if path_text.ends_with("/filters/nr_filters")
+                || path_text.ends_with("/core_filters/nr_filters")
+                || path_text.ends_with("/ops_filters/nr_filters")
+            {
                 let parent = path.parent().expect("count path has parent");
                 self.remove_indexed_children(parent);
                 for index in 0..count {
-                    self.create_probe_filter(parent, index);
+                    if path_text.contains("/monitoring_attrs/probes/") {
+                        self.create_probe_filter(parent, index);
+                    } else {
+                        self.create_scheme_filter(parent, index);
+                    }
+                }
+                return Ok(true);
+            }
+            if path_text.ends_with("/quotas/goals/nr_goals") {
+                let parent = path.parent().expect("count path has parent");
+                self.remove_indexed_children(parent);
+                for index in 0..count {
+                    self.create_quota_goal(parent, index);
+                }
+                return Ok(true);
+            }
+            if path_text.ends_with("/dests/nr_dests") {
+                let parent = path.parent().expect("count path has parent");
+                self.remove_indexed_children(parent);
+                for index in 0..count {
+                    self.create_destination(parent, index);
                 }
                 return Ok(true);
             }
@@ -1930,6 +2054,16 @@ pub(crate) mod test_backend {
             let kdamond = path.parent().expect("state path has parent");
             match command {
                 "on" => {
+                    let context_count = kdamond.join("contexts/nr_contexts");
+                    if !matches!(
+                        self.nodes.get(&context_count),
+                        Some(Node::File(value)) if value == b"1\n"
+                    ) {
+                        return Err(io::Error::from_raw_os_error(22));
+                    }
+                    if matches!(self.nodes.get(path), Some(Node::File(value)) if value == b"on\n") {
+                        return Err(io::Error::from_raw_os_error(16));
+                    }
                     self.capture_active_files();
                     self.next_kdamond_pid += 1;
                     self.file(path, b"on\n");
@@ -1939,7 +2073,13 @@ pub(crate) mod test_backend {
                     );
                 }
                 "off" => {
-                    self.active_files = None;
+                    if self.active_files.is_none() {
+                        return Err(io::Error::from_raw_os_error(22));
+                    }
+                    if !matches!(self.nodes.get(path), Some(Node::File(value)) if value == b"on\n")
+                    {
+                        return Err(io::Error::from_raw_os_error(1));
+                    }
                     self.file(path, b"off\n");
                     self.file(kdamond.join("pid"), b"-1\n");
                 }
@@ -2379,6 +2519,83 @@ mod tests {
 
         kdamond.command(KdamondCommand::Off).expect("stop model");
         admin.set_kdamond_count(0).expect("remove stopped model");
+    }
+
+    #[test]
+    fn modeled_state_transitions_match_linux_errors() {
+        let model = test_backend::Model::new("vaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+
+        let error = kdamond
+            .command(KdamondCommand::On)
+            .expect_err("starting without one context must fail");
+        assert!(matches!(
+            error,
+            Error::Io { source, .. } if source.raw_os_error() == Some(22)
+        ));
+
+        kdamond.set_context_count(1).expect("stage context");
+        kdamond.command(KdamondCommand::On).expect("start model");
+        let error = kdamond
+            .command(KdamondCommand::On)
+            .expect_err("starting an active kdamond must be busy");
+        assert!(error.is_resource_busy());
+
+        kdamond.command(KdamondCommand::Off).expect("stop model");
+        let error = kdamond
+            .command(KdamondCommand::Off)
+            .expect_err("stopping an inactive context must fail");
+        assert!(matches!(
+            error,
+            Error::Io { source, .. } if source.raw_os_error() == Some(1)
+        ));
+    }
+
+    #[test]
+    fn modeled_indexed_children_match_linux_7_2_layout() {
+        let model = test_backend::Model::new("vaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let context = admin.kdamond(0).context(0);
+        admin
+            .kdamond(0)
+            .set_context_count(1)
+            .expect("stage context");
+        context.set_scheme_count(1).expect("stage scheme");
+        let scheme = context.scheme(0);
+
+        assert_eq!(
+            read_text(&scheme.path().join("target_nid")).expect("read target node"),
+            "-1\n"
+        );
+
+        let goals = scheme.path().join("quotas/goals");
+        write_value(&goals.join("nr_goals"), 1).expect("stage quota goal");
+        assert!(path_exists(&goals.join("0/target_metric")).expect("inspect quota goal"));
+        assert!(path_exists(&goals.join("0/path")).expect("inspect quota goal path"));
+
+        for name in ["filters", "core_filters", "ops_filters"] {
+            let filters = scheme.path().join(name);
+            write_value(&filters.join("nr_filters"), 1).expect("stage scheme filter");
+            assert!(path_exists(&filters.join("0/memcg_path")).expect("inspect scheme filter"));
+            assert!(!path_exists(&filters.join("0/path")).expect("distinguish probe filter"));
+        }
+
+        let dests = scheme.path().join("dests");
+        write_value(&dests.join("nr_dests"), 1).expect("stage destination");
+        assert!(path_exists(&dests.join("0/id")).expect("inspect destination id"));
+        assert!(path_exists(&dests.join("0/weight")).expect("inspect destination weight"));
+
+        context.set_probe_count(1).expect("stage probe");
+        let probe = context.probe(0);
+        probe.set_filter_count(1).expect("stage probe filter");
+        assert!(path_exists(&probe.filter(0).path().join("path")).expect("inspect probe filter"));
+        assert!(
+            !path_exists(&probe.filter(0).path().join("memcg_path"))
+                .expect("distinguish scheme filter")
+        );
     }
 
     #[derive(Default)]
