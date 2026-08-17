@@ -1620,10 +1620,22 @@ pub(crate) mod test_backend {
         pub(crate) probe_hits: Vec<u8>,
     }
 
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    pub(crate) struct ModelSchemeStats {
+        pub(crate) nr_tried: u64,
+        pub(crate) sz_tried: u64,
+        pub(crate) nr_applied: u64,
+        pub(crate) sz_applied: u64,
+        pub(crate) sz_ops_filter_passed: u64,
+        pub(crate) qt_exceeds: u64,
+        pub(crate) nr_snapshots: u64,
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub(crate) enum Mutation {
         SetFile { path: PathBuf, value: Vec<u8> },
         RemoveTree { path: PathBuf },
+        StartKdamond { path: PathBuf },
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1645,6 +1657,8 @@ pub(crate) mod test_backend {
         active_files: Option<BTreeMap<PathBuf, Vec<u8>>>,
         next_kdamond_pid: u32,
         tried_regions: Vec<ModelRegion>,
+        scheme_stats: Vec<ModelSchemeStats>,
+        effective_quota_bytes: Vec<u64>,
         hooks: Vec<Hook>,
     }
 
@@ -1656,6 +1670,8 @@ pub(crate) mod test_backend {
                 active_files: None,
                 next_kdamond_pid: 10_000,
                 tried_regions: Vec::new(),
+                scheme_stats: Vec::new(),
+                effective_quota_bytes: Vec::new(),
                 hooks: Vec::new(),
             };
             state.directory("");
@@ -1775,6 +1791,7 @@ pub(crate) mod test_backend {
             ] {
                 self.file(base.join("quotas").join(name), b"0\n");
             }
+            self.file(base.join("quotas/effective_bytes"), b"0\n");
             self.file(base.join("quotas/goal_tuner"), b"none\n");
             self.directory(base.join("quotas/weights"));
             for name in ["sz_permil", "nr_accesses_permil", "age_permil"] {
@@ -1794,7 +1811,18 @@ pub(crate) mod test_backend {
             self.directory(base.join("dests"));
             self.file(base.join("dests/nr_dests"), b"0\n");
             self.directory(base.join("stats"));
-            self.file(base.join("stats/max_nr_snapshots"), b"0\n");
+            for name in [
+                "nr_tried",
+                "sz_tried",
+                "nr_applied",
+                "sz_applied",
+                "sz_ops_filter_passed",
+                "qt_exceeds",
+                "nr_snapshots",
+                "max_nr_snapshots",
+            ] {
+                self.file(base.join("stats").join(name), b"0\n");
+            }
             self.directory(base.join("tried_regions"));
             self.file(base.join("tried_regions/total_bytes"), b"0\n");
         }
@@ -2047,6 +2075,54 @@ pub(crate) mod test_backend {
             Ok(())
         }
 
+        fn materialize_scheme_stats(&mut self, kdamond: &Path) {
+            let stats = self.scheme_stats.clone();
+            for (index, stats) in stats.iter().enumerate() {
+                let base = kdamond
+                    .join("contexts/0/schemes")
+                    .join(index.to_string())
+                    .join("stats");
+                if !self.nodes.contains_key(&base) {
+                    break;
+                }
+                for (name, value) in [
+                    ("nr_tried", stats.nr_tried),
+                    ("sz_tried", stats.sz_tried),
+                    ("nr_applied", stats.nr_applied),
+                    ("sz_applied", stats.sz_applied),
+                    ("sz_ops_filter_passed", stats.sz_ops_filter_passed),
+                    ("qt_exceeds", stats.qt_exceeds),
+                    ("nr_snapshots", stats.nr_snapshots),
+                ] {
+                    self.file(base.join(name), format!("{value}\n").as_bytes());
+                }
+            }
+        }
+
+        fn materialize_effective_quotas(&mut self, kdamond: &Path) {
+            let quotas = self.effective_quota_bytes.clone();
+            for (index, effective_bytes) in quotas.into_iter().enumerate() {
+                let path = kdamond
+                    .join("contexts/0/schemes")
+                    .join(index.to_string())
+                    .join("quotas/effective_bytes");
+                if !self.nodes.contains_key(&path) {
+                    break;
+                }
+                self.file(path, format!("{effective_bytes}\n").as_bytes());
+            }
+        }
+
+        fn start_kdamond(&mut self, kdamond: &Path) {
+            self.capture_active_files();
+            self.next_kdamond_pid += 1;
+            self.file(kdamond.join("state"), b"on\n");
+            self.file(
+                kdamond.join("pid"),
+                format!("{}\n", self.next_kdamond_pid).as_bytes(),
+            );
+        }
+
         fn write_state(&mut self, path: &Path, value: &[u8]) -> io::Result<()> {
             let command = std::str::from_utf8(value)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 command"))?
@@ -2064,13 +2140,7 @@ pub(crate) mod test_backend {
                     if matches!(self.nodes.get(path), Some(Node::File(value)) if value == b"on\n") {
                         return Err(io::Error::from_raw_os_error(16));
                     }
-                    self.capture_active_files();
-                    self.next_kdamond_pid += 1;
-                    self.file(path, b"on\n");
-                    self.file(
-                        kdamond.join("pid"),
-                        format!("{}\n", self.next_kdamond_pid).as_bytes(),
-                    );
+                    self.start_kdamond(kdamond);
                 }
                 "off" => {
                     if self.active_files.is_none() {
@@ -2107,9 +2177,15 @@ pub(crate) mod test_backend {
                     self.remove_indexed_children(&base);
                     self.file(base.join("total_bytes"), b"0\n");
                 }
-                "update_schemes_stats"
-                | "update_schemes_effective_quotas"
-                | "update_tuned_intervals" => self.ensure_running(path)?,
+                "update_schemes_stats" => {
+                    self.ensure_running(path)?;
+                    self.materialize_scheme_stats(kdamond);
+                }
+                "update_schemes_effective_quotas" => {
+                    self.ensure_running(path)?;
+                    self.materialize_effective_quotas(kdamond);
+                }
+                "update_tuned_intervals" => self.ensure_running(path)?,
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -2166,6 +2242,7 @@ pub(crate) mod test_backend {
                 match mutation {
                     Mutation::SetFile { path, value } => self.file(path, &value),
                     Mutation::RemoveTree { path } => self.remove_tree(&path),
+                    Mutation::StartKdamond { path } => self.start_kdamond(&path),
                 }
             }
         }
@@ -2199,6 +2276,14 @@ pub(crate) mod test_backend {
 
         pub(crate) fn set_tried_regions(&self, regions: Vec<ModelRegion>) {
             lock(&self.state).tried_regions = regions;
+        }
+
+        pub(crate) fn set_scheme_stats(&self, stats: Vec<ModelSchemeStats>) {
+            lock(&self.state).scheme_stats = stats;
+        }
+
+        pub(crate) fn set_effective_quota_bytes(&self, quotas: Vec<u64>) {
+            lock(&self.state).effective_quota_bytes = quotas;
         }
 
         pub(crate) fn active_value(&self, path: impl AsRef<Path>) -> Option<String> {
@@ -2283,9 +2368,7 @@ pub(crate) mod test_backend {
             Some(Node::Directory) => Err(io::Error::from(io::ErrorKind::IsADirectory)),
             None => Err(not_found(&relative)),
         };
-        if result.is_ok() {
-            state.apply_hooks(&HookEvent::Read(relative));
-        }
+        state.apply_hooks(&HookEvent::Read(relative));
         Some(result)
     }
 
@@ -2499,6 +2582,105 @@ mod tests {
         assert_eq!(
             model.active_value("kdamonds/0/contexts/0/schemes/0/quotas/goals/nr_goals"),
             Some("1".to_owned())
+        );
+    }
+
+    #[test]
+    fn modeled_output_commands_materialize_stats_and_effective_quotas() {
+        let model = test_backend::Model::new("vaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        kdamond.set_context_count(1).expect("stage context");
+        let context = kdamond.context(0);
+        context.set_scheme_count(2).expect("stage schemes");
+        let first = context.scheme(0);
+        let second = context.scheme(1);
+        write_value(&first.path().join("stats/max_nr_snapshots"), 19)
+            .expect("stage maximum snapshots");
+        kdamond.command(KdamondCommand::On).expect("start model");
+
+        model.set_scheme_stats(vec![
+            test_backend::ModelSchemeStats {
+                nr_tried: 1,
+                sz_tried: 2,
+                nr_applied: 3,
+                sz_applied: 4,
+                sz_ops_filter_passed: 5,
+                qt_exceeds: 6,
+                nr_snapshots: 7,
+            },
+            test_backend::ModelSchemeStats {
+                nr_tried: 11,
+                sz_tried: 12,
+                nr_applied: 13,
+                sz_applied: 14,
+                sz_ops_filter_passed: 15,
+                qt_exceeds: 16,
+                nr_snapshots: 17,
+            },
+        ]);
+        model.set_effective_quota_bytes(vec![4_096, 8_192]);
+
+        assert_eq!(
+            read_u64(&first.path().join("stats/nr_tried")).expect("read stale stats"),
+            0
+        );
+        assert_eq!(
+            read_u64(&first.path().join("quotas/effective_bytes"))
+                .expect("read stale effective quota"),
+            0
+        );
+
+        kdamond
+            .command(KdamondCommand::UpdateSchemesStats)
+            .expect("refresh modeled stats");
+        for (scheme, expected) in [
+            (&first, [1, 2, 3, 4, 5, 6, 7]),
+            (&second, [11, 12, 13, 14, 15, 16, 17]),
+        ] {
+            for (name, value) in [
+                "nr_tried",
+                "sz_tried",
+                "nr_applied",
+                "sz_applied",
+                "sz_ops_filter_passed",
+                "qt_exceeds",
+                "nr_snapshots",
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                assert_eq!(
+                    read_u64(&scheme.path().join("stats").join(name))
+                        .expect("read refreshed stats"),
+                    value
+                );
+            }
+        }
+        assert_eq!(
+            read_u64(&first.path().join("stats/max_nr_snapshots"))
+                .expect("read configured maximum snapshots"),
+            19
+        );
+        assert_eq!(
+            read_u64(&first.path().join("quotas/effective_bytes"))
+                .expect("stats command must not update quota"),
+            0
+        );
+
+        kdamond
+            .command(KdamondCommand::UpdateSchemesEffectiveQuotas)
+            .expect("refresh modeled effective quotas");
+        assert_eq!(
+            read_u64(&first.path().join("quotas/effective_bytes"))
+                .expect("read first effective quota"),
+            4_096
+        );
+        assert_eq!(
+            read_u64(&second.path().join("quotas/effective_bytes"))
+                .expect("read second effective quota"),
+            8_192
         );
     }
 

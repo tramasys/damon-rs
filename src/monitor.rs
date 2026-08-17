@@ -139,12 +139,21 @@ impl MonitorBuilder<'_> {
         }
 
         retry_busy(|| self.damon.admin.set_kdamond_count(1))?;
-        if self.damon.admin.kdamond_count()? != 1 {
+        let kdamond = self.damon.admin.kdamond(0);
+        let staged_count = match self.damon.admin.kdamond_count() {
+            Ok(count) => count,
+            Err(operation) => {
+                return Err(with_rollback(
+                    operation,
+                    rollback_unstarted_slot(&self.damon.admin, &kdamond),
+                ));
+            }
+        };
+        if staged_count != 1 {
             return Err(Error::OwnershipLost {
                 reason: "kdamond count changed immediately after staging",
             });
         }
-        let kdamond = self.damon.admin.kdamond(0);
         let setup = configure_monitor(&kdamond, self.pid, intervals, region_bounds);
         let (capabilities, staged) = match setup {
             Ok(configured) => configured,
@@ -163,21 +172,17 @@ impl MonitorBuilder<'_> {
         }
 
         if let Err(operation) = retry_busy(|| kdamond.command(KdamondCommand::On)) {
-            return Err(rollback_started_monitor(
+            return Err(with_rollback(
                 operation,
-                &self.damon.admin,
-                &kdamond,
-                &staged,
+                rollback_unstarted_monitor(&self.damon.admin, &kdamond, &staged),
             ));
         }
         let kdamond_pid = match running_thread_pid(&kdamond) {
             Ok(pid) => pid,
             Err(operation) => {
-                return Err(rollback_started_monitor(
+                return Err(with_rollback(
                     operation,
-                    &self.damon.admin,
-                    &kdamond,
-                    &staged,
+                    rollback_started_without_identity(&self.damon.admin, &kdamond, &staged),
                 ));
             }
         };
@@ -186,11 +191,9 @@ impl MonitorBuilder<'_> {
             kdamond_pid,
         };
         if let Err(operation) = ownership.verify_running(&self.damon.admin, &kdamond) {
-            return Err(rollback_started_monitor(
+            return Err(with_rollback(
                 operation,
-                &self.damon.admin,
-                &kdamond,
-                &ownership.staged,
+                rollback_owned_monitor(&self.damon.admin, &kdamond, &ownership),
             ));
         }
 
@@ -386,15 +389,6 @@ fn running_thread_pid(kdamond: &Kdamond) -> Result<Pid> {
     }
 }
 
-fn rollback_started_monitor(
-    operation: Error,
-    admin: &DamonAdmin,
-    kdamond: &Kdamond,
-    staged: &StagedOwnership,
-) -> Error {
-    with_rollback(operation, rollback_staged_monitor(admin, kdamond, staged))
-}
-
 fn with_rollback(operation: Error, rollback_result: Result<()>) -> Error {
     match rollback_result {
         Ok(()) => operation,
@@ -439,16 +433,34 @@ fn rollback_unstarted_monitor(
     }
 }
 
-fn rollback_staged_monitor(
+fn rollback_started_without_identity(
     admin: &DamonAdmin,
     kdamond: &Kdamond,
     staged: &StagedOwnership,
 ) -> Result<()> {
     staged.verify(admin, kdamond)?;
-    if kdamond_is_running(kdamond)? {
-        retry_busy(|| kdamond.command(KdamondCommand::Off))?;
+    match retry_busy(|| kdamond.state())? {
+        KdamondState::Off => {
+            staged.verify(admin, kdamond)?;
+            retry_busy(|| admin.set_kdamond_count(0))
+        }
+        KdamondState::On => Err(Error::OwnershipLost {
+            reason: "cannot safely stop a kdamond before its kernel-thread ID was captured",
+        }),
+        KdamondState::Unknown(_) => Err(Error::OwnershipLost {
+            reason: "the kdamond state changed before its identity was captured",
+        }),
     }
-    staged.verify(admin, kdamond)?;
+}
+
+fn rollback_owned_monitor(
+    admin: &DamonAdmin,
+    kdamond: &Kdamond,
+    ownership: &Ownership,
+) -> Result<()> {
+    ownership.verify_running(admin, kdamond)?;
+    retry_busy(|| kdamond.command(KdamondCommand::Off))?;
+    ownership.staged.verify(admin, kdamond)?;
     retry_busy(|| admin.set_kdamond_count(0))
 }
 
@@ -465,14 +477,6 @@ fn retry_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
             }
             result => return result,
         }
-    }
-}
-
-fn kdamond_is_running(kdamond: &Kdamond) -> Result<bool> {
-    match retry_busy(|| kdamond.state())? {
-        KdamondState::On => Ok(true),
-        KdamondState::Off => Ok(false),
-        KdamondState::Unknown(state) => Err(Error::UnexpectedKdamondState { state }),
     }
 }
 
@@ -708,6 +712,164 @@ mod tests {
 
         assert!(!error.is_resource_busy());
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn staging_count_read_error_rolls_back_created_slot() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        model.after_next_write(
+            "kdamonds/nr_kdamonds",
+            b"1".to_vec(),
+            vec![Mutation::RemoveTree {
+                path: "kdamonds/nr_kdamonds".into(),
+            }],
+        );
+        model.after_next_read("kdamonds/nr_kdamonds", Vec::new());
+        model.after_next_read(
+            "kdamonds/nr_kdamonds",
+            vec![Mutation::SetFile {
+                path: "kdamonds/nr_kdamonds".into(),
+                value: b"1\n".to_vec(),
+            }],
+        );
+
+        let error = damon
+            .monitor_pid(Pid::new(42).expect("valid pid"))
+            .start()
+            .expect_err("failed verification read must fail startup");
+
+        assert!(
+            matches!(error, Error::Io { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            damon.admin.kdamond_count().expect("read rolled-back count"),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_on_does_not_stop_an_external_kdamond() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        for _ in 0..2 {
+            model.after_next_read("kdamonds/nr_kdamonds", Vec::new());
+        }
+        model.after_next_read(
+            "kdamonds/nr_kdamonds",
+            vec![Mutation::StartKdamond {
+                path: "kdamonds/0".into(),
+            }],
+        );
+
+        let error = damon
+            .monitor_pid(Pid::new(42).expect("valid pid"))
+            .start()
+            .expect_err("external start must prevent ownership");
+
+        assert!(matches!(
+            error,
+            Error::Rollback {
+                operation,
+                rollback,
+            } if operation.is_resource_busy()
+                && matches!(*rollback, Error::OwnershipLost {
+                    reason: "a kdamond started before setup completed"
+                })
+        ));
+        let kdamond = damon.admin.kdamond(0);
+        assert_eq!(
+            kdamond.state().expect("read external state"),
+            KdamondState::On
+        );
+        assert!(kdamond.pid().expect("read external pid").is_some());
+
+        kdamond.command(KdamondCommand::Off).expect("stop fixture");
+        damon.admin.set_kdamond_count(0).expect("remove fixture");
+    }
+
+    #[test]
+    fn pid_replacement_prevents_started_monitor_rollback() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        model.after_next_read(
+            "kdamonds/0/pid",
+            vec![Mutation::StartKdamond {
+                path: "kdamonds/0".into(),
+            }],
+        );
+
+        let error = damon
+            .monitor_pid(Pid::new(42).expect("valid pid"))
+            .start()
+            .expect_err("replacement pid must prevent ownership");
+
+        assert!(matches!(
+            error,
+            Error::Rollback {
+                operation,
+                rollback,
+            } if matches!(*operation, Error::OwnershipLost {
+                    reason: "the kdamond kernel-thread ID changed"
+                })
+                && matches!(*rollback, Error::OwnershipLost {
+                    reason: "the kdamond kernel-thread ID changed"
+                })
+        ));
+        let kdamond = damon.admin.kdamond(0);
+        assert_eq!(
+            kdamond.state().expect("read replacement state"),
+            KdamondState::On
+        );
+        assert!(kdamond.pid().expect("read replacement pid").is_some());
+
+        kdamond.command(KdamondCommand::Off).expect("stop fixture");
+        damon.admin.set_kdamond_count(0).expect("remove fixture");
+    }
+
+    #[test]
+    fn missing_startup_pid_does_not_trigger_unidentified_stop() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        model.after_next_write(
+            "kdamonds/0/state",
+            b"on".to_vec(),
+            vec![Mutation::SetFile {
+                path: "kdamonds/0/pid".into(),
+                value: b"-1\n".to_vec(),
+            }],
+        );
+
+        let error = damon
+            .monitor_pid(Pid::new(42).expect("valid pid"))
+            .start()
+            .expect_err("missing kernel-thread ID must fail startup");
+
+        assert!(matches!(
+            error,
+            Error::Rollback {
+                operation,
+                rollback,
+            } if matches!(*operation, Error::OwnershipLost {
+                    reason: "a running kdamond did not expose a kernel-thread ID"
+                })
+                && matches!(*rollback, Error::OwnershipLost {
+                    reason: "cannot safely stop a kdamond before its kernel-thread ID was captured"
+                })
+        ));
+        let kdamond = damon.admin.kdamond(0);
+        assert_eq!(
+            kdamond.state().expect("read running state"),
+            KdamondState::On
+        );
+
+        kdamond.command(KdamondCommand::Off).expect("stop fixture");
+        damon.admin.set_kdamond_count(0).expect("remove fixture");
     }
 
     #[test]
