@@ -1,20 +1,12 @@
 # Security policy
 
-The crate has not yet reached a stable release. Security fixes are applied to
-the latest development version.
+Report vulnerabilities through GitHub private vulnerability reporting. Do not
+post secrets, memory contents, or identifying process data in public issues.
 
-Please report suspected vulnerabilities privately through GitHub's private
-vulnerability reporting feature once the repository is hosted. Do not include
-secrets, production memory contents, or identifying process data in a public
-issue.
+DAMON admin sysfs is privileged and system-global. Do not expose low-level
+mutation methods to untrusted callers.
 
-DAMON's admin sysfs interface is privileged and system-global. Applications
-must treat access to it as administrative authority, coordinate with other
-DAMON controllers, and avoid exposing untrusted callers to raw low-level
-mutation methods.
-
-High-level sessions use `/run/lock/damon-rs.lock` by default. Keep the lock
-file's parent directory trusted, and make every cooperating DAMON controller
-use the same lock, directly or through a wrapper. A process with permission to
-mutate DAMON sysfs can ignore that lock, so the crate also rechecks the staged
-configuration and kdamond thread ID but cannot guarantee exclusive ownership.
+High-level sessions use `/run/lock/damon-rs.lock`. All cooperating controllers
+must share that lock or equivalent coordination. The crate also verifies
+configuration and kdamond identity, but cannot stop another privileged process
+from ignoring the lock.
