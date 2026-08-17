@@ -66,6 +66,32 @@ pub enum Error {
     },
     /// Summing tried-region sizes overflowed the snapshot representation.
     SnapshotSizeOverflow,
+    /// Converting DAMON core address units to bytes overflowed `u64`.
+    AddressConversionOverflow {
+        /// The raw number of DAMON address units.
+        units: u64,
+        /// The number of bytes per address unit.
+        unit_bytes: u64,
+    },
+    /// A requested indexed sysfs child is not currently staged.
+    IndexOutOfBounds {
+        /// The kind of indexed child.
+        kind: &'static str,
+        /// The requested child index.
+        index: usize,
+        /// The number of staged children.
+        count: usize,
+    },
+    /// Another cooperating process or thread owns the high-level session lock.
+    SessionLockBusy {
+        /// The advisory lock file.
+        path: PathBuf,
+    },
+    /// The high-level session can no longer prove ownership of its sysfs slot.
+    OwnershipLost {
+        /// The failed ownership check.
+        reason: &'static str,
+    },
     /// A filesystem operation failed.
     Io {
         /// The operation being performed.
@@ -135,6 +161,22 @@ impl fmt::Display for Error {
             }
             Self::SnapshotSizeOverflow => {
                 formatter.write_str("DAMON snapshot total size exceeds u64::MAX")
+            }
+            Self::AddressConversionOverflow { units, unit_bytes } => write!(
+                formatter,
+                "DAMON address conversion overflows u64 ({units} units at {unit_bytes} bytes each)"
+            ),
+            Self::IndexOutOfBounds { kind, index, count } => write!(
+                formatter,
+                "DAMON {kind} index {index} is out of bounds for {count} staged children"
+            ),
+            Self::SessionLockBusy { path } => write!(
+                formatter,
+                "another DAMON session holds the advisory lock {}",
+                path.display()
+            ),
+            Self::OwnershipLost { reason } => {
+                write!(formatter, "DAMON session ownership was lost: {reason}")
             }
             Self::Io {
                 operation,

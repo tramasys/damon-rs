@@ -31,6 +31,7 @@ kdamonds/nr_kdamonds                                      <- 1
 kdamonds/0/contexts/nr_contexts                           <- 1
 kdamonds/0/contexts/0/avail_operations                    -> require vaddr
 kdamonds/0/contexts/0/operations                          <- vaddr
+kdamonds/0/contexts/0/addr_unit                           <- 1
 kdamonds/0/contexts/0/monitoring_attrs/intervals/*         <- intervals
 kdamonds/0/contexts/0/monitoring_attrs/nr_regions/{min,max}<- bounds
 kdamonds/0/contexts/0/targets/nr_targets                  <- 1
@@ -42,8 +43,11 @@ kdamonds/0/state                                           <- on
 ```
 
 The kernel creates and destroys indexed directories when each `nr_*` file is
-written. The high-level API therefore refuses to begin when any kdamond is
-already staged and rolls `nr_kdamonds` back to zero if setup fails.
+written. The high-level API takes a cooperative `flock`, refuses to begin when
+any kdamond is already staged, and rolls `nr_kdamonds` back to zero if setup
+fails. It also records the kdamond thread ID and fingerprints the staged
+configuration before cleanup. Those checks reduce races among cooperating
+callers but cannot create kernel-enforced ownership.
 
 ## Snapshot semantics
 
@@ -54,7 +58,8 @@ simple file. Query-style retrieval uses DAMOS tried regions:
 2. Write `update_schemes_tried_regions` to `kdamonds/0/state`.
 3. Read `schemes/0/tried_regions/total_bytes` when the kernel exposes it.
 4. Read consecutive indexed region directories containing `start`, `end`,
-   `nr_accesses`, `age`, and, on newer kernels, `sz_filter_passed`.
+   `nr_accesses`, `age`, `sz_filter_passed`, and `probes/<N>/hits` when those
+   fields are exposed.
 
 Kernels with tried-region queries but no `total_bytes` file are supported by
 summing the validated materialized region sizes in userspace. This matches the
@@ -63,7 +68,25 @@ compatibility distinction made by the official `damo` implementation.
 The command can wait until the next scheme apply interval. A zero
 `apply_interval_us` uses the aggregation interval. `nr_accesses` is a count per
 aggregation interval and `age` is measured in aggregation intervals. Neither
-is a byte-normalized density.
+is a byte-normalized density. Linux 7.2 stores each tried-region probe hit in
+an `unsigned char`, which the crate preserves as `u8` in probe-index order.
+
+## Address units
+
+DAMON core addresses and sizes use `unsigned long`. A context's `addr_unit`
+scales those raw values to bytes, and Linux 7.2 supports a non-default unit for
+physical-address monitoring. The low-level Rust API therefore names raw
+accessors with an `_units` suffix, stores the `AddressUnit` in each snapshot,
+and provides checked `_bytes` conversions. Virtual-address high-level
+sessions explicitly stage an address unit of one.
+
+## Access-pattern widths
+
+The sysfs staging structure accepts access-pattern values as `unsigned long`,
+but the active `damos_access_pattern` stores region size as `unsigned long`
+and access count and age as `unsigned int`. The crate uses a kernel-width
+`RegionSizeRange` and separate `u32` `AccessCountRange` and `AgeRange` types,
+preventing a successful sysfs write from becoming a truncated active pattern.
 
 ## Validated invariants
 
@@ -75,6 +98,8 @@ The userspace types enforce kernel invariants before writing:
 - minimum regions is at least three.
 - minimum regions does not exceed maximum regions.
 - returned region end is not below its start.
+- address units are non-zero and byte conversions cannot overflow `u64`.
+- access-count and age pattern limits fit `u32`.
 
 Linux 7.2 defaults are 5,000 microseconds sampling, 100,000 microseconds
 aggregation, 60,000,000 microseconds operations update, and 10 to 1,000
@@ -83,18 +108,20 @@ regions. The crate uses the same defaults.
 ## Compatibility policy
 
 The ABI grows over time, so known operation and action names are typed while
-unknown names are preserved. Optional support is represented as a set of
-`SysfsFeature` values. Each value is detected from its concrete file or
-directory in the populated hierarchy, following the official `damo`
-implementation. Features below an indexed child are discoverable after that
-child is staged.
+unknown names are preserved. Each `SysfsFeature` is detected from its concrete
+file or directory. Paths below an unstaged probe or filter are reported as
+`CapabilitySupport::RequiresStaging`, distinct from `Unsupported`. This keeps
+the non-mutating Rust query honest while following the same concrete-path
+principle used by official `damo`, whose exhaustive probe temporarily stages
+representative children and restores the saved configuration.
 
 DAMON uses the kernel's `unsigned long` for several values. Userspace pointer
 width does not reveal kernel width when a 32-bit process controls a 64-bit
 kernel. The match-all helper therefore probes `u64::MAX` and falls back to
 `u32::MAX` only when the kernel reports a numeric range rejection. Other `u64`
-values are sent to the kernel without a userspace-`usize` restriction, and the
-kernel validates its native range.
+values, including monitoring-region bounds, are represented as `u64` and sent
+without a userspace-`usize` restriction. The kernel validates its native
+range.
 
 Linux 7.2 is the source-verified baseline, not a hard-coded version gate. Older
 kernels may work when they expose the required paths. Kernel-backed VM tests

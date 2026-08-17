@@ -6,9 +6,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use damon::sysfs::{
-    AccessPattern, AccessPatternRange, Action, DamonAdmin, MAX_PROBES, ProbeFilterType,
+    AccessCountRange, AccessPattern, Action, AgeRange, DamonAdmin, MAX_PROBES, ProbeFilterType,
+    RegionSizeRange,
 };
-use damon::{Damon, Error, MonitoringIntervals, Operation, Pid, RegionBounds, SysfsFeature};
+use damon::{
+    AddressUnit, CapabilitySupport, Damon, Error, MonitoringIntervals, Operation, Pid,
+    RegionBounds, SysfsFeature,
+};
 
 #[test]
 fn low_level_context_attributes_round_trip() {
@@ -32,8 +36,14 @@ fn low_level_context_attributes_round_trip() {
         context.operation().expect("read operation"),
         Operation::FixedVirtualAddress
     );
-    context.set_address_unit(4_096).expect("set address unit");
-    assert_eq!(context.address_unit().expect("read address unit"), 4_096);
+    let address_unit = AddressUnit::new(4_096).expect("valid address unit");
+    context
+        .set_address_unit(address_unit)
+        .expect("set address unit");
+    assert_eq!(
+        context.address_unit().expect("read address unit"),
+        address_unit
+    );
     context.set_paused(true).expect("pause context");
     assert!(context.is_paused().expect("read pause state"));
 
@@ -56,7 +66,9 @@ fn low_level_probe_attributes_and_capabilities_are_individual() {
     fixture.add_probe_filter_files();
     let admin = DamonAdmin::open(fixture.path()).expect("open fixture");
     let kdamond = admin.kdamond(0);
+    kdamond.set_context_count(1).expect("stage context");
     let context = kdamond.context(0);
+    context.set_scheme_count(1).expect("stage scheme");
 
     context.set_probe_count(1).expect("stage probe");
     assert_eq!(context.probe_count().expect("read probe count"), 1);
@@ -100,15 +112,54 @@ fn low_level_probe_attributes_and_capabilities_are_individual() {
         SysfsFeature::TriedRegions,
         SysfsFeature::TriedRegionsTotalBytes,
     ] {
-        assert!(capabilities.has(feature), "missing {feature:?}");
+        assert_eq!(
+            capabilities.feature_support(feature),
+            CapabilitySupport::Supported,
+            "missing {feature:?}"
+        );
     }
 
     fixture.remove("kdamonds/0/contexts/0/monitoring_attrs/probes/0/filters/0/allow");
     let capabilities = kdamond
         .capabilities(0, 0)
         .expect("rediscover individual paths");
-    assert!(!capabilities.has(SysfsFeature::ProbeFilterAllow));
-    assert!(capabilities.has(SysfsFeature::ProbeFilterMatching));
+    assert_eq!(
+        capabilities.feature_support(SysfsFeature::ProbeFilterAllow),
+        CapabilitySupport::Unsupported
+    );
+    assert_eq!(
+        capabilities.feature_support(SysfsFeature::ProbeFilterMatching),
+        CapabilitySupport::Supported
+    );
+}
+
+#[test]
+fn capability_discovery_marks_unstaged_probe_children() {
+    let fixture = Fixture::new("vaddr\n");
+    let admin = DamonAdmin::open(fixture.path()).expect("open fixture");
+    let kdamond = admin.kdamond(0);
+    kdamond.set_context_count(1).expect("stage context");
+    let context = kdamond.context(0);
+    context.set_scheme_count(1).expect("stage scheme");
+
+    let capabilities = kdamond.capabilities(0, 0).expect("discover features");
+    assert_eq!(
+        capabilities.feature_support(SysfsFeature::AttributeProbeCount),
+        CapabilitySupport::Supported
+    );
+    for feature in [
+        SysfsFeature::ProbeFilterCount,
+        SysfsFeature::ProbeFilterType,
+        SysfsFeature::ProbeFilterMatching,
+        SysfsFeature::ProbeFilterAllow,
+        SysfsFeature::ProbeFilterPath,
+    ] {
+        assert_eq!(
+            capabilities.feature_support(feature),
+            CapabilitySupport::RequiresStaging,
+            "{feature:?} must not be reported as unsupported"
+        );
+    }
 }
 
 #[test]
@@ -131,9 +182,9 @@ fn low_level_target_and_scheme_attributes_round_trip() {
         .expect("set future action in fixture");
     assert_eq!(scheme.action().expect("read action"), future_action);
     let pattern = AccessPattern::new(
-        AccessPatternRange::new(1, 10).expect("valid size range"),
-        AccessPatternRange::new(2, 20).expect("valid access range"),
-        AccessPatternRange::new(3, 30).expect("valid age range"),
+        RegionSizeRange::new(1, 10).expect("valid size range"),
+        AccessCountRange::new(2, 20).expect("valid access range"),
+        AgeRange::new(3, 30).expect("valid age range"),
     );
     scheme.set_access_pattern(pattern).expect("set pattern");
     assert_eq!(scheme.access_pattern().expect("read pattern"), pattern);
@@ -146,6 +197,22 @@ fn low_level_target_and_scheme_attributes_round_trip() {
             .max(),
         u64::MAX
     );
+    assert_eq!(
+        scheme
+            .access_pattern()
+            .expect("read match-all pattern")
+            .accesses()
+            .max(),
+        u32::MAX
+    );
+    assert_eq!(
+        scheme
+            .access_pattern()
+            .expect("read match-all pattern")
+            .age()
+            .max(),
+        u32::MAX
+    );
     scheme
         .set_apply_interval(Duration::from_micros(500))
         .expect("set apply interval");
@@ -156,11 +223,88 @@ fn low_level_target_and_scheme_attributes_round_trip() {
 }
 
 #[test]
+fn snapshot_preserves_raw_address_units_and_checks_byte_conversions() {
+    let fixture = Fixture::new("paddr\n");
+    fixture.add_snapshot_regions();
+    fixture.write(
+        "kdamonds/0/contexts/0/schemes/0/tried_regions/total_bytes",
+        "6144\n",
+    );
+    let admin = DamonAdmin::open(fixture.path()).expect("open fixture");
+    let context = admin.kdamond(0).context(0);
+    let unit = AddressUnit::new(4_096).expect("valid address unit");
+    context.set_address_unit(unit).expect("set address unit");
+
+    let snapshot = context
+        .scheme(0)
+        .tried_regions(2)
+        .expect("read raw snapshot");
+    assert_eq!(snapshot.address_unit(), unit);
+    assert_eq!(snapshot.total_units(), 6_144);
+    assert_eq!(
+        snapshot.total_bytes().expect("checked byte conversion"),
+        25_165_824
+    );
+    let region = &snapshot.regions()[0];
+    assert_eq!(region.start_units(), 4_096);
+    assert_eq!(region.start_bytes().expect("convert start"), 16_777_216);
+    assert_eq!(region.len_units(), 4_096);
+    assert_eq!(region.len_bytes().expect("convert length"), 16_777_216);
+    assert_eq!(region.filter_passed_units(), Some(4_096));
+    assert_eq!(
+        region.filter_passed_bytes().expect("convert filtered size"),
+        Some(16_777_216)
+    );
+}
+
+#[test]
+fn snapshot_reports_address_conversion_overflow() {
+    let fixture = Fixture::new("paddr\n");
+    fixture.add_snapshot_regions();
+    let admin = DamonAdmin::open(fixture.path()).expect("open fixture");
+    let context = admin.kdamond(0).context(0);
+    context
+        .set_address_unit(AddressUnit::new(u64::MAX).expect("valid unit"))
+        .expect("set address unit");
+
+    let snapshot = context
+        .scheme(0)
+        .tried_regions(2)
+        .expect("read raw snapshot");
+    assert!(matches!(
+        snapshot.total_bytes(),
+        Err(Error::AddressConversionOverflow { .. })
+    ));
+}
+
+#[test]
+fn access_and_age_ranges_reject_values_the_active_kernel_type_cannot_hold() {
+    let fixture = Fixture::new("vaddr\n");
+    fixture.write(
+        "kdamonds/0/contexts/0/schemes/0/access_pattern/nr_accesses/max",
+        "4294967296\n",
+    );
+    let scheme = DamonAdmin::open(fixture.path())
+        .expect("open fixture")
+        .kdamond(0)
+        .context(0)
+        .scheme(0);
+
+    assert!(matches!(
+        scheme.access_pattern(),
+        Err(Error::InvalidKernelValue {
+            expected: "u32",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn stages_queries_and_cleans_up_a_monitor() {
     let fixture = Fixture::new("vaddr\npaddr\nfuture_ops\n");
     fixture.add_snapshot_regions();
 
-    let damon = Damon::at(fixture.path()).expect("open fixture");
+    let damon = fixture.damon();
     let mut monitor = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
         .region_bounds(10, 128)
@@ -178,17 +322,29 @@ fn stages_queries_and_cleans_up_a_monitor() {
             .capabilities()
             .supports_operation(&Operation::VirtualAddress)
     );
-    assert!(monitor.capabilities().has(SysfsFeature::ContextPause));
-    assert!(
+    assert_eq!(
         monitor
             .capabilities()
-            .has(SysfsFeature::AttributeProbeCount)
+            .feature_support(SysfsFeature::ContextPause),
+        CapabilitySupport::Supported
     );
-    assert!(monitor.capabilities().has(SysfsFeature::TriedRegions));
-    assert!(
+    assert_eq!(
         monitor
             .capabilities()
-            .has(SysfsFeature::TriedRegionsTotalBytes)
+            .feature_support(SysfsFeature::AttributeProbeCount),
+        CapabilitySupport::Supported
+    );
+    assert_eq!(
+        monitor
+            .capabilities()
+            .feature_support(SysfsFeature::TriedRegions),
+        CapabilitySupport::Supported
+    );
+    assert_eq!(
+        monitor
+            .capabilities()
+            .feature_support(SysfsFeature::TriedRegionsTotalBytes),
+        CapabilitySupport::Supported
     );
     assert_eq!(
         monitor.capabilities().operations()[2],
@@ -196,15 +352,30 @@ fn stages_queries_and_cleans_up_a_monitor() {
     );
 
     let snapshot = monitor.snapshot().expect("query snapshot");
-    assert_eq!(snapshot.total_bytes(), 6_144);
+    assert_eq!(snapshot.total_bytes().expect("convert total"), 6_144);
     assert_eq!(snapshot.len(), 2);
-    assert_eq!(snapshot.regions()[0].start(), 4_096);
-    assert_eq!(snapshot.regions()[0].end(), 8_192);
-    assert_eq!(snapshot.regions()[0].len(), 4_096);
+    assert_eq!(snapshot.regions()[0].start_units(), 4_096);
+    assert_eq!(snapshot.regions()[0].end_units(), 8_192);
+    assert_eq!(snapshot.regions()[0].len_units(), 4_096);
+    assert_eq!(
+        snapshot.regions()[0].len_bytes().expect("convert length"),
+        4_096
+    );
     assert_eq!(snapshot.regions()[0].nr_accesses(), 7);
     assert_eq!(snapshot.regions()[0].age(), 3);
-    assert_eq!(snapshot.regions()[0].filter_passed_bytes(), Some(4_096));
-    assert_eq!(snapshot.regions()[1].filter_passed_bytes(), None);
+    assert_eq!(
+        snapshot.regions()[0]
+            .filter_passed_bytes()
+            .expect("convert filtered size"),
+        Some(4_096)
+    );
+    assert_eq!(
+        snapshot.regions()[1]
+            .filter_passed_bytes()
+            .expect("convert filtered size"),
+        None
+    );
+    assert_eq!(snapshot.regions()[0].probe_hits(), &[3, 7]);
 
     fixture.write("kdamonds/0/state", "on\n");
     monitor.stop().expect("stop monitor");
@@ -216,7 +387,7 @@ fn stages_queries_and_cleans_up_a_monitor() {
 fn refuses_to_replace_an_existing_configuration() {
     let fixture = Fixture::new("vaddr\n");
     fixture.write("kdamonds/nr_kdamonds", "2\n");
-    let damon = Damon::at(fixture.path()).expect("open fixture");
+    let damon = fixture.damon();
 
     let error = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
@@ -228,9 +399,74 @@ fn refuses_to_replace_an_existing_configuration() {
 }
 
 #[test]
+fn serializes_high_level_sessions_with_the_advisory_lock() {
+    let fixture = Fixture::new("vaddr\n");
+    let first = fixture.damon();
+    let second = fixture.damon();
+    let monitor = first
+        .monitor_pid(Pid::new(42).expect("valid pid"))
+        .start()
+        .expect("start first monitor");
+
+    let error = second
+        .monitor_pid(Pid::new(43).expect("valid pid"))
+        .start()
+        .expect_err("a second cooperating session must not race");
+    assert!(matches!(error, Error::SessionLockBusy { .. }));
+
+    monitor.stop().expect("stop first monitor");
+}
+
+#[test]
+fn refuses_to_stop_a_replaced_kdamond_thread() {
+    let fixture = Fixture::new("vaddr\n");
+    let damon = fixture.damon();
+    let monitor = damon
+        .monitor_pid(Pid::new(42).expect("valid pid"))
+        .start()
+        .expect("start monitor");
+
+    fixture.write("kdamonds/0/pid", "9002\n");
+    let error = monitor
+        .stop()
+        .expect_err("a replacement thread must be preserved");
+    assert!(matches!(
+        error,
+        Error::OwnershipLost {
+            reason: "the kdamond kernel-thread ID changed"
+        }
+    ));
+    assert_eq!(fixture.read("kdamonds/0/state"), "on");
+    assert_eq!(fixture.read("kdamonds/nr_kdamonds"), "1");
+}
+
+#[test]
+fn refuses_to_stop_an_externally_reconfigured_slot() {
+    let fixture = Fixture::new("vaddr\n");
+    let damon = fixture.damon();
+    let monitor = damon
+        .monitor_pid(Pid::new(42).expect("valid pid"))
+        .start()
+        .expect("start monitor");
+
+    fixture.write("kdamonds/0/contexts/0/targets/0/pid_target", "77\n");
+    let error = monitor
+        .stop()
+        .expect_err("a replacement configuration must be preserved");
+    assert!(matches!(
+        error,
+        Error::OwnershipLost {
+            reason: "the staged target changed"
+        }
+    ));
+    assert_eq!(fixture.read("kdamonds/0/state"), "on");
+    assert_eq!(fixture.read("kdamonds/nr_kdamonds"), "1");
+}
+
+#[test]
 fn rolls_back_when_virtual_address_operations_are_missing() {
     let fixture = Fixture::new("paddr\n");
-    let damon = Damon::at(fixture.path()).expect("open fixture");
+    let damon = fixture.damon();
 
     let error = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
@@ -247,9 +483,48 @@ fn rolls_back_when_virtual_address_operations_are_missing() {
 }
 
 #[test]
+fn setup_rollback_preserves_a_concurrently_started_slot() {
+    let fixture = Fixture::new("paddr\n");
+    let damon = fixture.damon();
+    fixture.write("kdamonds/0/state", "on\n");
+    fixture.write("kdamonds/0/pid", "9002\n");
+    assert_eq!(fixture.read("kdamonds/0/state"), "on\n");
+
+    let error = damon
+        .monitor_pid(Pid::new(42).expect("valid pid"))
+        .start()
+        .expect_err("a concurrently started replacement must be preserved");
+
+    assert!(
+        matches!(
+            error,
+            Error::Rollback {
+                ref operation,
+                ref rollback,
+            } if matches!(
+                **operation,
+                Error::UnsupportedOperation {
+                    operation: Operation::VirtualAddress
+                }
+            ) && matches!(
+                **rollback,
+                Error::OwnershipLost {
+                    reason: "a kdamond started during setup rollback"
+                }
+            )
+        ),
+        "unexpected error: {error:?}, state: {:?}, count: {:?}",
+        fixture.read("kdamonds/0/state"),
+        fixture.read("kdamonds/nr_kdamonds")
+    );
+    assert_eq!(fixture.read("kdamonds/0/state"), "on\n");
+    assert_eq!(fixture.read("kdamonds/nr_kdamonds"), "1");
+}
+
+#[test]
 fn cleans_up_after_the_kernel_thread_has_already_stopped() {
     let fixture = Fixture::new("vaddr\n");
-    let damon = Damon::at(fixture.path()).expect("open fixture");
+    let damon = fixture.damon();
     let monitor = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
         .start()
@@ -264,7 +539,7 @@ fn cleans_up_after_the_kernel_thread_has_already_stopped() {
 #[test]
 fn validates_before_mutating_the_global_interface() {
     let fixture = Fixture::new("vaddr\n");
-    let damon = Damon::at(fixture.path()).expect("open fixture");
+    let damon = fixture.damon();
 
     let error = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
@@ -287,20 +562,26 @@ fn supports_tried_regions_without_total_bytes() {
     let fixture = Fixture::new("vaddr\n");
     fixture.add_snapshot_regions();
     fixture.remove("kdamonds/0/contexts/0/schemes/0/tried_regions/total_bytes");
-    let damon = Damon::at(fixture.path()).expect("open fixture");
+    let damon = fixture.damon();
     let mut monitor = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
         .start()
         .expect("tried-region directory provides query support");
 
-    assert!(monitor.capabilities().has(SysfsFeature::TriedRegions));
-    assert!(
-        !monitor
+    assert_eq!(
+        monitor
             .capabilities()
-            .has(SysfsFeature::TriedRegionsTotalBytes)
+            .feature_support(SysfsFeature::TriedRegions),
+        CapabilitySupport::Supported
+    );
+    assert_eq!(
+        monitor
+            .capabilities()
+            .feature_support(SysfsFeature::TriedRegionsTotalBytes),
+        CapabilitySupport::Unsupported
     );
     let snapshot = monitor.snapshot().expect("query snapshot");
-    assert_eq!(snapshot.total_bytes(), 6_144);
+    assert_eq!(snapshot.total_bytes().expect("convert total"), 6_144);
 
     fixture.write("kdamonds/0/state", "on\n");
     monitor.stop().expect("stop monitor");
@@ -310,7 +591,7 @@ fn supports_tried_regions_without_total_bytes() {
 fn rolls_back_when_tried_region_queries_are_unsupported() {
     let fixture = Fixture::new("vaddr\n");
     fixture.remove_dir("kdamonds/0/contexts/0/schemes/0/tried_regions");
-    let damon = Damon::at(fixture.path()).expect("open fixture");
+    let damon = fixture.damon();
 
     let error = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
@@ -329,7 +610,7 @@ fn rolls_back_when_tried_region_queries_are_unsupported() {
 #[test]
 fn snapshot_detects_a_kernel_thread_that_stopped() {
     let fixture = Fixture::new("vaddr\n");
-    let damon = Damon::at(fixture.path()).expect("open fixture");
+    let damon = fixture.damon();
     let mut monitor = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
         .start()
@@ -350,7 +631,7 @@ fn snapshot_detects_a_kernel_thread_that_stopped() {
 #[test]
 fn reports_an_unexpected_kernel_state() {
     let fixture = Fixture::new("vaddr\n");
-    let damon = Damon::at(fixture.path()).expect("open fixture");
+    let damon = fixture.damon();
     let monitor = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
         .start()
@@ -372,7 +653,7 @@ fn reports_an_unexpected_kernel_state() {
 #[test]
 fn cleanup_preserves_an_externally_changed_configuration() {
     let fixture = Fixture::new("vaddr\n");
-    let damon = Damon::at(fixture.path()).expect("open fixture");
+    let damon = fixture.damon();
     let monitor = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
         .start()
@@ -395,7 +676,7 @@ fn rejects_invalid_regions_materialized_by_the_kernel() {
         "kdamonds/0/contexts/0/schemes/0/tried_regions/0/end",
         "1024\n",
     );
-    let damon = Damon::at(fixture.path()).expect("open fixture");
+    let damon = fixture.damon();
     let mut monitor = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
         .start()
@@ -434,7 +715,7 @@ fn rejects_overflow_in_a_computed_snapshot_total() {
         "0\n",
     );
     fixture.write("kdamonds/0/contexts/0/schemes/0/tried_regions/1/end", "1\n");
-    let damon = Damon::at(fixture.path()).expect("open fixture");
+    let damon = fixture.damon();
     let mut monitor = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
         .start()
@@ -452,10 +733,10 @@ fn rejects_overflow_in_a_computed_snapshot_total() {
 #[test]
 fn bounds_eager_snapshot_allocation() {
     let fixture = Fixture::new("vaddr\n");
-    let damon = Damon::at(fixture.path()).expect("open fixture");
+    let damon = fixture.damon();
     let mut monitor = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
-        .region_bounds(3, usize::MAX)
+        .region_bounds(3, u64::MAX)
         .start()
         .expect("start monitor");
 
@@ -463,7 +744,7 @@ fn bounds_eager_snapshot_allocation() {
         .snapshot()
         .expect("large maximum remains only an allocation hint");
     assert!(snapshot.is_empty());
-    assert_eq!(snapshot.total_bytes(), 0);
+    assert_eq!(snapshot.total_bytes().expect("convert total"), 0);
 
     fixture.write("kdamonds/0/state", "on\n");
     monitor.stop().expect("stop monitor");
@@ -472,7 +753,7 @@ fn bounds_eager_snapshot_allocation() {
 #[test]
 fn drop_performs_best_effort_cleanup() {
     let fixture = Fixture::new("vaddr\n");
-    let damon = Damon::at(fixture.path()).expect("open fixture");
+    let damon = fixture.damon();
 
     {
         let _monitor = damon
@@ -608,6 +889,19 @@ impl Fixture {
             "kdamonds/0/contexts/0/schemes/0/tried_regions/0/sz_filter_passed",
             "4096\n",
         );
+        self.write(
+            "kdamonds/0/contexts/0/schemes/0/tried_regions/0/probes/0/hits",
+            "3\n",
+        );
+        self.write(
+            "kdamonds/0/contexts/0/schemes/0/tried_regions/0/probes/1/hits",
+            "7\n",
+        );
+    }
+
+    fn damon(&self) -> Damon {
+        self.write("kdamonds/0/pid", "9001\n");
+        Damon::at_with_lock(self.path(), self.root.join("damon-rs.lock")).expect("open fixture")
     }
 
     fn path(&self) -> &Path {

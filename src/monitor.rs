@@ -1,15 +1,24 @@
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::sysfs::{
-    Action, DamonAdmin, Kdamond, KdamondCommand, KdamondState, Operation, SysfsFeature,
+    AccessPattern, Action, CapabilitySupport, DamonAdmin, Kdamond, KdamondCommand, KdamondState,
+    Operation, SysfsFeature,
 };
-use crate::{Capabilities, Error, MonitoringIntervals, Pid, RegionBounds, Result, Snapshot};
+use crate::{
+    AddressUnit, Capabilities, Error, MonitoringIntervals, Pid, RegionBounds, Result, Snapshot,
+};
+
+/// Conventional advisory lock used by high-level DAMON sessions.
+pub const DEFAULT_SESSION_LOCK_PATH: &str = "/run/lock/damon-rs.lock";
 
 /// Entry point for high-level DAMON monitoring.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Damon {
     admin: DamonAdmin,
+    lock_path: PathBuf,
 }
 
 impl Damon {
@@ -26,8 +35,19 @@ impl Damon {
     /// This is primarily useful for mounted sysfs instances, containers, and
     /// deterministic test fixtures.
     pub fn at(path: impl AsRef<Path>) -> Result<Self> {
+        Self::at_with_lock(path, DEFAULT_SESSION_LOCK_PATH)
+    }
+
+    /// Opens a DAMON hierarchy with a custom high-level session lock path.
+    ///
+    /// Cooperating controllers must use the same lock path. The lock is
+    /// advisory because the kernel DAMON sysfs ABI has no ownership primitive.
+    /// The lock file's parent directory should be trusted and non-writable by
+    /// unprivileged users on a production system.
+    pub fn at_with_lock(path: impl AsRef<Path>, lock_path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             admin: DamonAdmin::open(path)?,
+            lock_path: lock_path.as_ref().to_path_buf(),
         })
     }
 
@@ -35,6 +55,12 @@ impl Damon {
     #[must_use]
     pub const fn admin(&self) -> &DamonAdmin {
         &self.admin
+    }
+
+    /// Returns the advisory lock path used by high-level sessions.
+    #[must_use]
+    pub fn lock_path(&self) -> &Path {
+        &self.lock_path
     }
 
     /// Starts building a virtual-address monitor for a process.
@@ -60,8 +86,8 @@ pub struct MonitorBuilder<'a> {
     sample: Duration,
     aggregation: Duration,
     update: Duration,
-    min_regions: usize,
-    max_regions: usize,
+    min_regions: u64,
+    max_regions: u64,
 }
 
 impl MonitorBuilder<'_> {
@@ -97,7 +123,7 @@ impl MonitorBuilder<'_> {
 
     /// Sets lower and upper bounds for the number of monitoring regions.
     #[must_use]
-    pub const fn region_bounds(mut self, min: usize, max: usize) -> Self {
+    pub const fn region_bounds(mut self, min: u64, max: u64) -> Self {
         self.min_regions = min;
         self.max_regions = max;
         self
@@ -105,39 +131,82 @@ impl MonitorBuilder<'_> {
 
     /// Validates, stages, and starts this monitor.
     ///
-    /// To avoid destroying configurations owned by other tools, this returns
-    /// [`Error::InUse`] unless `nr_kdamonds` is zero. DAMON sysfs has no
-    /// transaction or ownership primitive, so system-wide coordination with
-    /// other DAMON controllers remains the caller's responsibility.
+    /// The method holds an advisory file lock for the monitor's lifetime,
+    /// refuses to replace a staged kdamond, and rechecks the staged
+    /// configuration and kernel-thread ID. Uncooperative controllers can
+    /// bypass the file lock because DAMON sysfs has no ownership primitive.
     pub fn start(self) -> Result<Monitor> {
         let intervals = MonitoringIntervals::new(self.sample, self.aggregation, self.update)?;
         let region_bounds = RegionBounds::new(self.min_regions, self.max_regions)?;
+        let session_lock = SessionLock::acquire(&self.damon.lock_path)?;
         let existing = self.damon.admin.kdamond_count()?;
         if existing != 0 {
             return Err(Error::InUse { kdamonds: existing });
         }
 
         retry_busy(|| self.damon.admin.set_kdamond_count(1))?;
+        if self.damon.admin.kdamond_count()? != 1 {
+            return Err(Error::OwnershipLost {
+                reason: "kdamond count changed immediately after staging",
+            });
+        }
         let kdamond = self.damon.admin.kdamond(0);
         let setup = configure_monitor(&kdamond, self.pid, intervals, region_bounds);
-        let capabilities = match setup {
-            Ok(capabilities) => capabilities,
+        let (capabilities, staged) = match setup {
+            Ok(configured) => configured,
             Err(operation) => {
-                return match retry_busy(|| self.damon.admin.set_kdamond_count(0)) {
-                    Ok(()) => Err(operation),
-                    Err(rollback) => Err(Error::Rollback {
-                        operation: Box::new(operation),
-                        rollback: Box::new(rollback),
-                    }),
-                };
+                return Err(with_rollback(
+                    operation,
+                    rollback_unstarted_slot(&self.damon.admin, &kdamond),
+                ));
             }
         };
+        if let Err(operation) = staged.verify(&self.damon.admin, &kdamond) {
+            return Err(with_rollback(
+                operation,
+                rollback_unstarted_monitor(&self.damon.admin, &kdamond, &staged),
+            ));
+        }
+
+        if let Err(operation) = retry_busy(|| kdamond.command(KdamondCommand::On)) {
+            return Err(rollback_started_monitor(
+                operation,
+                &self.damon.admin,
+                &kdamond,
+                &staged,
+            ));
+        }
+        let kdamond_pid = match running_thread_pid(&kdamond) {
+            Ok(pid) => pid,
+            Err(operation) => {
+                return Err(rollback_started_monitor(
+                    operation,
+                    &self.damon.admin,
+                    &kdamond,
+                    &staged,
+                ));
+            }
+        };
+        let ownership = Ownership {
+            staged,
+            kdamond_pid,
+        };
+        if let Err(operation) = ownership.verify_running(&self.damon.admin, &kdamond) {
+            return Err(rollback_started_monitor(
+                operation,
+                &self.damon.admin,
+                &kdamond,
+                &ownership.staged,
+            ));
+        }
 
         Ok(Monitor {
             admin: self.damon.admin.clone(),
             kdamond,
             capabilities,
-            capacity_hint: region_bounds.max(),
+            capacity_hint: usize::try_from(region_bounds.max()).unwrap_or(usize::MAX),
+            ownership,
+            _session_lock: session_lock,
             running: true,
             owns_slot: true,
         })
@@ -149,7 +218,7 @@ fn configure_monitor(
     pid: Pid,
     intervals: MonitoringIntervals,
     region_bounds: RegionBounds,
-) -> Result<Capabilities> {
+) -> Result<(Capabilities, StagedOwnership)> {
     retry_busy(|| kdamond.set_context_count(1))?;
     let context = kdamond.context(0);
     let operations = context.available_operations()?;
@@ -160,6 +229,7 @@ fn configure_monitor(
     }
 
     context.set_operation(&Operation::VirtualAddress)?;
+    context.set_address_unit(AddressUnit::ONE)?;
     context.set_intervals(intervals)?;
     context.set_region_bounds(region_bounds)?;
     retry_busy(|| context.set_target_count(1))?;
@@ -170,14 +240,164 @@ fn configure_monitor(
     scheme.set_match_all()?;
 
     let capabilities = kdamond.capabilities(0, 0)?;
-    if !capabilities.has(SysfsFeature::TriedRegions) {
+    if capabilities.feature_support(SysfsFeature::TriedRegions) != CapabilitySupport::Supported {
         return Err(Error::UnsupportedFeature {
             feature: "DAMOS tried-region queries",
         });
     }
 
-    retry_busy(|| kdamond.command(KdamondCommand::On))?;
-    Ok(capabilities)
+    let staged = StagedOwnership {
+        target_pid: pid,
+        intervals,
+        region_bounds,
+        access_pattern: scheme.access_pattern()?,
+    };
+    Ok((capabilities, staged))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StagedOwnership {
+    target_pid: Pid,
+    intervals: MonitoringIntervals,
+    region_bounds: RegionBounds,
+    access_pattern: AccessPattern,
+}
+
+impl StagedOwnership {
+    fn verify(&self, admin: &DamonAdmin, kdamond: &Kdamond) -> Result<()> {
+        if admin.kdamond_count()? != 1 {
+            return Err(Error::OwnershipLost {
+                reason: "the staged kdamond count changed",
+            });
+        }
+        if kdamond.context_count()? != 1 {
+            return Err(Error::OwnershipLost {
+                reason: "the staged context count changed",
+            });
+        }
+        let context = kdamond.context(0);
+        if context.operation()? != Operation::VirtualAddress
+            || context.address_unit()? != AddressUnit::ONE
+            || context.intervals()? != self.intervals
+            || context.region_bounds()? != self.region_bounds
+        {
+            return Err(Error::OwnershipLost {
+                reason: "the staged monitoring attributes changed",
+            });
+        }
+        if context.target_count()? != 1 || context.target(0).pid()? != Some(self.target_pid) {
+            return Err(Error::OwnershipLost {
+                reason: "the staged target changed",
+            });
+        }
+        if context.scheme_count()? != 1 {
+            return Err(Error::OwnershipLost {
+                reason: "the staged scheme count changed",
+            });
+        }
+        let scheme = context.scheme(0);
+        if scheme.action()? != Action::Stat || scheme.access_pattern()? != self.access_pattern {
+            return Err(Error::OwnershipLost {
+                reason: "the staged scheme changed",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct Ownership {
+    staged: StagedOwnership,
+    kdamond_pid: Pid,
+}
+
+impl Ownership {
+    fn verify_running(&self, admin: &DamonAdmin, kdamond: &Kdamond) -> Result<()> {
+        self.staged.verify(admin, kdamond)?;
+        let current = running_thread_pid(kdamond)?;
+        if current != self.kdamond_pid {
+            return Err(Error::OwnershipLost {
+                reason: "the kdamond kernel-thread ID changed",
+            });
+        }
+        Ok(())
+    }
+}
+
+fn running_thread_pid(kdamond: &Kdamond) -> Result<Pid> {
+    match retry_busy(|| kdamond.state())? {
+        KdamondState::Off => Err(Error::NotRunning),
+        KdamondState::Unknown(state) => Err(Error::UnexpectedKdamondState { state }),
+        KdamondState::On => kdamond.pid()?.ok_or(Error::OwnershipLost {
+            reason: "a running kdamond did not expose a kernel-thread ID",
+        }),
+    }
+}
+
+fn rollback_started_monitor(
+    operation: Error,
+    admin: &DamonAdmin,
+    kdamond: &Kdamond,
+    staged: &StagedOwnership,
+) -> Error {
+    with_rollback(operation, rollback_staged_monitor(admin, kdamond, staged))
+}
+
+fn with_rollback(operation: Error, rollback_result: Result<()>) -> Error {
+    match rollback_result {
+        Ok(()) => operation,
+        Err(rollback) => Error::Rollback {
+            operation: Box::new(operation),
+            rollback: Box::new(rollback),
+        },
+    }
+}
+
+fn rollback_unstarted_slot(admin: &DamonAdmin, kdamond: &Kdamond) -> Result<()> {
+    match admin.kdamond_count()? {
+        0 => return Ok(()),
+        1 => {}
+        kdamonds => return Err(Error::InUse { kdamonds }),
+    }
+    match retry_busy(|| kdamond.state())? {
+        KdamondState::Off => retry_busy(|| admin.set_kdamond_count(0)),
+        KdamondState::On => Err(Error::OwnershipLost {
+            reason: "a kdamond started during setup rollback",
+        }),
+        KdamondState::Unknown(_) => Err(Error::OwnershipLost {
+            reason: "the kdamond state changed during setup rollback",
+        }),
+    }
+}
+
+fn rollback_unstarted_monitor(
+    admin: &DamonAdmin,
+    kdamond: &Kdamond,
+    staged: &StagedOwnership,
+) -> Result<()> {
+    staged.verify(admin, kdamond)?;
+    match retry_busy(|| kdamond.state())? {
+        KdamondState::Off => retry_busy(|| admin.set_kdamond_count(0)),
+        KdamondState::On => Err(Error::OwnershipLost {
+            reason: "a kdamond started before setup completed",
+        }),
+        KdamondState::Unknown(_) => Err(Error::OwnershipLost {
+            reason: "the kdamond state changed before setup completed",
+        }),
+    }
+}
+
+fn rollback_staged_monitor(
+    admin: &DamonAdmin,
+    kdamond: &Kdamond,
+    staged: &StagedOwnership,
+) -> Result<()> {
+    staged.verify(admin, kdamond)?;
+    if kdamond_is_running(kdamond)? {
+        retry_busy(|| kdamond.command(KdamondCommand::Off))?;
+    }
+    staged.verify(admin, kdamond)?;
+    retry_busy(|| admin.set_kdamond_count(0))
 }
 
 fn retry_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
@@ -204,13 +424,62 @@ fn kdamond_is_running(kdamond: &Kdamond) -> Result<bool> {
     }
 }
 
-/// A running, exclusively owned high-level DAMON monitor.
+#[derive(Debug)]
+struct SessionLock {
+    _file: File,
+}
+
+impl SessionLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            use rustix::fs::{FlockOperation, flock};
+
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path)
+                .map_err(|error| crate::error::io_error("open session lock", path, error))?;
+            match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => Ok(Self { _file: file }),
+                Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
+                    Err(Error::SessionLockBusy {
+                        path: path.to_path_buf(),
+                    })
+                }
+                Err(error) => Err(crate::error::io_error(
+                    "lock session",
+                    path,
+                    io::Error::from_raw_os_error(error.raw_os_error()),
+                )),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            Err(Error::UnsupportedPlatform)
+        }
+    }
+}
+
+/// A running high-level DAMON monitor holding a cooperative session lock.
+///
+/// The monitor verifies its staged configuration and kdamond thread ID before
+/// destructive operations. This cannot provide absolute ownership against
+/// tools that ignore the advisory lock and mutate the global sysfs hierarchy.
 #[derive(Debug)]
 pub struct Monitor {
     admin: DamonAdmin,
     kdamond: Kdamond,
     capabilities: Capabilities,
     capacity_hint: usize,
+    ownership: Ownership,
+    _session_lock: SessionLock,
     running: bool,
     owns_slot: bool,
 }
@@ -231,9 +500,12 @@ impl Monitor {
         if !self.running {
             return Err(Error::NotRunning);
         }
-        if !kdamond_is_running(&self.kdamond)? {
-            self.running = false;
-            return Err(Error::NotRunning);
+        match self.ownership.verify_running(&self.admin, &self.kdamond) {
+            Err(Error::NotRunning) => {
+                self.running = false;
+                return Err(Error::NotRunning);
+            }
+            result => result?,
         }
         retry_busy(|| {
             self.kdamond
@@ -250,7 +522,11 @@ impl Monitor {
         if !self.running {
             return Ok(false);
         }
-        kdamond_is_running(&self.kdamond)
+        match self.ownership.verify_running(&self.admin, &self.kdamond) {
+            Ok(()) => Ok(true),
+            Err(Error::NotRunning) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Stops monitoring and removes the crate-owned kdamond slot.
@@ -259,23 +535,33 @@ impl Monitor {
     }
 
     fn stop_inner(&mut self) -> Result<()> {
-        if self.running {
-            if kdamond_is_running(&self.kdamond)? {
+        if !self.owns_slot {
+            return Ok(());
+        }
+        let count = self.admin.kdamond_count()?;
+        match count {
+            0 => {
+                self.running = false;
+                self.owns_slot = false;
+                return Ok(());
+            }
+            1 => {}
+            kdamonds => return Err(Error::InUse { kdamonds }),
+        }
+        match retry_busy(|| self.kdamond.state())? {
+            KdamondState::On => {
+                self.ownership.verify_running(&self.admin, &self.kdamond)?;
                 retry_busy(|| self.kdamond.command(KdamondCommand::Off))?;
             }
-            self.running = false;
-        }
-        if self.owns_slot {
-            let count = self.admin.kdamond_count()?;
-            match count {
-                0 => self.owns_slot = false,
-                1 => {
-                    retry_busy(|| self.admin.set_kdamond_count(0))?;
-                    self.owns_slot = false;
-                }
-                kdamonds => return Err(Error::InUse { kdamonds }),
+            KdamondState::Off => self.ownership.staged.verify(&self.admin, &self.kdamond)?,
+            KdamondState::Unknown(state) => {
+                return Err(Error::UnexpectedKdamondState { state });
             }
         }
+        self.running = false;
+        self.ownership.staged.verify(&self.admin, &self.kdamond)?;
+        retry_busy(|| self.admin.set_kdamond_count(0))?;
+        self.owns_slot = false;
         Ok(())
     }
 }

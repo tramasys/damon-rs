@@ -7,7 +7,7 @@ Versioning and the Keep a Changelog structure.
 
 ### Added
 
-- Initial dependency-free crate infrastructure.
+- Initial crate infrastructure with a safe direct Linux syscall dependency.
 - Typed DAMON sysfs primitives and capability discovery.
 - High-level single-PID virtual-address monitoring lifecycle.
 - Query snapshots backed by a match-all DAMOS `stat` scheme.
@@ -26,3 +26,9 @@ Versioning and the Keep a Changelog structure.
 - Accept zero monitoring intervals as supported by the kernel ABI.
 - Bound eager snapshot allocation independently of configured region limits.
 - Preserve externally changed configurations during monitor cleanup.
+- Preserve raw DAMON address units and provide checked byte conversions.
+- Use `u32` access-count and age ranges to match the active kernel ABI.
+- Preserve tried-region probe hits in snapshot regions.
+- Distinguish unsupported capabilities from paths requiring staged children.
+- Serialize cooperating sessions with an advisory lock and verify staged
+  configuration and kdamond identity before destructive lifecycle operations.

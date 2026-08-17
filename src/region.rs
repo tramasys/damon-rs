@@ -1,54 +1,98 @@
-/// A monitored virtual-memory region returned by DAMON.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+use crate::sysfs::MAX_PROBES;
+use crate::{AddressUnit, Result};
+
+/// A monitored region returned by DAMON.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Region {
     pub(crate) start: u64,
     pub(crate) end: u64,
-    pub(crate) nr_accesses: u64,
-    pub(crate) age: u64,
-    pub(crate) filter_passed_bytes: Option<u64>,
+    pub(crate) nr_accesses: u32,
+    pub(crate) age: u32,
+    pub(crate) filter_passed_units: Option<u64>,
+    pub(crate) probe_hits: [u8; MAX_PROBES],
+    pub(crate) probe_count: u8,
+    pub(crate) address_unit: AddressUnit,
 }
 
 impl Region {
-    /// Returns the inclusive start address.
+    /// Returns the inclusive start address in DAMON core address units.
     #[must_use]
-    pub const fn start(self) -> u64 {
+    pub const fn start_units(&self) -> u64 {
         self.start
     }
 
-    /// Returns the exclusive end address.
+    /// Returns the inclusive start address in bytes.
+    pub const fn start_bytes(&self) -> Result<u64> {
+        self.address_unit.to_bytes(self.start)
+    }
+
+    /// Returns the exclusive end address in DAMON core address units.
     #[must_use]
-    pub const fn end(self) -> u64 {
+    pub const fn end_units(&self) -> u64 {
         self.end
     }
 
-    /// Returns the length in bytes.
+    /// Returns the exclusive end address in bytes.
+    pub const fn end_bytes(&self) -> Result<u64> {
+        self.address_unit.to_bytes(self.end)
+    }
+
+    /// Returns the length in DAMON core address units.
     #[must_use]
-    pub const fn len(self) -> u64 {
+    pub const fn len_units(&self) -> u64 {
         self.end - self.start
+    }
+
+    /// Returns the length in bytes.
+    pub const fn len_bytes(&self) -> Result<u64> {
+        self.address_unit.to_bytes(self.len_units())
     }
 
     /// Returns whether the region is empty.
     #[must_use]
-    pub const fn is_empty(self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.start == self.end
     }
 
     /// Returns the number of observed accesses in the aggregation interval.
     #[must_use]
-    pub const fn nr_accesses(self) -> u64 {
+    pub const fn nr_accesses(&self) -> u32 {
         self.nr_accesses
     }
 
     /// Returns the region age in aggregation intervals.
     #[must_use]
-    pub const fn age(self) -> u64 {
+    pub const fn age(&self) -> u32 {
         self.age
     }
 
-    /// Returns bytes that passed scheme filters when exposed by the kernel.
+    /// Returns address units that passed scheme filters when exposed.
     #[must_use]
-    pub const fn filter_passed_bytes(self) -> Option<u64> {
-        self.filter_passed_bytes
+    pub const fn filter_passed_units(&self) -> Option<u64> {
+        self.filter_passed_units
+    }
+
+    /// Returns bytes that passed scheme filters when exposed by the kernel.
+    pub fn filter_passed_bytes(&self) -> Result<Option<u64>> {
+        match self.filter_passed_units {
+            Some(units) => match self.address_unit.to_bytes(units) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) => Err(error),
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// Returns the per-probe positive sample counters in probe-index order.
+    #[must_use]
+    pub fn probe_hits(&self) -> &[u8] {
+        &self.probe_hits[..usize::from(self.probe_count)]
+    }
+
+    /// Returns the scale factor used for address and size fields.
+    #[must_use]
+    pub const fn address_unit(&self) -> AddressUnit {
+        self.address_unit
     }
 }
 
@@ -56,7 +100,8 @@ impl Region {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
     pub(crate) regions: Vec<Region>,
-    pub(crate) total_bytes: u64,
+    pub(crate) total_units: u64,
+    pub(crate) address_unit: AddressUnit,
 }
 
 impl Snapshot {
@@ -70,11 +115,21 @@ impl Snapshot {
         &self.regions
     }
 
-    /// Returns the matched byte total reported by the kernel or, on kernels
-    /// without that field, computed from the materialized regions.
+    /// Returns the matched total in DAMON core address units.
     #[must_use]
-    pub const fn total_bytes(&self) -> u64 {
-        self.total_bytes
+    pub const fn total_units(&self) -> u64 {
+        self.total_units
+    }
+
+    /// Returns the matched total in bytes.
+    pub const fn total_bytes(&self) -> Result<u64> {
+        self.address_unit.to_bytes(self.total_units)
+    }
+
+    /// Returns the scale factor used for address and size fields.
+    #[must_use]
+    pub const fn address_unit(&self) -> AddressUnit {
+        self.address_unit
     }
 
     /// Returns the number of regions in this snapshot.

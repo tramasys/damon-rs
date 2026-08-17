@@ -9,7 +9,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::config::{MonitoringIntervals, Pid, RegionBounds};
+use crate::config::{AddressUnit, MonitoringIntervals, Pid, RegionBounds};
 use crate::error::io_error;
 use crate::{Error, Region, Result, Snapshot};
 
@@ -197,8 +197,8 @@ impl fmt::Display for Action {
 /// An optional DAMON sysfs feature detected from a concrete ABI path.
 ///
 /// Discovery is based on populated sysfs paths rather than the running kernel
-/// version. Features below an indexed child, such as a probe filter, can only
-/// be discovered after that child has been staged.
+/// version. Features below an unstaged indexed child, such as a probe filter,
+/// are reported through [`CapabilitySupport::RequiresStaging`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum SysfsFeature {
@@ -230,12 +230,44 @@ pub enum SysfsFeature {
     TriedRegionsTotalBytes,
 }
 
-/// Runtime capabilities discovered from individual paths in a populated
-/// DAMON hierarchy.
+/// Whether an optional sysfs feature can be observed in the current hierarchy.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum CapabilitySupport {
+    /// The concrete sysfs path is present.
+    Supported,
+    /// The concrete sysfs path is absent even though its parent is staged.
+    Unsupported,
+    /// An indexed parent must be staged before support can be observed.
+    RequiresStaging,
+}
+
+/// The discovery result for one optional sysfs feature.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct FeatureCapability {
+    feature: SysfsFeature,
+    support: CapabilitySupport,
+}
+
+impl FeatureCapability {
+    /// Returns the optional feature being described.
+    #[must_use]
+    pub const fn feature(self) -> SysfsFeature {
+        self.feature
+    }
+
+    /// Returns whether the feature is supported or needs more staging.
+    #[must_use]
+    pub const fn support(self) -> CapabilitySupport {
+        self.support
+    }
+}
+
+/// Runtime capabilities discovered from individual DAMON sysfs paths.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Capabilities {
     operations: Box<[Operation]>,
-    features: Box<[SysfsFeature]>,
+    features: Box<[FeatureCapability]>,
 }
 
 impl Capabilities {
@@ -253,32 +285,37 @@ impl Capabilities {
             .any(|candidate| candidate == operation)
     }
 
-    /// Returns every optional feature whose concrete path was found.
+    /// Returns the discovery result for every known optional feature.
     #[must_use]
-    pub fn features(&self) -> &[SysfsFeature] {
+    pub fn features(&self) -> &[FeatureCapability] {
         &self.features
     }
 
-    /// Returns whether a concrete optional sysfs feature is present.
+    /// Returns the discovery state of an optional sysfs feature.
     #[must_use]
-    pub fn has(&self, feature: SysfsFeature) -> bool {
-        self.features.contains(&feature)
+    pub fn feature_support(&self, feature: SysfsFeature) -> CapabilitySupport {
+        self.features
+            .iter()
+            .find(|capability| capability.feature == feature)
+            .map_or(CapabilitySupport::Unsupported, |capability| {
+                capability.support
+            })
     }
 }
 
-/// A minimum and maximum value in a DAMOS access pattern.
+/// A DAMOS region-size range in DAMON core address units.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AccessPatternRange {
+pub struct RegionSizeRange {
     min: u64,
     max: u64,
 }
 
-impl AccessPatternRange {
-    /// Creates a validated inclusive range.
+impl RegionSizeRange {
+    /// Creates a validated inclusive size range in core address units.
     pub const fn new(min: u64, max: u64) -> Result<Self> {
         if min > max {
             return Err(Error::InvalidConfiguration {
-                field: "access pattern range",
+                field: "region size range",
                 reason: "minimum must not exceed maximum",
             });
         }
@@ -296,24 +333,94 @@ impl AccessPatternRange {
     pub const fn max(self) -> u64 {
         self.max
     }
+
+    /// Converts the inclusive minimum to bytes with the context's unit.
+    pub const fn min_bytes(self, address_unit: AddressUnit) -> Result<u64> {
+        address_unit.to_bytes(self.min)
+    }
+
+    /// Converts the inclusive maximum to bytes with the context's unit.
+    pub const fn max_bytes(self, address_unit: AddressUnit) -> Result<u64> {
+        address_unit.to_bytes(self.max)
+    }
+}
+
+/// A DAMOS access-count range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccessCountRange {
+    min: u32,
+    max: u32,
+}
+
+impl AccessCountRange {
+    /// Creates a validated inclusive access-count range.
+    pub const fn new(min: u32, max: u32) -> Result<Self> {
+        if min > max {
+            return Err(Error::InvalidConfiguration {
+                field: "access count range",
+                reason: "minimum must not exceed maximum",
+            });
+        }
+        Ok(Self { min, max })
+    }
+
+    /// Returns the inclusive minimum.
+    #[must_use]
+    pub const fn min(self) -> u32 {
+        self.min
+    }
+
+    /// Returns the inclusive maximum.
+    #[must_use]
+    pub const fn max(self) -> u32 {
+        self.max
+    }
+}
+
+/// A DAMOS age range in aggregation intervals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgeRange {
+    min: u32,
+    max: u32,
+}
+
+impl AgeRange {
+    /// Creates a validated inclusive age range.
+    pub const fn new(min: u32, max: u32) -> Result<Self> {
+        if min > max {
+            return Err(Error::InvalidConfiguration {
+                field: "age range",
+                reason: "minimum must not exceed maximum",
+            });
+        }
+        Ok(Self { min, max })
+    }
+
+    /// Returns the inclusive minimum.
+    #[must_use]
+    pub const fn min(self) -> u32 {
+        self.min
+    }
+
+    /// Returns the inclusive maximum.
+    #[must_use]
+    pub const fn max(self) -> u32 {
+        self.max
+    }
 }
 
 /// A DAMOS region access pattern.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AccessPattern {
-    size: AccessPatternRange,
-    accesses: AccessPatternRange,
-    age: AccessPatternRange,
+    size: RegionSizeRange,
+    accesses: AccessCountRange,
+    age: AgeRange,
 }
 
 impl AccessPattern {
     /// Creates a pattern from size, access-count, and age ranges.
     #[must_use]
-    pub const fn new(
-        size: AccessPatternRange,
-        accesses: AccessPatternRange,
-        age: AccessPatternRange,
-    ) -> Self {
+    pub const fn new(size: RegionSizeRange, accesses: AccessCountRange, age: AgeRange) -> Self {
         Self {
             size,
             accesses,
@@ -321,21 +428,21 @@ impl AccessPattern {
         }
     }
 
-    /// Returns the region-size range in bytes.
+    /// Returns the region-size range in DAMON core address units.
     #[must_use]
-    pub const fn size(self) -> AccessPatternRange {
+    pub const fn size(self) -> RegionSizeRange {
         self.size
     }
 
     /// Returns the access-count range.
     #[must_use]
-    pub const fn accesses(self) -> AccessPatternRange {
+    pub const fn accesses(self) -> AccessCountRange {
         self.accesses
     }
 
     /// Returns the age range in aggregation intervals.
     #[must_use]
-    pub const fn age(self) -> AccessPatternRange {
+    pub const fn age(self) -> AgeRange {
         self.age
     }
 }
@@ -518,14 +625,29 @@ impl Kdamond {
         }
     }
 
-    /// Discovers features from individual paths in an already populated
-    /// context and scheme.
+    /// Discovers features from individual paths in a staged context and scheme.
     ///
-    /// This follows the official `damo` strategy of inspecting concrete ABI
-    /// nodes. Paths below indexed children are reported only when the caller
-    /// has staged those children.
+    /// Paths below an unstaged probe or probe filter are reported as
+    /// [`CapabilitySupport::RequiresStaging`], rather than being confused with
+    /// kernel-level absence. This method never modifies the staged hierarchy.
     pub fn capabilities(&self, context_index: usize, scheme_index: usize) -> Result<Capabilities> {
+        let context_count = self.context_count()?;
+        if context_index >= context_count {
+            return Err(Error::IndexOutOfBounds {
+                kind: "context",
+                index: context_index,
+                count: context_count,
+            });
+        }
         let context = self.context(context_index);
+        let scheme_count = context.scheme_count()?;
+        if scheme_index >= scheme_count {
+            return Err(Error::IndexOutOfBounds {
+                kind: "scheme",
+                index: scheme_index,
+                count: scheme_count,
+            });
+        }
         let scheme = context.scheme(scheme_index);
         let probes = context.path.join("monitoring_attrs/probes");
         let probe_filter = probes.join("0/filters/0");
@@ -541,35 +663,66 @@ impl Kdamond {
             (SysfsFeature::ContextPause, context.path.join("pause")),
             (SysfsFeature::AttributeProbeCount, probes.join("nr_probes")),
             (
-                SysfsFeature::ProbeFilterCount,
-                probes.join("0/filters/nr_filters"),
-            ),
-            (SysfsFeature::ProbeFilterType, probe_filter.join("type")),
-            (
-                SysfsFeature::ProbeFilterMatching,
-                probe_filter.join("matching"),
-            ),
-            (SysfsFeature::ProbeFilterAllow, probe_filter.join("allow")),
-            (SysfsFeature::ProbeFilterPath, probe_filter.join("path")),
-            (
                 SysfsFeature::SchemeApplyInterval,
                 scheme.path.join("apply_interval_us"),
             ),
-            (
-                SysfsFeature::TriedRegionsTotalBytes,
-                scheme.path.join("tried_regions/total_bytes"),
-            ),
         ] {
-            if path_exists(&path)? {
-                features.push(feature);
-            }
+            features.push(feature_capability(feature, support_for_path(&path)?));
         }
-        if path_is_dir(&scheme.path.join("tried_regions"))? {
-            features.push(SysfsFeature::TriedRegions);
-        }
-        features.sort_unstable();
 
-        let operations = if features.contains(&SysfsFeature::AvailableOperations) {
+        let probe_count_support = support_for_path(&probes.join("nr_probes"))?;
+        let probe_filter_count_support = match probe_count_support {
+            CapabilitySupport::Unsupported => CapabilitySupport::Unsupported,
+            CapabilitySupport::RequiresStaging => CapabilitySupport::RequiresStaging,
+            CapabilitySupport::Supported if context.probe_count()? == 0 => {
+                CapabilitySupport::RequiresStaging
+            }
+            CapabilitySupport::Supported => support_for_path(&probes.join("0/filters/nr_filters"))?,
+        };
+        features.push(feature_capability(
+            SysfsFeature::ProbeFilterCount,
+            probe_filter_count_support,
+        ));
+
+        let probe_filter_attribute_support = match probe_filter_count_support {
+            CapabilitySupport::Unsupported => CapabilitySupport::Unsupported,
+            CapabilitySupport::RequiresStaging => CapabilitySupport::RequiresStaging,
+            CapabilitySupport::Supported if context.probe(0).filter_count()? == 0 => {
+                CapabilitySupport::RequiresStaging
+            }
+            CapabilitySupport::Supported => CapabilitySupport::Supported,
+        };
+        for (feature, name) in [
+            (SysfsFeature::ProbeFilterType, "type"),
+            (SysfsFeature::ProbeFilterMatching, "matching"),
+            (SysfsFeature::ProbeFilterAllow, "allow"),
+            (SysfsFeature::ProbeFilterPath, "path"),
+        ] {
+            let support = if probe_filter_attribute_support == CapabilitySupport::Supported {
+                support_for_path(&probe_filter.join(name))?
+            } else {
+                probe_filter_attribute_support
+            };
+            features.push(feature_capability(feature, support));
+        }
+
+        let tried_regions = scheme.path.join("tried_regions");
+        features.push(feature_capability(
+            SysfsFeature::TriedRegions,
+            if path_is_dir(&tried_regions)? {
+                CapabilitySupport::Supported
+            } else {
+                CapabilitySupport::Unsupported
+            },
+        ));
+        features.push(feature_capability(
+            SysfsFeature::TriedRegionsTotalBytes,
+            support_for_path(&tried_regions.join("total_bytes"))?,
+        ));
+
+        let operations = if feature_support(&features, SysfsFeature::AvailableOperations)
+            == CapabilitySupport::Supported
+        {
             context.available_operations()?
         } else {
             Vec::new()
@@ -619,20 +772,17 @@ impl Context {
         )
     }
 
-    /// Reads the address-unit size in bytes.
-    pub fn address_unit(&self) -> Result<u64> {
-        read_u64(&self.path.join("addr_unit"))
+    /// Reads the scale factor from DAMON core address units to bytes.
+    pub fn address_unit(&self) -> Result<AddressUnit> {
+        let path = self.path.join("addr_unit");
+        let bytes = read_u64(&path)?;
+        AddressUnit::new(bytes)
+            .map_err(|_| invalid_kernel_value(&path, bytes.to_string(), "a non-zero address unit"))
     }
 
-    /// Sets the address-unit size in bytes.
-    pub fn set_address_unit(&self, bytes: u64) -> Result<()> {
-        if bytes == 0 {
-            return Err(Error::InvalidConfiguration {
-                field: "address unit",
-                reason: "must be greater than zero",
-            });
-        }
-        write_value(&self.path.join("addr_unit"), bytes)
+    /// Sets the scale factor from DAMON core address units to bytes.
+    pub fn set_address_unit(&self, address_unit: AddressUnit) -> Result<()> {
+        write_value(&self.path.join("addr_unit"), address_unit.bytes())
     }
 
     /// Reads whether monitoring is paused for this context.
@@ -667,10 +817,7 @@ impl Context {
     /// Reads the adaptive monitoring-region count bounds.
     pub fn region_bounds(&self) -> Result<RegionBounds> {
         let path = self.path.join("monitoring_attrs/nr_regions");
-        RegionBounds::new(
-            read_usize(&path.join("min"))?,
-            read_usize(&path.join("max"))?,
-        )
+        RegionBounds::new(read_u64(&path.join("min"))?, read_u64(&path.join("max"))?)
     }
 
     /// Writes the adaptive monitoring-region count bounds.
@@ -740,6 +887,7 @@ impl Context {
     pub fn scheme(&self, index: usize) -> Scheme {
         Scheme {
             path: self.path.join("schemes").join(index.to_string()),
+            address_unit_path: self.path.join("addr_unit"),
         }
     }
 }
@@ -892,6 +1040,7 @@ impl ProbeFilter {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Scheme {
     path: PathBuf,
+    address_unit_path: PathBuf,
 }
 
 impl Scheme {
@@ -916,18 +1065,18 @@ impl Scheme {
     pub fn access_pattern(&self) -> Result<AccessPattern> {
         let pattern = self.path.join("access_pattern");
         Ok(AccessPattern::new(
-            read_access_pattern_range(&pattern.join("sz"))?,
-            read_access_pattern_range(&pattern.join("nr_accesses"))?,
-            read_access_pattern_range(&pattern.join("age"))?,
+            read_region_size_range(&pattern.join("sz"))?,
+            read_access_count_range(&pattern.join("nr_accesses"))?,
+            read_age_range(&pattern.join("age"))?,
         ))
     }
 
     /// Sets this scheme's access pattern.
     pub fn set_access_pattern(&self, pattern: AccessPattern) -> Result<()> {
         let path = self.path.join("access_pattern");
-        write_access_pattern_range(&path.join("sz"), pattern.size())?;
-        write_access_pattern_range(&path.join("nr_accesses"), pattern.accesses())?;
-        write_access_pattern_range(&path.join("age"), pattern.age())
+        write_region_size_range(&path.join("sz"), pattern.size())?;
+        write_access_count_range(&path.join("nr_accesses"), pattern.accesses())?;
+        write_age_range(&path.join("age"), pattern.age())
     }
 
     /// Configures a pattern that matches every kernel-representable region.
@@ -940,12 +1089,12 @@ impl Scheme {
         let pattern = self.path.join("access_pattern");
         let size = pattern.join("sz");
         write_value(&size.join("min"), 0_u8)?;
-        let kernel_max = write_kernel_ulong_max(&size.join("max"))?;
+        write_kernel_ulong_max(&size.join("max"))?;
 
         for name in ["nr_accesses", "age"] {
             let range = pattern.join(name);
             write_value(&range.join("min"), 0_u8)?;
-            write_value(&range.join("max"), kernel_max)?;
+            write_value(&range.join("max"), u32::MAX)?;
         }
         Ok(())
     }
@@ -975,16 +1124,26 @@ impl Scheme {
     /// only controls userspace allocation and does not limit results. The
     /// initial allocation is capped to avoid excessive eager allocation. When
     /// the kernel does not expose `total_bytes`, the total is computed from
-    /// the validated materialized regions.
+    /// the validated materialized regions. Despite the sysfs filename, a
+    /// non-default address unit makes the reported value a count of core
+    /// address units; use [`Snapshot::total_bytes`] for checked conversion.
     pub fn tried_regions(&self, capacity_hint: usize) -> Result<Snapshot> {
+        let address_unit_bytes = read_u64(&self.address_unit_path)?;
+        let address_unit = AddressUnit::new(address_unit_bytes).map_err(|_| {
+            invalid_kernel_value(
+                &self.address_unit_path,
+                address_unit_bytes.to_string(),
+                "a non-zero address unit",
+            )
+        })?;
         let base = self.path.join("tried_regions");
         let total_bytes_path = base.join("total_bytes");
-        let reported_total_bytes = if path_exists(&total_bytes_path)? {
+        let reported_total_units = if path_exists(&total_bytes_path)? {
             Some(read_u64(&total_bytes_path)?)
         } else {
             None
         };
-        let mut computed_total_bytes = 0_u64;
+        let mut computed_total_units = 0_u64;
         let mut regions = Vec::with_capacity(capacity_hint.min(MAX_INITIAL_REGION_CAPACITY));
 
         for index in 0_usize.. {
@@ -1000,46 +1159,80 @@ impl Scheme {
             if end < start {
                 return Err(Error::InvalidRegion { start, end });
             }
-            if reported_total_bytes.is_none() {
-                computed_total_bytes = computed_total_bytes
+            if reported_total_units.is_none() {
+                computed_total_units = computed_total_units
                     .checked_add(end - start)
                     .ok_or(Error::SnapshotSizeOverflow)?;
             }
             path.pop();
             path.push("nr_accesses");
-            let nr_accesses = read_u64(&path)?;
+            let nr_accesses = read_u32(&path)?;
             path.pop();
             path.push("age");
-            let age = read_u64(&path)?;
+            let age = read_u32(&path)?;
             path.pop();
             path.push("sz_filter_passed");
-            let filter_passed_bytes = if path_exists(&path)? {
+            let filter_passed_units = if path_exists(&path)? {
                 Some(read_u64(&path)?)
             } else {
                 None
             };
+            path.pop();
+            let probes = path.join("probes");
+            let mut probe_hits = [0_u8; MAX_PROBES];
+            let mut probe_count = 0_u8;
+            for (probe_index, hits_value) in probe_hits.iter_mut().enumerate() {
+                let hits = probes.join(probe_index.to_string()).join("hits");
+                if !path_exists(&hits)? {
+                    break;
+                }
+                *hits_value = read_u8(&hits)?;
+                probe_count += 1;
+            }
 
             regions.push(Region {
                 start,
                 end,
                 nr_accesses,
                 age,
-                filter_passed_bytes,
+                filter_passed_units,
+                probe_hits,
+                probe_count,
+                address_unit,
             });
         }
 
         Ok(Snapshot {
             regions,
-            total_bytes: reported_total_bytes.unwrap_or(computed_total_bytes),
+            total_units: reported_total_units.unwrap_or(computed_total_units),
+            address_unit,
         })
     }
 }
 
-fn read_access_pattern_range(path: &Path) -> Result<AccessPatternRange> {
-    AccessPatternRange::new(read_u64(&path.join("min"))?, read_u64(&path.join("max"))?)
+fn read_region_size_range(path: &Path) -> Result<RegionSizeRange> {
+    RegionSizeRange::new(read_u64(&path.join("min"))?, read_u64(&path.join("max"))?)
 }
 
-fn write_access_pattern_range(path: &Path, range: AccessPatternRange) -> Result<()> {
+fn write_region_size_range(path: &Path, range: RegionSizeRange) -> Result<()> {
+    write_value(&path.join("min"), range.min())?;
+    write_value(&path.join("max"), range.max())
+}
+
+fn read_access_count_range(path: &Path) -> Result<AccessCountRange> {
+    AccessCountRange::new(read_u32(&path.join("min"))?, read_u32(&path.join("max"))?)
+}
+
+fn write_access_count_range(path: &Path, range: AccessCountRange) -> Result<()> {
+    write_value(&path.join("min"), range.min())?;
+    write_value(&path.join("max"), range.max())
+}
+
+fn read_age_range(path: &Path) -> Result<AgeRange> {
+    AgeRange::new(read_u32(&path.join("min"))?, read_u32(&path.join("max"))?)
+}
+
+fn write_age_range(path: &Path, range: AgeRange) -> Result<()> {
     write_value(&path.join("min"), range.min())?;
     write_value(&path.join("max"), range.max())
 }
@@ -1083,6 +1276,30 @@ fn path_is_dir(path: &Path) -> Result<bool> {
     }
 }
 
+fn support_for_path(path: &Path) -> Result<CapabilitySupport> {
+    if path_exists(path)? {
+        Ok(CapabilitySupport::Supported)
+    } else {
+        Ok(CapabilitySupport::Unsupported)
+    }
+}
+
+const fn feature_capability(
+    feature: SysfsFeature,
+    support: CapabilitySupport,
+) -> FeatureCapability {
+    FeatureCapability { feature, support }
+}
+
+fn feature_support(capabilities: &[FeatureCapability], feature: SysfsFeature) -> CapabilitySupport {
+    capabilities
+        .iter()
+        .find(|capability| capability.feature == feature)
+        .map_or(CapabilitySupport::Unsupported, |capability| {
+            capability.support
+        })
+}
+
 fn read_text(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).map_err(|error| io_error("read", path, error))
 }
@@ -1095,6 +1312,11 @@ fn read_usize(path: &Path) -> Result<usize> {
 fn read_u32(path: &Path) -> Result<u32> {
     let value = read_u64(path)?;
     u32::try_from(value).map_err(|_| invalid_kernel_value(path, value.to_string(), "u32"))
+}
+
+fn read_u8(path: &Path) -> Result<u8> {
+    let value = read_u64(path)?;
+    u8::try_from(value).map_err(|_| invalid_kernel_value(path, value.to_string(), "u8"))
 }
 
 fn read_i32(path: &Path) -> Result<i32> {

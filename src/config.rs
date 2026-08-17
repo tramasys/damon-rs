@@ -7,6 +7,54 @@ const DEFAULT_SAMPLE_US: u64 = 5_000;
 const DEFAULT_AGGREGATION_US: u64 = 100_000;
 const DEFAULT_UPDATE_US: u64 = 60_000_000;
 
+/// Scale factor from DAMON core address units to bytes.
+///
+/// The default unit is one byte. Linux 7.2 applies non-default units only to
+/// physical-address monitoring. Multiplication is checked because a core
+/// address that fits the kernel's `unsigned long` can overflow a userspace
+/// `u64` after scaling.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
+pub struct AddressUnit(u64);
+
+impl AddressUnit {
+    /// One byte per DAMON core address unit.
+    pub const ONE: Self = Self(1);
+
+    /// Creates a non-zero address unit.
+    pub const fn new(bytes: u64) -> Result<Self> {
+        if bytes == 0 {
+            return Err(Error::InvalidConfiguration {
+                field: "address unit",
+                reason: "must be greater than zero",
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the number of bytes per DAMON core address unit.
+    #[must_use]
+    pub const fn bytes(self) -> u64 {
+        self.0
+    }
+
+    /// Converts DAMON core address units to bytes.
+    pub const fn to_bytes(self, units: u64) -> Result<u64> {
+        match units.checked_mul(self.0) {
+            Some(bytes) => Ok(bytes),
+            None => Err(Error::AddressConversionOverflow {
+                units,
+                unit_bytes: self.0,
+            }),
+        }
+    }
+}
+
+impl Default for AddressUnit {
+    fn default() -> Self {
+        Self::ONE
+    }
+}
+
 /// A Linux process identifier accepted by DAMON's virtual-address operations.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub struct Pid(u32);
@@ -135,15 +183,15 @@ fn duration_micros(field: &'static str, duration: Duration) -> Result<u64> {
 /// Lower and upper bounds for DAMON's adaptive number of monitoring regions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RegionBounds {
-    min: usize,
-    max: usize,
+    min: u64,
+    max: u64,
 }
 
 impl RegionBounds {
     /// Creates validated region-count bounds.
     ///
     /// The kernel requires a minimum of at least three and `min <= max`.
-    pub const fn new(min: usize, max: usize) -> Result<Self> {
+    pub const fn new(min: u64, max: u64) -> Result<Self> {
         if min < 3 {
             return Err(Error::InvalidConfiguration {
                 field: "minimum regions",
@@ -161,13 +209,13 @@ impl RegionBounds {
 
     /// Returns the lower region-count bound.
     #[must_use]
-    pub const fn min(self) -> usize {
+    pub const fn min(self) -> u64 {
         self.min
     }
 
     /// Returns the upper region-count bound.
     #[must_use]
-    pub const fn max(self) -> usize {
+    pub const fn max(self) -> u64 {
         self.max
     }
 }

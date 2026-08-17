@@ -18,14 +18,20 @@
 //! let mut monitor = damon.monitor_pid(pid).start()?;
 //!
 //! for region in monitor.snapshot()?.regions() {
-//!     println!("{:#x}-{:#x}: {} accesses", region.start(), region.end(), region.nr_accesses());
+//!     println!(
+//!         "{:#x}-{:#x}: {} accesses",
+//!         region.start_bytes()?,
+//!         region.end_bytes()?,
+//!         region.nr_accesses()
+//!     );
 //! }
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! The high-level API requires exclusive access to the DAMON admin sysfs tree
-//! and refuses to replace an existing kdamond configuration.
+//! The high-level API uses a cooperative advisory lock and refuses to replace
+//! an existing kdamond configuration. The kernel ABI cannot enforce ownership
+//! against controllers that ignore that lock.
 
 #![forbid(unsafe_code)]
 
@@ -35,8 +41,8 @@ mod monitor;
 mod region;
 pub mod sysfs;
 
-pub use config::{MonitoringIntervals, Pid, RegionBounds};
+pub use config::{AddressUnit, MonitoringIntervals, Pid, RegionBounds};
 pub use error::{Error, Result};
-pub use monitor::{Damon, Monitor, MonitorBuilder};
+pub use monitor::{DEFAULT_SESSION_LOCK_PATH, Damon, Monitor, MonitorBuilder};
 pub use region::{Region, Snapshot};
-pub use sysfs::{Capabilities, Operation, SysfsFeature};
+pub use sysfs::{Capabilities, CapabilitySupport, Operation, SysfsFeature};

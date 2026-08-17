@@ -13,11 +13,13 @@ human-facing [`damo`](https://github.com/damonitor/damo) tool.
 - Linux DAMON admin sysfs (`/sys/kernel/mm/damon/admin`)
 - Virtual-address monitoring of one PID
 - Typed process IDs, intervals, region bounds, operations, actions, and errors
-- Runtime operation and feature discovery
-- Lifecycle rollback and automatic best-effort cleanup
+- Runtime operation and tri-state feature discovery
+- Advisory session locking, ownership rechecks, rollback, and cleanup
 - Query snapshots through a match-all `stat` DAMOS scheme
+- Raw DAMON address units with checked byte conversions
+- Per-probe hit counters in tried-region snapshots
 - A public low-level `sysfs` module for specialized callers
-- No runtime dependencies and no unsafe code
+- No unsafe code and one direct Linux-only syscall dependency
 
 DAMOS policies, multiple targets/contexts, initial address ranges, physical
 address monitoring, and async integration are intentionally future work.
@@ -33,9 +35,12 @@ CONFIG_DAMON_SYSFS=y
 ```
 
 Access to the admin hierarchy generally requires elevated privileges. The
-high-level API only starts when `nr_kdamonds` is zero, because the kernel ABI is
-global and has no ownership or transaction primitive. Coordinate with `damo`
-and other DAMON controllers at the system level.
+high-level API takes an advisory lock at `/run/lock/damon-rs.lock`, then starts
+only when `nr_kdamonds` is zero. It fingerprints the staged configuration and
+running kdamond thread before destructive operations. The kernel ABI is global
+and has no ownership or transaction primitive, so tools that ignore the lock
+can still race. Serialize `damo` and other controllers externally on the same
+lock, or through another system-wide coordination mechanism.
 
 The ABI foundation was verified against Linux 7.2. Capabilities are discovered
 from sysfs instead of inferred solely from a kernel version. See
@@ -63,8 +68,8 @@ fn main() -> Result<(), damon::Error> {
     for region in monitor.snapshot()?.regions() {
         println!(
             "{:#x}-{:#x}: accesses={}, age={}",
-            region.start(),
-            region.end(),
+            region.start_bytes()?,
+            region.end_bytes()?,
             region.nr_accesses(),
             region.age(),
         );
