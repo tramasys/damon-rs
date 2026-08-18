@@ -16,8 +16,8 @@ use crate::{Error, RawRegion, RawSnapshot, Result};
 mod configuration;
 
 pub use configuration::{
-    ContextConfig, DamonConfig, DestinationConfig, FilterConfig, FilterLayer, InitialRegion,
-    InitialRegionConfig, IntervalsGoalConfig, KdamondConfig, MigrationDestination,
+    ContextConfig, DamonConfig, DestinationConfig, FilterConfig, FilterLayer, FilterPlacement,
+    InitialRegion, InitialRegionConfig, IntervalsGoalConfig, KdamondConfig, MigrationDestination,
     OperationAttributes, OperationAttributesConfig, ProbeConfig, ProbeFilterConfig,
     ProbePreparation, ProbePreparationAction, ProbePreparationConfig, QuotaConfig, QuotaGoal,
     QuotaGoalConfig, QuotaGoalMetric, QuotaGoalTuner, QuotaWeights, SampleControl,
@@ -73,8 +73,8 @@ impl fmt::Display for Operation {
     }
 }
 
-/// A command accepted by a `kdamonds/<N>/state` file in Linux 7.2.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// A command accepted by a `kdamonds/<N>/state` file.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum KdamondCommand {
     /// Start the kernel monitoring thread.
@@ -97,12 +97,14 @@ pub enum KdamondCommand {
     UpdateSchemesEffectiveQuotas,
     /// Refresh auto-tuned monitoring intervals.
     UpdateTunedIntervals,
+    /// A command introduced by a newer kernel.
+    Unknown(Box<str>),
 }
 
 impl KdamondCommand {
     /// Returns the command string used by the kernel ABI.
     #[must_use]
-    pub const fn kernel_name(self) -> &'static str {
+    pub fn kernel_name(&self) -> &str {
         match self {
             Self::On => "on",
             Self::Off => "off",
@@ -114,6 +116,7 @@ impl KdamondCommand {
             Self::ClearSchemesTriedRegions => "clear_schemes_tried_regions",
             Self::UpdateSchemesEffectiveQuotas => "update_schemes_effective_quotas",
             Self::UpdateTunedIntervals => "update_tuned_intervals",
+            Self::Unknown(command) => command,
         }
     }
 }
@@ -1047,7 +1050,8 @@ impl Kdamond {
     }
 
     /// Sends a command to this kdamond.
-    pub fn command(&self, command: KdamondCommand) -> Result<()> {
+    pub fn command(&self, command: &KdamondCommand) -> Result<()> {
+        configuration::validate_token("kdamond command", command.kernel_name())?;
         write_bytes(&self.path.join("state"), command.kernel_name().as_bytes())
     }
 
@@ -1077,15 +1081,6 @@ impl Kdamond {
     pub fn refresh_interval(&self) -> Result<Duration> {
         let milliseconds = read_u32(&self.path.join("refresh_ms"))?;
         Ok(Duration::from_millis(u64::from(milliseconds)))
-    }
-
-    pub(crate) fn refresh_interval_if_present(&self) -> Result<Option<Duration>> {
-        let path = self.path.join("refresh_ms");
-        if path_exists(&path)? {
-            self.refresh_interval().map(Some)
-        } else {
-            Ok(None)
-        }
     }
 
     /// Sets the periodic sysfs refresh interval.
@@ -2074,8 +2069,13 @@ impl Scheme {
         };
         let mut computed_total_units = 0_u64;
         let mut regions = Vec::with_capacity(capacity_hint.min(MAX_INITIAL_REGION_CAPACITY));
+        let mut region_indices = Vec::new();
+        numeric_directory_indices_into(&base, &mut region_indices)?;
+        let mut probe_indices = Vec::with_capacity(4);
+        let mut probe_hits = Vec::with_capacity(4);
 
-        for (_index, mut path) in numeric_directories(&base)? {
+        for index in region_indices {
+            let mut path = base.join(index.to_string());
             path.push("start");
             let start = read_u64(&path)?;
             path.pop();
@@ -2096,10 +2096,11 @@ impl Scheme {
             };
             path.pop();
             let probes = path.join("probes");
-            let mut probe_hits = Vec::new();
+            probe_hits.clear();
             if path_is_dir(&probes)? {
-                for (probe_index, probe_path) in numeric_directories(&probes)? {
-                    let hits = probe_path.join("hits");
+                numeric_directory_indices_into(&probes, &mut probe_indices)?;
+                for probe_index in probe_indices.iter().copied() {
+                    let hits = probes.join(probe_index.to_string()).join("hits");
                     if path_exists(&hits)? {
                         probe_hits.push((probe_index, read_u8(&hits)?));
                     }
@@ -2319,18 +2320,20 @@ fn path_is_dir(path: &Path) -> Result<bool> {
     }
 }
 
-fn numeric_directories(path: &Path) -> Result<Vec<(usize, PathBuf)>> {
+fn numeric_directory_indices_into(path: &Path, indices: &mut Vec<usize>) -> Result<()> {
+    indices.clear();
     #[cfg(test)]
     if let Some(result) = test_backend::numeric_directories(path) {
-        return result.map_err(|error| io_error("list directory", path, error));
+        let directories = result.map_err(|error| io_error("list directory", path, error))?;
+        indices.extend(directories.into_iter().map(|(index, _)| index));
+        return Ok(());
     }
 
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(io_error("list directory", path, error)),
     };
-    let mut numeric = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| io_error("read directory entry", path, error))?;
         if !entry
@@ -2347,10 +2350,10 @@ fn numeric_directories(path: &Path) -> Result<Vec<(usize, PathBuf)>> {
         else {
             continue;
         };
-        numeric.push((index, entry.path()));
+        indices.push(index);
     }
-    numeric.sort_unstable_by_key(|(index, _)| *index);
-    Ok(numeric)
+    indices.sort_unstable();
+    Ok(())
 }
 
 fn observed_attribute_paths(root: &Path) -> Result<Vec<String>> {
@@ -2888,6 +2891,7 @@ pub(crate) mod test_backend {
         effective_quota_bytes: Vec<u64>,
         hooks: Vec<Hook>,
         write_failures: Vec<WriteFailure>,
+        read_count: usize,
         write_count: usize,
     }
 
@@ -2914,6 +2918,7 @@ pub(crate) mod test_backend {
                 effective_quota_bytes: Vec::new(),
                 hooks: Vec::new(),
                 write_failures: Vec::new(),
+                read_count: 0,
                 write_count: 0,
             };
             state.directory("");
@@ -3750,6 +3755,10 @@ pub(crate) mod test_backend {
         pub(crate) fn write_count(&self) -> usize {
             lock(&self.state).write_count
         }
+
+        pub(crate) fn read_count(&self) -> usize {
+            lock(&self.state).read_count
+        }
     }
 
     type Registry = Vec<(PathBuf, Weak<Mutex<State>>)>;
@@ -3866,6 +3875,7 @@ pub(crate) mod test_backend {
             Some(Node::Directory) => Err(io::Error::from(io::ErrorKind::IsADirectory)),
             None => Err(not_found(&relative)),
         };
+        state.read_count += 1;
         state.apply_hooks(&HookEvent::Read(relative));
         Some(result)
     }
@@ -3902,6 +3912,21 @@ mod tests {
             Action::parse("future_action"),
             Action::Unknown("future_action".into())
         );
+    }
+
+    #[test]
+    fn command_values_preserve_future_kernel_tokens() {
+        let command = KdamondCommand::Unknown("future_command".into());
+        assert_eq!(command.kernel_name(), "future_command");
+
+        let model = test_backend::Model::new("vaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let error = admin
+            .kdamond(0)
+            .command(&KdamondCommand::Unknown("invalid\ncommand".into()))
+            .expect_err("multi-line command must be rejected before writing");
+        assert!(matches!(error, Error::InvalidConfiguration { .. }));
     }
 
     #[test]
@@ -4200,7 +4225,7 @@ mod tests {
             .set_address_unit(AddressUnit::new(4_096).expect("valid unit"))
             .expect("stage address unit");
 
-        kdamond.command(KdamondCommand::On).expect("start model");
+        kdamond.command(&KdamondCommand::On).expect("start model");
         let first_pid = kdamond.pid().expect("read modeled pid");
         assert!(first_pid.is_some());
         assert_eq!(
@@ -4221,21 +4246,21 @@ mod tests {
         );
 
         kdamond
-            .command(KdamondCommand::UpdateSchemesStats)
+            .command(&KdamondCommand::UpdateSchemesStats)
             .expect("state command is accepted");
         assert_eq!(
             kdamond.state().expect("state remains running"),
             KdamondState::On
         );
         kdamond
-            .command(KdamondCommand::Commit)
+            .command(&KdamondCommand::Commit)
             .expect("commit staged values");
         assert_eq!(
             model.active_value("kdamonds/0/contexts/0/addr_unit"),
             Some("1".to_owned())
         );
 
-        kdamond.command(KdamondCommand::Off).expect("stop model");
+        kdamond.command(&KdamondCommand::Off).expect("stop model");
         assert_eq!(kdamond.pid().expect("read stopped pid"), None);
         kdamond.set_context_count(0).expect("remove context");
         assert!(!path_exists(context.path()).expect("inspect removed child"));
@@ -4250,14 +4275,14 @@ mod tests {
         kdamond.set_context_count(1).expect("stage context");
         let context = kdamond.context(0);
         context.set_scheme_count(1).expect("stage scheme");
-        kdamond.command(KdamondCommand::On).expect("start model");
+        kdamond.command(&KdamondCommand::On).expect("start model");
 
         let scheme = context.scheme(0);
         write_bytes(&scheme.path().join("quotas/ms"), b"99").expect("stage non-goal quota");
         write_bytes(&scheme.path().join("quotas/goals/nr_goals"), b"1")
             .expect("stage quota goal count");
         kdamond
-            .command(KdamondCommand::CommitSchemesQuotaGoals)
+            .command(&KdamondCommand::CommitSchemesQuotaGoals)
             .expect("commit only quota goals");
 
         assert_eq!(
@@ -4283,7 +4308,7 @@ mod tests {
         let second = context.scheme(1);
         write_value(&first.path().join("stats/max_nr_snapshots"), 19)
             .expect("stage maximum snapshots");
-        kdamond.command(KdamondCommand::On).expect("start model");
+        kdamond.command(&KdamondCommand::On).expect("start model");
 
         model.set_scheme_stats(vec![
             test_backend::ModelSchemeStats {
@@ -4318,7 +4343,7 @@ mod tests {
         );
 
         kdamond
-            .command(KdamondCommand::UpdateSchemesStats)
+            .command(&KdamondCommand::UpdateSchemesStats)
             .expect("refresh modeled stats");
         for (scheme, expected) in [
             (&first, [1, 2, 3, 4, 5, 6, 7]),
@@ -4355,7 +4380,7 @@ mod tests {
         );
 
         kdamond
-            .command(KdamondCommand::UpdateSchemesEffectiveQuotas)
+            .command(&KdamondCommand::UpdateSchemesEffectiveQuotas)
             .expect("refresh modeled effective quotas");
         assert_eq!(
             read_u64(&first.path().join("quotas/effective_bytes"))
@@ -4400,7 +4425,7 @@ mod tests {
         admin.set_kdamond_count(1).expect("stage kdamond");
         let kdamond = admin.kdamond(0);
         kdamond.set_context_count(1).expect("stage context");
-        kdamond.command(KdamondCommand::On).expect("start model");
+        kdamond.command(&KdamondCommand::On).expect("start model");
 
         let error = admin
             .set_kdamond_count(0)
@@ -4408,7 +4433,7 @@ mod tests {
         assert!(error.is_resource_busy());
         assert_eq!(admin.kdamond_count().expect("preserve count"), 1);
 
-        kdamond.command(KdamondCommand::Off).expect("stop model");
+        kdamond.command(&KdamondCommand::Off).expect("stop model");
         admin.set_kdamond_count(0).expect("remove stopped model");
     }
 
@@ -4420,7 +4445,7 @@ mod tests {
         let kdamond = admin.kdamond(0);
 
         let error = kdamond
-            .command(KdamondCommand::On)
+            .command(&KdamondCommand::On)
             .expect_err("starting without one context must fail");
         assert!(matches!(
             error,
@@ -4428,15 +4453,15 @@ mod tests {
         ));
 
         kdamond.set_context_count(1).expect("stage context");
-        kdamond.command(KdamondCommand::On).expect("start model");
+        kdamond.command(&KdamondCommand::On).expect("start model");
         let error = kdamond
-            .command(KdamondCommand::On)
+            .command(&KdamondCommand::On)
             .expect_err("starting an active kdamond must be busy");
         assert!(error.is_resource_busy());
 
-        kdamond.command(KdamondCommand::Off).expect("stop model");
+        kdamond.command(&KdamondCommand::Off).expect("stop model");
         let error = kdamond
-            .command(KdamondCommand::Off)
+            .command(&KdamondCommand::Off)
             .expect_err("stopping an inactive context must fail");
         assert!(matches!(
             error,
@@ -4585,12 +4610,52 @@ mod tests {
         kdamond
             .stage_configuration(&config)
             .expect("stage complete configuration");
+        let observed = kdamond
+            .configuration()
+            .expect("read complete configuration");
+        assert_kdamond_configs_equivalent(config, observed);
+    }
+
+    #[test]
+    fn owned_configuration_preserves_all_filter_layers_and_execution_order() {
+        let model = test_backend::Model::new("vaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        kdamond.set_context_count(1).expect("stage context");
+        let context = kdamond.context(0);
+        context.set_target_count(1).expect("stage target");
+        context.set_scheme_count(1).expect("stage scheme");
+
+        let mut config = kdamond.configuration().expect("read defaults");
+        config.contexts[0].targets[0].pid = Some(Pid::new(42).expect("valid pid"));
+        let filters = &mut config.contexts[0].schemes[0].filters;
+        let mut core = FilterConfig::address(0, 4_096, true, true);
+        core.placement = FilterPlacement::Core;
+        let mut operations = FilterConfig::new(SchemeFilterType::Anonymous, true, false);
+        operations.placement = FilterPlacement::Operations;
+        let mut unified = FilterConfig::new(SchemeFilterType::Active, false, true);
+        unified.placement = FilterPlacement::Unified;
+        *filters = vec![core, operations, unified];
+
+        kdamond
+            .stage_configuration(&config)
+            .expect("stage every filter layer");
+        let observed = kdamond.configuration().expect("read every filter layer");
+        let placements = observed.contexts[0].schemes[0]
+            .filters
+            .iter()
+            .map(|filter| filter.placement)
+            .collect::<Vec<_>>();
         assert_eq!(
-            kdamond
-                .configuration()
-                .expect("read complete configuration"),
-            config
+            placements,
+            vec![
+                FilterPlacement::Core,
+                FilterPlacement::Operations,
+                FilterPlacement::Unified
+            ]
         );
+        assert_eq!(observed, config);
     }
 
     #[test]
@@ -4690,6 +4755,17 @@ mod tests {
         }
     }
 
+    fn assert_kdamond_configs_equivalent(expected: KdamondConfig, observed: KdamondConfig) {
+        assert!(
+            DamonConfig {
+                kdamonds: vec![expected]
+            }
+            .equivalent_after_kernel_normalization(&DamonConfig {
+                kdamonds: vec![observed]
+            })
+        );
+    }
+
     #[test]
     fn owned_configuration_validation_precedes_every_write() {
         let model = test_backend::Model::new("vaddr\n");
@@ -4697,7 +4773,12 @@ mod tests {
         admin.set_kdamond_count(1).expect("stage kdamond");
         let kdamond = admin.kdamond(0);
         let mut context = ContextConfig::new(Operation::VirtualAddress);
-        context.targets.push(TargetConfig::address_space());
+        let mut target = TargetConfig::for_pid(Pid::new(42).expect("valid pid"));
+        target.initial_regions = vec![
+            InitialRegionConfig::new(100, 200).expect("valid region"),
+            InitialRegionConfig::new(150, 250).expect("valid region"),
+        ];
+        context.targets.push(target);
         let config = KdamondConfig {
             refresh_interval: Duration::from_millis(99),
             contexts: vec![context],
@@ -4705,7 +4786,7 @@ mod tests {
 
         let error = kdamond
             .stage_configuration(&config)
-            .expect_err("pid-less vaddr target must be rejected");
+            .expect_err("overlapping regions must be rejected");
         assert!(matches!(error, Error::InvalidConfiguration { .. }));
         assert_eq!(
             kdamond.refresh_interval().expect("refresh stays unchanged"),
@@ -4880,7 +4961,7 @@ mod tests {
         );
         let mut context = ContextConfig::new(Operation::PhysicalAddress);
         context.targets = vec![TargetConfig::address_space(), TargetConfig::address_space()];
-        assert!(context.validate().is_err());
+        assert!(context.validate_runnable().is_err());
 
         context.targets.truncate(1);
         context.targets[0].initial_regions = vec![

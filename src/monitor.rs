@@ -99,13 +99,13 @@ impl Damon {
     /// is restored by [`ExclusiveSession::close`], or on a best-effort basis
     /// when the session is dropped.
     pub fn exclusive_session(&self, config: &DamonConfig) -> Result<ExclusiveSession> {
-        config.validate()?;
         if config.kdamonds.len() != 1 {
             return Err(Error::InvalidConfiguration {
                 field: "exclusive session kdamond count",
                 reason: "must contain exactly one kdamond",
             });
         }
+        config.validate_runnable()?;
         let session_lock = SessionLock::acquire(&self.lock_path)?;
         let staged_configuration =
             self.stage_validated_configuration_locked(&session_lock, config)?;
@@ -184,29 +184,34 @@ impl Damon {
     /// Exclusively stages representative nodes and discovers this kernel's
     /// concrete and semantic DAMON sysfs capabilities.
     ///
-    /// Discovery holds the same advisory lock as a monitor and requires the
-    /// global DAMON hierarchy to be empty. It never starts a kdamond. The
-    /// temporary hierarchy is removed before this method returns. This makes
-    /// capabilities below indexed children and accepted filter values
-    /// observable without replacing another controller's configuration.
+    /// Discovery holds the same advisory lock as a monitor and requires all
+    /// existing kdamonds to be stopped. It never starts a kdamond. The exact
+    /// preceding writable hierarchy is restored before this method returns.
+    /// This makes capabilities below indexed children and accepted filter
+    /// values observable without discarding a stopped configuration.
     pub fn capabilities(&self) -> Result<Capabilities> {
         let _session_lock = SessionLock::acquire(&self.lock_path)?;
-        let existing = self.admin.kdamond_count()?;
-        if existing != 0 {
-            return Err(Error::InUse { kdamonds: existing });
+        retry_busy(|| ensure_hierarchy_stopped(&self.admin))?;
+        let previous = retry_busy(|| self.admin.configuration_snapshot())?;
+        if !retry_busy(|| previous.values_match_current())? {
+            return Err(Error::OwnershipLost {
+                reason: "the DAMON hierarchy changed while capability probing captured it",
+            });
         }
-
-        retry_busy(|| self.admin.set_kdamond_count(1))?;
         let kdamond = self.admin.kdamond(0);
-        let result = stage_capability_probe(&kdamond);
+        let result = (|| {
+            retry_busy(|| ensure_hierarchy_stopped(&self.admin))?;
+            retry_busy(|| self.admin.set_kdamond_count(1))?;
+            stage_capability_probe(&kdamond)
+        })();
         match result {
             Ok((capabilities, fingerprint)) => {
-                cleanup_capability_probe(&self.admin, &kdamond, &fingerprint)?;
+                restore_after_capability_probe(&self.admin, &kdamond, &fingerprint, &previous)?;
                 Ok(capabilities)
             }
             Err(operation) => Err(with_rollback(
                 operation,
-                rollback_unstarted_slot(&self.admin, &kdamond),
+                restore_configuration(&self.admin, &previous),
             )),
         }
     }
@@ -310,10 +315,11 @@ fn stage_capability_probe(kdamond: &Kdamond) -> Result<(Capabilities, Configurat
     Ok((capabilities, fingerprint))
 }
 
-fn cleanup_capability_probe(
+fn restore_after_capability_probe(
     admin: &DamonAdmin,
     kdamond: &Kdamond,
     fingerprint: &ConfigurationFingerprint,
+    previous: &ConfigurationSnapshot,
 ) -> Result<()> {
     if admin.kdamond_count()? != 1 || !fingerprint.matches_current()? {
         return Err(Error::OwnershipLost {
@@ -321,7 +327,7 @@ fn cleanup_capability_probe(
         });
     }
     match retry_busy(|| kdamond.state())? {
-        KdamondState::Off => retry_busy(|| admin.set_kdamond_count(0)),
+        KdamondState::Off => restore_configuration(admin, previous),
         KdamondState::On => Err(Error::OwnershipLost {
             reason: "the capability-probe kdamond was started externally",
         }),
@@ -387,7 +393,7 @@ impl ExclusiveSession {
             }
         }
 
-        retry_busy(|| self.kdamond.command(KdamondCommand::On))?;
+        retry_busy(|| self.kdamond.command(&KdamondCommand::On))?;
         self.state = SessionState::UnidentifiedRunning;
         let pid = running_thread_pid(&self.kdamond)?;
         self.state = SessionState::Running(pid);
@@ -448,14 +454,55 @@ impl ExclusiveSession {
     }
 
     /// Applies the currently staged inputs to the running kdamond.
+    ///
+    /// The session refuses untracked sysfs changes. Use
+    /// [`Self::update_configuration`] to stage and commit a changed owned
+    /// configuration while preserving rollback and ownership checks.
     pub fn commit(&mut self) -> Result<()> {
-        self.command_with_identity_check(KdamondCommand::Commit)?;
+        self.command_with_identity_check(&KdamondCommand::Commit)?;
         self.verify_running_identity()
+    }
+
+    /// Transactionally stages and commits a changed running configuration.
+    ///
+    /// The requested hierarchy must still contain this session's one runnable
+    /// kdamond. On failure, the method stages and commits the preceding owned
+    /// configuration before returning the error. Controllers that ignore the
+    /// advisory lock can still interfere because sysfs has no ownership or
+    /// atomic-commit primitive.
+    pub fn update_configuration(&mut self, config: &DamonConfig) -> Result<()> {
+        config.validate_runnable()?;
+        if config.kdamonds.len() != 1 {
+            return Err(Error::InvalidConfiguration {
+                field: "exclusive session kdamond count",
+                reason: "must contain exactly one kdamond",
+            });
+        }
+        self.verify_running()?;
+        let previous = retry_busy(|| self.admin.configuration())?;
+        self.verify_running()?;
+
+        match self.stage_and_commit_running(config, Some(&previous)) {
+            Ok(staged) => {
+                self.staged = staged;
+                Ok(())
+            }
+            Err(operation) => match self.stage_and_commit_running(&previous, None) {
+                Ok(staged) => {
+                    self.staged = staged;
+                    Err(operation)
+                }
+                Err(rollback) => Err(Error::Rollback {
+                    operation: Box::new(operation),
+                    rollback: Box::new(rollback),
+                }),
+            },
+        }
     }
 
     /// Applies staged DAMOS quota-goal changes to the running kdamond.
     pub fn commit_scheme_quota_goals(&mut self) -> Result<()> {
-        self.command_with_identity_check(KdamondCommand::CommitSchemesQuotaGoals)?;
+        self.command_with_identity_check(&KdamondCommand::CommitSchemesQuotaGoals)?;
         self.verify_running_identity()
     }
 
@@ -486,8 +533,21 @@ impl ExclusiveSession {
         scheme_index: usize,
     ) -> Result<SchemeStats> {
         let scheme = self.scheme(context_index, scheme_index)?;
-        self.refresh_runtime_output(KdamondCommand::UpdateSchemesStats)?;
+        self.refresh_runtime_output(&KdamondCommand::UpdateSchemesStats)?;
         let stats = scheme.stats()?;
+        self.verify_running_identity()?;
+        Ok(stats)
+    }
+
+    /// Reads the last materialized scheme statistics without requesting a
+    /// synchronous kernel refresh.
+    pub fn cached_scheme_stats(
+        &self,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<SchemeStats> {
+        self.verify_running()?;
+        let stats = self.scheme(context_index, scheme_index)?.stats()?;
         self.verify_running_identity()?;
         Ok(stats)
     }
@@ -500,7 +560,7 @@ impl ExclusiveSession {
         capacity_hint: usize,
     ) -> Result<RawSnapshot> {
         let scheme = self.scheme(context_index, scheme_index)?;
-        self.command_with_identity_check(KdamondCommand::UpdateSchemesTriedRegions)?;
+        self.command_with_identity_check(&KdamondCommand::UpdateSchemesTriedRegions)?;
         let snapshot = scheme.tried_regions(capacity_hint)?;
         self.verify_running_identity()?;
         Ok(snapshot)
@@ -509,7 +569,7 @@ impl ExclusiveSession {
     /// Refreshes and reads one scheme's total tried size in core address units.
     pub fn tried_bytes_units(&mut self, context_index: usize, scheme_index: usize) -> Result<u64> {
         let scheme = self.scheme(context_index, scheme_index)?;
-        self.command_with_identity_check(KdamondCommand::UpdateSchemesTriedBytes)?;
+        self.command_with_identity_check(&KdamondCommand::UpdateSchemesTriedBytes)?;
         let units = scheme.tried_bytes_units()?;
         self.verify_running_identity()?;
         Ok(units)
@@ -522,21 +582,60 @@ impl ExclusiveSession {
         scheme_index: usize,
     ) -> Result<u64> {
         let scheme = self.scheme(context_index, scheme_index)?;
-        self.refresh_runtime_output(KdamondCommand::UpdateSchemesEffectiveQuotas)?;
+        self.refresh_runtime_output(&KdamondCommand::UpdateSchemesEffectiveQuotas)?;
         let units = scheme.quotas().effective_size_units()?;
         self.verify_running_identity()?;
         Ok(units)
     }
 
+    /// Reads the last materialized effective quota without requesting a
+    /// synchronous kernel refresh.
+    pub fn cached_effective_quota_units(
+        &self,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<u64> {
+        self.verify_running()?;
+        let units = self
+            .scheme(context_index, scheme_index)?
+            .quotas()
+            .effective_size_units()?;
+        self.verify_running_identity()?;
+        Ok(units)
+    }
+
+    /// Runs multiple runtime reads or refreshes under one pair of complete
+    /// ownership checks.
+    ///
+    /// Individual batch operations still verify the kdamond thread identity.
+    /// The complete writable hierarchy is checked before and after the
+    /// closure, reducing sysfs reads for polling loops without weakening the
+    /// boundary checks. If both the closure and the final ownership check
+    /// fail, the ownership error is returned because the closure's outputs
+    /// cannot be trusted.
+    pub fn runtime_batch<T>(
+        &mut self,
+        operation: impl FnOnce(&mut RuntimeBatch<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.verify_running()?;
+        let result = {
+            let mut batch = RuntimeBatch { session: self };
+            operation(&mut batch)
+        };
+        let ownership = self.verify_running_identity();
+        ownership?;
+        result
+    }
+
     /// Refreshes auto-tuned interval values for the running kdamond.
     pub fn update_tuned_intervals(&mut self) -> Result<()> {
-        self.refresh_runtime_output(KdamondCommand::UpdateTunedIntervals)?;
+        self.refresh_runtime_output(&KdamondCommand::UpdateTunedIntervals)?;
         self.verify_running_identity()
     }
 
     /// Clears all materialized tried-region results.
     pub fn clear_tried_regions(&mut self) -> Result<()> {
-        self.command_with_identity_check(KdamondCommand::ClearSchemesTriedRegions)?;
+        self.command_with_identity_check(&KdamondCommand::ClearSchemesTriedRegions)?;
         self.verify_running_identity()
     }
 
@@ -564,7 +663,7 @@ impl ExclusiveSession {
         let pause_path = context.path().join("pause");
         context.set_paused(paused)?;
         let operation = (|| {
-            retry_busy(|| self.kdamond.command(KdamondCommand::Commit))?;
+            retry_busy(|| self.kdamond.command(&KdamondCommand::Commit))?;
             self.verify_running_identity_only()?;
             let observed = context.is_paused()?;
             if observed != paused {
@@ -585,7 +684,7 @@ impl ExclusiveSession {
         if let Err(operation) = operation {
             let rollback = (|| {
                 context.set_paused(previous)?;
-                retry_busy(|| self.kdamond.command(KdamondCommand::Commit))?;
+                retry_busy(|| self.kdamond.command(&KdamondCommand::Commit))?;
                 let restored = previous_fingerprint.refreshed_paths_except(
                     std::slice::from_ref(&pause_path),
                     &self.staged.volatile_paths,
@@ -599,19 +698,50 @@ impl ExclusiveSession {
         Ok(())
     }
 
-    fn command_with_identity_check(&self, command: KdamondCommand) -> Result<()> {
+    fn stage_and_commit_running(
+        &self,
+        config: &DamonConfig,
+        observed: Option<&DamonConfig>,
+    ) -> Result<StagedOwnership> {
+        self.verify_running_identity_only()?;
+        retry_busy(|| {
+            self.verify_running_identity_only()?;
+            self.admin
+                .stage_validated_configuration_from(config, observed)
+        })?;
+        self.verify_running_identity_only()?;
+        let snapshot = retry_busy(|| self.admin.configuration_snapshot())?;
+        let mut staged_config = retry_busy(|| self.admin.configuration())?;
+        normalize_running_tuned_intervals(config, observed, &mut staged_config)?;
+        if let Some(error) = config.mismatch_error(&staged_config) {
+            return Err(error);
+        }
+        if !retry_busy(|| snapshot.values_match_current())? {
+            return Err(Error::OwnershipLost {
+                reason: "the running DAMON hierarchy changed during staging",
+            });
+        }
+        self.verify_running_identity_only()?;
+        retry_busy(|| self.kdamond.command(&KdamondCommand::Commit))?;
+        self.verify_running_identity_only()?;
+        let staged = StagedOwnership::new(
+            snapshot.into_fingerprint(),
+            &self.kdamond,
+            &config.kdamonds[0],
+        );
+        staged.verify(&self.admin)?;
+        Ok(staged)
+    }
+
+    fn command_with_identity_check(&self, command: &KdamondCommand) -> Result<()> {
         self.verify_running()?;
         retry_busy(|| self.kdamond.command(command))?;
         self.verify_running_identity_only()
     }
 
-    fn refresh_runtime_output(&self, command: KdamondCommand) -> Result<()> {
+    fn refresh_runtime_output(&self, command: &KdamondCommand) -> Result<()> {
         self.verify_running()?;
-        if retry_busy(|| self.kdamond.refresh_interval_if_present())?
-            .is_none_or(|interval| interval == Duration::ZERO)
-        {
-            retry_busy(|| self.kdamond.command(command))?;
-        }
+        retry_busy(|| self.kdamond.command(command))?;
         self.verify_running_identity_only()
     }
 
@@ -701,7 +831,7 @@ impl ExclusiveSession {
                 match retry_busy(|| self.kdamond.state())? {
                     KdamondState::On => {
                         self.verify_running_identity_only()?;
-                        retry_busy(|| self.kdamond.command(KdamondCommand::Off))?;
+                        retry_busy(|| self.kdamond.command(&KdamondCommand::Off))?;
                         self.staged.verify(&self.admin)?;
                         match retry_busy(|| self.kdamond.state())? {
                             KdamondState::Off => {
@@ -753,6 +883,143 @@ impl ExclusiveSession {
         self.owns_hierarchy = false;
         self.state = SessionState::Closed;
         Ok(())
+    }
+}
+
+fn normalize_running_tuned_intervals(
+    requested: &DamonConfig,
+    previous: Option<&DamonConfig>,
+    observed: &mut DamonConfig,
+) -> Result<()> {
+    for (kdamond_index, (requested_kdamond, observed_kdamond)) in requested
+        .kdamonds
+        .iter()
+        .zip(&mut observed.kdamonds)
+        .enumerate()
+    {
+        for (context_index, (requested_context, observed_context)) in requested_kdamond
+            .contexts
+            .iter()
+            .zip(&mut observed_kdamond.contexts)
+            .enumerate()
+        {
+            let was_tuned = previous
+                .and_then(|config| config.kdamonds.get(kdamond_index))
+                .and_then(|kdamond| kdamond.contexts.get(context_index))
+                .is_some_and(|context| context.intervals_goal.aggregation_intervals != 0);
+            if requested_context.intervals_goal.aggregation_intervals == 0 && !was_tuned {
+                continue;
+            }
+            observed_context.intervals = MonitoringIntervals::new(
+                requested_context.intervals.sample(),
+                requested_context.intervals.aggregation(),
+                observed_context.intervals.update(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Runtime operations batched between complete ownership checks.
+///
+/// Construct this through [`ExclusiveSession::runtime_batch`].
+#[derive(Debug)]
+pub struct RuntimeBatch<'a> {
+    session: &'a mut ExclusiveSession,
+}
+
+impl RuntimeBatch<'_> {
+    /// Synchronously refreshes and reads one scheme's statistics.
+    pub fn scheme_stats(
+        &mut self,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<SchemeStats> {
+        let scheme = self.session.scheme(context_index, scheme_index)?;
+        self.command(&KdamondCommand::UpdateSchemesStats)?;
+        let stats = scheme.stats()?;
+        self.session.verify_running_identity_only()?;
+        Ok(stats)
+    }
+
+    /// Reads the last materialized scheme statistics.
+    pub fn cached_scheme_stats(
+        &self,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<SchemeStats> {
+        self.session.verify_running_identity_only()?;
+        let stats = self.session.scheme(context_index, scheme_index)?.stats()?;
+        self.session.verify_running_identity_only()?;
+        Ok(stats)
+    }
+
+    /// Materializes and reads one scheme's tried regions.
+    pub fn tried_regions(
+        &mut self,
+        context_index: usize,
+        scheme_index: usize,
+        capacity_hint: usize,
+    ) -> Result<RawSnapshot> {
+        let scheme = self.session.scheme(context_index, scheme_index)?;
+        self.command(&KdamondCommand::UpdateSchemesTriedRegions)?;
+        let snapshot = scheme.tried_regions(capacity_hint)?;
+        self.session.verify_running_identity_only()?;
+        Ok(snapshot)
+    }
+
+    /// Synchronously refreshes and reads total tried units.
+    pub fn tried_bytes_units(&mut self, context_index: usize, scheme_index: usize) -> Result<u64> {
+        let scheme = self.session.scheme(context_index, scheme_index)?;
+        self.command(&KdamondCommand::UpdateSchemesTriedBytes)?;
+        let units = scheme.tried_bytes_units()?;
+        self.session.verify_running_identity_only()?;
+        Ok(units)
+    }
+
+    /// Synchronously refreshes and reads effective quota units.
+    pub fn effective_quota_units(
+        &mut self,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<u64> {
+        let scheme = self.session.scheme(context_index, scheme_index)?;
+        self.command(&KdamondCommand::UpdateSchemesEffectiveQuotas)?;
+        let units = scheme.quotas().effective_size_units()?;
+        self.session.verify_running_identity_only()?;
+        Ok(units)
+    }
+
+    /// Reads the last materialized effective quota units.
+    pub fn cached_effective_quota_units(
+        &self,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<u64> {
+        self.session.verify_running_identity_only()?;
+        let units = self
+            .session
+            .scheme(context_index, scheme_index)?
+            .quotas()
+            .effective_size_units()?;
+        self.session.verify_running_identity_only()?;
+        Ok(units)
+    }
+
+    /// Synchronously refreshes auto-tuned monitoring intervals.
+    pub fn update_tuned_intervals(&mut self) -> Result<()> {
+        self.command(&KdamondCommand::UpdateTunedIntervals)
+    }
+
+    /// Clears materialized tried-region results.
+    pub fn clear_tried_regions(&mut self) -> Result<()> {
+        self.command(&KdamondCommand::ClearSchemesTriedRegions)
+    }
+
+    fn command(&self, command: &KdamondCommand) -> Result<()> {
+        self.session.verify_running_identity_only()?;
+        retry_busy(|| self.session.kdamond.command(command))?;
+        self.session.verify_running_identity_only()
     }
 }
 
@@ -944,23 +1211,6 @@ fn with_rollback(operation: Error, rollback_result: Result<()>) -> Error {
             operation: Box::new(operation),
             rollback: Box::new(rollback),
         },
-    }
-}
-
-fn rollback_unstarted_slot(admin: &DamonAdmin, kdamond: &Kdamond) -> Result<()> {
-    match admin.kdamond_count()? {
-        0 => return Ok(()),
-        1 => {}
-        kdamonds => return Err(Error::InUse { kdamonds }),
-    }
-    match retry_busy(|| kdamond.state())? {
-        KdamondState::Off => retry_busy(|| admin.set_kdamond_count(0)),
-        KdamondState::On => Err(Error::OwnershipLost {
-            reason: "a kdamond started during setup rollback",
-        }),
-        KdamondState::Unknown(_) => Err(Error::OwnershipLost {
-            reason: "the kdamond state changed during setup rollback",
-        }),
     }
 }
 
@@ -1313,7 +1563,10 @@ mod tests {
         let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
         let _held_lock = SessionLock::acquire(lock.path()).expect("hold session lock");
         let mut invalid = transaction_config(42, Action::Stat);
-        invalid.kdamonds[0].contexts[0].targets[0] = TargetConfig::address_space();
+        invalid.kdamonds[0].contexts[0].targets[0].initial_regions = vec![
+            crate::sysfs::InitialRegionConfig::new(100, 200).expect("valid region"),
+            crate::sysfs::InitialRegionConfig::new(150, 250).expect("valid region"),
+        ];
         let writes = model.write_count();
 
         let error = damon
@@ -1514,7 +1767,7 @@ mod tests {
             .stage_configuration(&original)
             .expect("stage original configuration");
         let kdamond = damon.admin.kdamond(0);
-        kdamond.command(KdamondCommand::On).expect("start kdamond");
+        kdamond.command(&KdamondCommand::On).expect("start kdamond");
 
         let error = damon
             .stage_configuration(&transaction_config(77, Action::PageOut))
@@ -1522,7 +1775,7 @@ mod tests {
 
         assert!(matches!(error, Error::KdamondRunning { index: 0 }));
         assert_eq!(kdamond.state().expect("read state"), KdamondState::On);
-        kdamond.command(KdamondCommand::Off).expect("stop fixture");
+        kdamond.command(&KdamondCommand::Off).expect("stop fixture");
     }
 
     #[test]
@@ -1555,7 +1808,7 @@ mod tests {
         ));
         let kdamond = damon.admin.kdamond(0);
         assert_eq!(kdamond.state().expect("read state"), KdamondState::On);
-        kdamond.command(KdamondCommand::Off).expect("stop fixture");
+        kdamond.command(&KdamondCommand::Off).expect("stop fixture");
     }
 
     #[test]
@@ -1616,7 +1869,7 @@ mod tests {
         );
         assert!(kdamond.pid().expect("read external pid").is_some());
 
-        kdamond.command(KdamondCommand::Off).expect("stop fixture");
+        kdamond.command(&KdamondCommand::Off).expect("stop fixture");
         damon.admin.set_kdamond_count(0).expect("remove fixture");
     }
 
@@ -1782,7 +2035,7 @@ mod tests {
     }
 
     #[test]
-    fn periodic_refresh_avoids_redundant_runtime_update_commands() {
+    fn synchronous_refresh_is_explicit_even_with_periodic_refresh_enabled() {
         let model = Model::new("vaddr\n");
         let lock = TestLock::new();
         let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
@@ -1800,7 +2053,144 @@ mod tests {
             .update_tuned_intervals()
             .expect("read periodic tuned intervals");
 
+        assert_eq!(model.write_count(), writes + 3);
+        let writes = model.write_count();
+        session
+            .cached_scheme_stats(0, 0)
+            .expect("read cached periodic stats");
+        session
+            .cached_effective_quota_units(0, 0)
+            .expect("read cached periodic quota");
         assert_eq!(model.write_count(), writes);
+        session.close().expect("close session");
+    }
+
+    #[test]
+    fn exclusive_session_transactionally_updates_a_running_configuration() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let original = transaction_config(42, Action::Stat);
+        let mut session = damon.exclusive_session(&original).expect("stage session");
+        session.start().expect("start session");
+        let mut updated = original.clone();
+        updated.kdamonds[0].contexts[0].schemes[0].action = Action::PageOut;
+
+        session
+            .update_configuration(&updated)
+            .expect("commit running update");
+
+        assert_eq!(
+            model
+                .active_value("kdamonds/0/contexts/0/schemes/0/action")
+                .as_deref(),
+            Some("pageout")
+        );
+        assert_eq!(
+            session.configuration().expect("read updated ownership"),
+            updated
+        );
+        session.close().expect("close updated session");
+    }
+
+    #[test]
+    fn running_configuration_update_rolls_back_after_commit_failure() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let original = transaction_config(42, Action::Stat);
+        let mut session = damon.exclusive_session(&original).expect("stage session");
+        session.start().expect("start session");
+        let mut updated = original.clone();
+        updated.kdamonds[0].contexts[0].schemes[0].action = Action::PageOut;
+        model.fail_next_write("kdamonds/0/state", 5);
+
+        let error = session
+            .update_configuration(&updated)
+            .expect_err("failed commit must roll back");
+
+        assert!(matches!(error, Error::Io { .. }));
+        assert_eq!(
+            model
+                .active_value("kdamonds/0/contexts/0/schemes/0/action")
+                .as_deref(),
+            Some("stat")
+        );
+        assert_eq!(
+            session.configuration().expect("retain original ownership"),
+            original
+        );
+        session.close().expect("close rolled-back session");
+    }
+
+    #[test]
+    fn running_update_accepts_kernel_tuned_interval_races() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let mut original = transaction_config(42, Action::Stat);
+        original.kdamonds[0].contexts[0].intervals_goal = IntervalsGoalConfig {
+            access_basis_points: 100,
+            aggregation_intervals: 1,
+            minimum_sample: Duration::from_millis(1),
+            maximum_sample: Duration::from_millis(10),
+        };
+        let mut session = damon.exclusive_session(&original).expect("stage session");
+        session.start().expect("start session");
+        let mut updated = original.clone();
+        updated.kdamonds[0].contexts[0].schemes[0].action = Action::PageOut;
+        model.after_next_write(
+            "kdamonds/0/contexts/0/schemes/0/action",
+            b"pageout".to_vec(),
+            vec![
+                Mutation::SetFile {
+                    path: "kdamonds/0/contexts/0/monitoring_attrs/intervals/sample_us".into(),
+                    value: b"4000\n".to_vec(),
+                },
+                Mutation::SetFile {
+                    path: "kdamonds/0/contexts/0/monitoring_attrs/intervals/aggr_us".into(),
+                    value: b"80000\n".to_vec(),
+                },
+            ],
+        );
+
+        session
+            .update_configuration(&updated)
+            .expect("accept tuned read-back values");
+        assert_eq!(
+            model
+                .active_value("kdamonds/0/contexts/0/schemes/0/action")
+                .as_deref(),
+            Some("pageout")
+        );
+        session.close().expect("close tuned session");
+    }
+
+    #[test]
+    fn runtime_batch_avoids_repeated_full_fingerprint_scans() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let config = transaction_config(42, Action::Stat);
+        let mut session = damon.exclusive_session(&config).expect("stage session");
+        session.start().expect("start session");
+
+        let reads = model.read_count();
+        session.scheme_stats(0, 0).expect("first ordinary read");
+        session.scheme_stats(0, 0).expect("second ordinary read");
+        let ordinary_reads = model.read_count() - reads;
+
+        let reads = model.read_count();
+        session
+            .runtime_batch(|batch| {
+                batch.scheme_stats(0, 0)?;
+                batch.scheme_stats(0, 0)?;
+                Ok(())
+            })
+            .expect("batched reads");
+        let batched_reads = model.read_count() - reads;
+
+        assert!(batched_reads < ordinary_reads);
         session.close().expect("close session");
     }
 
@@ -1921,7 +2311,7 @@ mod tests {
         );
         assert!(kdamond.pid().expect("read replacement pid").is_some());
 
-        kdamond.command(KdamondCommand::Off).expect("stop fixture");
+        kdamond.command(&KdamondCommand::Off).expect("stop fixture");
         damon.admin.set_kdamond_count(0).expect("remove fixture");
     }
 
@@ -1954,7 +2344,7 @@ mod tests {
         ));
         let kdamond = damon.admin.kdamond(0);
         kdamond
-            .command(KdamondCommand::Off)
+            .command(&KdamondCommand::Off)
             .expect("stop replacement fixture");
         session.close().expect("restore after replacement stopped");
     }
@@ -1996,7 +2386,7 @@ mod tests {
             KdamondState::On
         );
 
-        kdamond.command(KdamondCommand::Off).expect("stop fixture");
+        kdamond.command(&KdamondCommand::Off).expect("stop fixture");
         damon.admin.set_kdamond_count(0).expect("remove fixture");
     }
 
@@ -2104,17 +2494,28 @@ mod tests {
         let model = Model::new("vaddr\n");
         let lock = TestLock::new();
         let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let original = transaction_config(42, Action::Stat);
         damon
-            .admin
-            .set_kdamond_count(1)
+            .stage_configuration(&original)
             .expect("stage external hierarchy");
+        model.set_file("kdamonds/0/contexts/0/future_input", b"preserve\n");
 
-        let error = damon
+        damon
             .capabilities()
-            .expect_err("capability probing must require an empty hierarchy");
+            .expect("probe around stopped configuration");
 
-        assert!(matches!(error, Error::InUse { kdamonds: 1 }));
         assert_eq!(damon.admin.kdamond_count().expect("preserve count"), 1);
+        assert_eq!(
+            damon
+                .admin
+                .configuration()
+                .expect("read restored hierarchy"),
+            original
+        );
+        assert_eq!(
+            model.value("kdamonds/0/contexts/0/future_input").as_deref(),
+            Some("preserve")
+        );
     }
 
     #[test]

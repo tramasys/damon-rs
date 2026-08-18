@@ -20,6 +20,7 @@ use crate::{Error, Result};
 
 const KERNEL_INDEX_MAX: usize = i32::MAX as usize;
 const MAX_EAGER_READ_CAPACITY: usize = 4_096;
+const CURRENT_MAX_PROBES: usize = 4;
 
 trait KernelName {
     fn kernel_name(&self) -> &str;
@@ -231,6 +232,44 @@ pub enum FilterLayer {
     Core,
     /// Filters handled by the monitoring operations implementation.
     Operations,
+}
+
+/// Requested or observed placement of a DAMOS filter.
+///
+/// [`Self::Adaptive`] lets staging select the directory used by the running
+/// kernel. The other variants preserve an exact layer when a configuration is
+/// read back or when execution order matters.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum FilterPlacement {
+    /// Select the appropriate unified or split directory at staging time.
+    #[default]
+    Adaptive,
+    /// Use the original unified `filters` directory.
+    Unified,
+    /// Use the `core_filters` directory.
+    Core,
+    /// Use the `ops_filters` directory.
+    Operations,
+}
+
+impl FilterPlacement {
+    const fn exact_layer(self) -> Option<FilterLayer> {
+        match self {
+            Self::Adaptive => None,
+            Self::Unified => Some(FilterLayer::Unified),
+            Self::Core => Some(FilterLayer::Core),
+            Self::Operations => Some(FilterLayer::Operations),
+        }
+    }
+
+    const fn from_layer(layer: FilterLayer) -> Self {
+        match layer {
+            FilterLayer::Unified => Self::Unified,
+            FilterLayer::Core => Self::Core,
+            FilterLayer::Operations => Self::Operations,
+        }
+    }
 }
 
 impl FilterLayer {
@@ -637,6 +676,8 @@ impl TargetConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct FilterConfig {
+    /// Directory placement, or adaptive selection for newly built filters.
+    pub placement: FilterPlacement,
     /// Filter type.
     pub filter_type: SchemeFilterType,
     /// Whether the filter matches or negates its criterion.
@@ -658,6 +699,7 @@ impl FilterConfig {
     #[must_use]
     pub fn new(filter_type: SchemeFilterType, matching: bool, allow: bool) -> Self {
         Self {
+            placement: FilterPlacement::Adaptive,
             filter_type,
             matching,
             allow,
@@ -706,6 +748,27 @@ impl FilterConfig {
 
     /// Validates this filter for a directory layer and configured target count.
     pub fn validate_for(&self, layer: FilterLayer, target_count: usize) -> Result<()> {
+        if self
+            .placement
+            .exact_layer()
+            .is_some_and(|placement| placement != layer)
+        {
+            return invalid(
+                "scheme filter placement",
+                "does not match the directory layer selected for validation",
+            );
+        }
+        self.validate_in_layer(layer, target_count)
+    }
+
+    fn validate(&self, target_count: usize) -> Result<()> {
+        self.validate_in_layer(
+            self.placement.exact_layer().unwrap_or(FilterLayer::Unified),
+            target_count,
+        )
+    }
+
+    fn validate_in_layer(&self, layer: FilterLayer, target_count: usize) -> Result<()> {
         validate_token("scheme filter type", self.filter_type.kernel_name())?;
         match (layer, self.filter_type.handled_by_operations()) {
             (FilterLayer::Core, Some(true)) => {
@@ -1021,7 +1084,7 @@ impl SchemeConfig {
         self.watermarks.validate()?;
         validate_count("scheme filter count", self.filters.len())?;
         for filter in &self.filters {
-            filter.validate_for(FilterLayer::Unified, target_count)?;
+            filter.validate(target_count)?;
         }
         validate_count("migration destination count", self.destinations.len())?;
         let mut total_weight = 0_u32;
@@ -1049,6 +1112,64 @@ impl SchemeConfig {
             return invalid(
                 "migration target node",
                 "must be non-negative, or None for NUMA_NO_NODE",
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_runnable_for(&self, operation: &Operation, target_count: usize) -> Result<()> {
+        self.validate_for(target_count)?;
+        let known_supported = match operation {
+            Operation::VirtualAddress | Operation::FixedVirtualAddress => matches!(
+                self.action,
+                Action::WillNeed
+                    | Action::Cold
+                    | Action::PageOut
+                    | Action::HugePage
+                    | Action::NoHugePage
+                    | Action::Collapse
+                    | Action::MigrateHot
+                    | Action::MigrateCold
+                    | Action::Stat
+                    | Action::Unknown(_)
+            ),
+            Operation::PhysicalAddress => matches!(
+                self.action,
+                Action::PageOut
+                    | Action::LruPrioritize
+                    | Action::LruDeprioritize
+                    | Action::MigrateHot
+                    | Action::MigrateCold
+                    | Action::Stat
+                    | Action::Unknown(_)
+            ),
+            Operation::Unknown(_) => true,
+        };
+        if !known_supported {
+            return invalid(
+                "scheme action",
+                "is not supported by the selected monitoring operation",
+            );
+        }
+        let migration = matches!(self.action, Action::MigrateHot | Action::MigrateCold);
+        if !migration && (self.target_node.is_some() || !self.destinations.is_empty()) {
+            return invalid(
+                "migration destination",
+                "requires a migrate_hot or migrate_cold scheme action",
+            );
+        }
+        if !matches!(
+            operation,
+            Operation::PhysicalAddress | Operation::Unknown(_)
+        ) && self
+            .quota
+            .goals
+            .iter()
+            .any(|goal| matches!(goal.metric, QuotaGoalMetric::NodeEligibleMemoryBasisPoints))
+        {
+            return invalid(
+                "quota goal metric",
+                "node_eligible_mem_bp requires physical-address monitoring",
             );
         }
         Ok(())
@@ -1125,29 +1246,129 @@ impl ContextConfig {
                         "only physical-address monitoring supports non-one units",
                     );
                 }
-                if self.targets.iter().any(|target| target.pid.is_none()) {
-                    return invalid("virtual-address target", "requires a process identifier");
-                }
             }
             Operation::PhysicalAddress => {
                 validate_address_unit_for_host(self.address_unit)?;
-                if self.targets.len() > 1 {
-                    return invalid(
-                        "physical-address targets",
-                        "Linux supports at most one target",
-                    );
-                }
-                if self.targets.iter().any(|target| target.pid.is_some()) {
-                    return invalid(
-                        "physical-address target",
-                        "must not contain a process identifier",
-                    );
-                }
             }
             Operation::Unknown(_) => {}
         }
         for scheme in &self.schemes {
             scheme.validate_for(self.targets.len())?;
+        }
+        Ok(())
+    }
+
+    /// Validates the operation-specific invariants required before starting
+    /// this context on the running kernel's current DAMON ABI.
+    pub fn validate_runnable(&self) -> Result<()> {
+        self.validate()?;
+        if self.probes.len() > CURRENT_MAX_PROBES {
+            return invalid(
+                "monitoring probe count",
+                "current DAMON supports at most four probes",
+            );
+        }
+        self.validate_weighted_probes()?;
+        match self.operation {
+            Operation::VirtualAddress => {
+                if self.targets.is_empty() {
+                    return invalid("virtual-address targets", "requires at least one target");
+                }
+                if self.targets.iter().any(|target| target.pid.is_none()) {
+                    return invalid("virtual-address target", "requires a process identifier");
+                }
+            }
+            Operation::FixedVirtualAddress => {
+                if self.targets.is_empty() {
+                    return invalid(
+                        "fixed virtual-address targets",
+                        "requires at least one target",
+                    );
+                }
+                if self.targets.iter().any(|target| target.pid.is_none()) {
+                    return invalid(
+                        "fixed virtual-address target",
+                        "requires a process identifier",
+                    );
+                }
+                if self
+                    .targets
+                    .iter()
+                    .any(|target| target.initial_regions.is_empty())
+                {
+                    return invalid(
+                        "fixed virtual-address target regions",
+                        "requires at least one initial region per target",
+                    );
+                }
+            }
+            Operation::PhysicalAddress => {
+                if self.targets.len() != 1 {
+                    return invalid(
+                        "physical-address targets",
+                        "requires exactly one target on current DAMON kernels",
+                    );
+                }
+                let target = &self.targets[0];
+                if target.pid.is_some() {
+                    return invalid(
+                        "physical-address target",
+                        "must not contain a process identifier",
+                    );
+                }
+                if target.initial_regions.is_empty() {
+                    return invalid(
+                        "physical-address target regions",
+                        "requires at least one initial region",
+                    );
+                }
+            }
+            Operation::Unknown(_) => {
+                if self.targets.is_empty() {
+                    return invalid("monitoring targets", "requires at least one target");
+                }
+            }
+        }
+        for scheme in &self.schemes {
+            scheme.validate_runnable_for(&self.operation, self.targets.len())?;
+        }
+        Ok(())
+    }
+
+    fn validate_weighted_probes(&self) -> Result<()> {
+        if self.probes.iter().all(|probe| probe.weight == 0) {
+            return Ok(());
+        }
+        let sample_us = self.intervals.sample().as_micros().max(1);
+        let aggregation_us = self.intervals.aggregation().as_micros();
+        let maximum_hits = (aggregation_us / sample_us).clamp(1, u128::from(u32::MAX));
+        if maximum_hits > u128::from(u8::MAX) {
+            return invalid(
+                "weighted monitoring probes",
+                "samples per aggregation interval must fit an 8-bit hit count",
+            );
+        }
+        let mut total = 0_u32;
+        let maximum_hits =
+            u32::try_from(maximum_hits).map_err(|_| Error::InvalidConfiguration {
+                field: "weighted monitoring probes",
+                reason: "samples per aggregation interval must fit u32",
+            })?;
+        for probe in &self.probes {
+            let weighted_hits =
+                probe
+                    .weight
+                    .checked_mul(maximum_hits)
+                    .ok_or(Error::InvalidConfiguration {
+                        field: "weighted monitoring probes",
+                        reason: "each weight multiplied by maximum hits must fit u32",
+                    })?;
+            total = total
+                .checked_add(weighted_hits)
+                .ok_or(Error::InvalidConfiguration {
+                    field: "weighted monitoring probes",
+                    reason: "sum of weighted maximum hits must fit u32",
+                })?;
         }
         Ok(())
     }
@@ -1167,6 +1388,28 @@ impl DamonConfig {
         validate_count("kdamond count", self.kdamonds.len())?;
         for kdamond in &self.kdamonds {
             kdamond.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Validates invariants required for starting the current DAMON ABI.
+    ///
+    /// [`Self::validate`] intentionally permits incomplete staged hierarchies
+    /// and unknown future operation values. This stricter check is used by
+    /// high-level sessions that will start monitoring.
+    pub fn validate_runnable(&self) -> Result<()> {
+        self.validate()?;
+        if self.kdamonds.is_empty() {
+            return invalid("kdamond count", "requires at least one kdamond");
+        }
+        for kdamond in &self.kdamonds {
+            if kdamond.contexts.len() != 1 {
+                return invalid(
+                    "kdamond context count",
+                    "current DAMON requires exactly one context per running kdamond",
+                );
+            }
+            kdamond.contexts[0].validate_runnable()?;
         }
         Ok(())
     }
@@ -1196,9 +1439,7 @@ impl DamonConfig {
                     scheme
                         .access_pattern
                         .normalize_kernel_width(observed_scheme.access_pattern);
-                    scheme.filters.sort_by_key(|filter| {
-                        filter.filter_type.handled_by_operations() != Some(false)
-                    });
+                    canonicalize_filter_placements(&mut scheme.filters, &observed_scheme.filters);
                 }
             }
         }
@@ -2959,13 +3200,9 @@ impl Scheme {
 
     /// Reads this complete staged scheme into owned data.
     pub fn configuration(&self) -> Result<SchemeConfig> {
-        let filters = if path_exists(&self.path.join("core_filters/nr_filters"))? {
-            let mut filters = self.read_filter_layer(FilterLayer::Core)?;
-            filters.extend(self.read_filter_layer(FilterLayer::Operations)?);
-            filters
-        } else {
-            self.read_filter_layer(FilterLayer::Unified)?
-        };
+        let mut filters = self.read_filter_layer(FilterLayer::Core)?;
+        filters.extend(self.read_filter_layer(FilterLayer::Operations)?);
+        filters.extend(self.read_filter_layer(FilterLayer::Unified)?);
         Ok(SchemeConfig {
             action: self.action()?,
             access_pattern: self.access_pattern()?,
@@ -2992,7 +3229,9 @@ impl Scheme {
             return Ok(Vec::new());
         }
         read_indexed(self.filter_count(layer)?, |index| {
-            self.filter(layer, index).configuration()
+            let mut config = self.filter(layer, index).configuration()?;
+            config.placement = FilterPlacement::from_layer(layer);
+            Ok(config)
         })
     }
 
@@ -3095,20 +3334,73 @@ impl Scheme {
     }
 
     fn stage_semantic_filters(&self, filters: &[FilterConfig]) -> Result<()> {
-        if path_exists(&self.path.join("core_filters/nr_filters"))? {
-            let (core, operations): (Vec<_>, Vec<_>) = filters
-                .iter()
-                .partition(|filter| filter.filter_type.handled_by_operations() == Some(false));
-            self.stage_filter_layer(FilterLayer::Core, &core)?;
-            self.stage_filter_layer(FilterLayer::Operations, &operations)
-        } else if path_exists(&self.path.join("filters/nr_filters"))? {
-            let filters = filters.iter().collect::<Vec<_>>();
-            self.stage_filter_layer(FilterLayer::Unified, &filters)
+        let has_core = path_exists(&self.path.join("core_filters/nr_filters"))?;
+        let has_operations = path_exists(&self.path.join("ops_filters/nr_filters"))?;
+        let has_unified = path_exists(&self.path.join("filters/nr_filters"))?;
+        if has_core || has_operations {
+            let mut core = Vec::new();
+            let mut operations = Vec::new();
+            let mut unified = Vec::new();
+            for filter in filters {
+                match filter.placement {
+                    FilterPlacement::Core => core.push(filter),
+                    FilterPlacement::Operations => operations.push(filter),
+                    FilterPlacement::Unified => unified.push(filter),
+                    FilterPlacement::Adaptive => {
+                        if filter.filter_type.handled_by_operations() == Some(false) {
+                            core.push(filter);
+                        } else {
+                            operations.push(filter);
+                        }
+                    }
+                }
+            }
+            self.stage_filter_layer_if_present(FilterLayer::Core, &core, has_core)?;
+            self.stage_filter_layer_if_present(
+                FilterLayer::Operations,
+                &operations,
+                has_operations,
+            )?;
+            self.stage_filter_layer_if_present(FilterLayer::Unified, &unified, has_unified)
+        } else if has_unified {
+            if filters.iter().any(|filter| {
+                matches!(
+                    filter.placement,
+                    FilterPlacement::Core | FilterPlacement::Operations
+                )
+            }) {
+                return Err(Error::UnsupportedFeature {
+                    feature: "split DAMOS filter placement",
+                });
+            }
+            let unified = filters.iter().collect::<Vec<_>>();
+            self.stage_filter_layer(FilterLayer::Unified, &unified)
         } else if filters.is_empty() {
             Ok(())
         } else {
             Err(Error::UnsupportedFeature {
                 feature: "DAMOS filters",
+            })
+        }
+    }
+
+    fn stage_filter_layer_if_present(
+        &self,
+        layer: FilterLayer,
+        filters: &[&FilterConfig],
+        present: bool,
+    ) -> Result<()> {
+        if present {
+            self.stage_filter_layer(layer, filters)
+        } else if filters.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::UnsupportedFeature {
+                feature: match layer {
+                    FilterLayer::Unified => "unified DAMOS filters",
+                    FilterLayer::Core => "core DAMOS filters",
+                    FilterLayer::Operations => "operations DAMOS filters",
+                },
             })
         }
     }
@@ -3260,16 +3552,42 @@ fn needs_stage<T: PartialEq>(observed: Option<&T>, requested: &T) -> bool {
 }
 
 fn semantic_filters_match(requested: &[FilterConfig], observed: &[FilterConfig]) -> bool {
-    requested == observed
-        || requested
-            .iter()
-            .filter(|filter| filter.filter_type.handled_by_operations() == Some(false))
-            .chain(
-                requested
-                    .iter()
-                    .filter(|filter| filter.filter_type.handled_by_operations() != Some(false)),
-            )
-            .eq(observed)
+    if requested == observed {
+        return true;
+    }
+    let mut canonical = requested.to_vec();
+    canonicalize_filter_placements(&mut canonical, observed);
+    canonical == observed
+}
+
+fn canonicalize_filter_placements(filters: &mut [FilterConfig], observed: &[FilterConfig]) {
+    let split = observed.iter().any(|filter| {
+        matches!(
+            filter.placement,
+            FilterPlacement::Core | FilterPlacement::Operations
+        )
+    });
+    for filter in filters.iter_mut() {
+        if filter.placement == FilterPlacement::Adaptive {
+            filter.placement = if split {
+                if filter.filter_type.handled_by_operations() == Some(false) {
+                    FilterPlacement::Core
+                } else {
+                    FilterPlacement::Operations
+                }
+            } else {
+                FilterPlacement::Unified
+            };
+        }
+    }
+    if split {
+        filters.sort_by_key(|filter| match filter.placement {
+            FilterPlacement::Core => 0,
+            FilterPlacement::Operations => 1,
+            FilterPlacement::Unified => 2,
+            FilterPlacement::Adaptive => 3,
+        });
+    }
 }
 
 fn optional_read<T>(path: &Path, read: impl FnOnce() -> Result<T>) -> Result<Option<T>> {

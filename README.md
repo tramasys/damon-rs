@@ -78,7 +78,7 @@ while `Drop` performs best-effort restoration.
 ## Capability discovery
 
 `Damon::capabilities()` exclusively stages a temporary hierarchy, probes
-semantic values, and restores the empty state. The passive low-level
+semantic values, and restores the preceding stopped state. The passive low-level
 `Kdamond::capabilities()` method does not mutate the hierarchy.
 
 Results use four states:
@@ -105,6 +105,10 @@ known effective unit.
 the session lock, rejects running kdamonds, verifies kernel read-back, and
 restores the preceding writable hierarchy if staging fails. Changed
 configurations write only differing leaves.
+
+Exclusive sessions can transactionally commit owned configuration updates.
+Runtime reads support explicit synchronous refreshes, cached reads, and checked
+batches for lower polling overhead.
 
 ## Toolchain
 

@@ -87,9 +87,9 @@ sysfs backend. Discovery returns:
 - `RequiresStaging` when an indexed child is not materialized
 - `Unverified` when visible ABI evidence cannot prove usability
 
-`Damon::capabilities()` holds the advisory lock, requires an empty hierarchy,
+`Damon::capabilities()` holds the advisory lock, requires stopped kdamonds,
 stages representative children, probes filter values, records concrete paths,
-and restores zero kdamonds. `Kdamond::capabilities()` is passive.
+and restores the preceding hierarchy. `Kdamond::capabilities()` is passive.
 
 Without `avail_operations`, accepted operation writes remain `Unverified`.
 Linux 5.18 can accept a recognized name even when its implementation is not

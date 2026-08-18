@@ -17,6 +17,7 @@ This project follows Semantic Versioning and Keep a Changelog.
   rollback of known and unknown writable attributes
 - Generic exclusive sessions with runtime commands, explicit close, and
   restoration of preceding stopped configurations
+- Transactional online configuration updates and checked runtime batches
 - Advisory locking, ownership fingerprints, rollback, and cleanup
 - CI for formatting, linting, tests, docs, packaging, MSRV, architectures, and
   dependency policy
@@ -28,6 +29,9 @@ This project follows Semantic Versioning and Keep a Changelog.
 - Distinguish core-unit region sizes from byte-sized huge-page filters
 - Adapt staging to attributes present on the running kernel
 - Normalize split filter layouts and write only changed configuration leaves
+- Preserve unified, core, and operation filter placement and execution order
+- Separate staged-shape validation from current runnable invariants
+- Restore stopped configurations around exclusive capability probing
 - Report configuration mismatches with the path and both values
 - Support snapshots without `total_bytes` and monitoring without tried-region
   queries

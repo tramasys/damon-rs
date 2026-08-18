@@ -70,3 +70,51 @@ fn owned_configuration_is_constructible_from_the_public_api() {
     config.kdamonds.push(kdamond);
     config.validate().expect("valid admin configuration");
 }
+
+#[test]
+fn runnable_validation_is_stricter_than_staged_shape_validation() {
+    let context = ContextConfig::new(damon::sysfs::Operation::VirtualAddress);
+    context
+        .validate()
+        .expect("incomplete context can be staged");
+    assert!(context.validate_runnable().is_err());
+
+    let mut config = DamonConfig::default();
+    let mut kdamond = KdamondConfig::default();
+    kdamond.contexts.push(context);
+    config.kdamonds.push(kdamond);
+    config
+        .validate()
+        .expect("incomplete hierarchy can be staged");
+    assert!(config.validate_runnable().is_err());
+}
+
+#[test]
+fn runnable_validation_enforces_current_weighted_probe_limits() {
+    let mut context = ContextConfig::new(damon::sysfs::Operation::VirtualAddress);
+    context
+        .targets
+        .push(TargetConfig::for_pid(Pid::new(42).expect("valid pid")));
+    context.probes = vec![ProbeConfig::default(); 5];
+    assert!(context.validate().is_ok());
+    assert!(context.validate_runnable().is_err());
+
+    context.probes.truncate(1);
+    context.probes[0].weight = 1;
+    context.intervals = damon::MonitoringIntervals::new(
+        Duration::from_micros(1),
+        Duration::from_micros(256),
+        Duration::from_secs(1),
+    )
+    .expect("valid intervals");
+    assert!(context.validate_runnable().is_err());
+
+    context.intervals = damon::MonitoringIntervals::new(
+        Duration::from_micros(1),
+        Duration::from_micros(2),
+        Duration::from_secs(1),
+    )
+    .expect("valid intervals");
+    context.probes[0].weight = u32::MAX;
+    assert!(context.validate_runnable().is_err());
+}
