@@ -117,6 +117,3 @@ Runtime support is discovered from available paths and accepted values.
 Unknown future ABI values are preserved where possible. See
 [the ABI notes](docs/kernel-abi.md) for the behavior that affects ownership,
 snapshots, and address units.
-
-The crate uses Rust 2024 and supports Rust 1.85 or newer. It is licensed under
-MIT.
