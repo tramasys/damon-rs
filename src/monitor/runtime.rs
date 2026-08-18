@@ -177,9 +177,34 @@ impl ManagedKdamond<'_> {
     ) -> Result<T> {
         self.hierarchy.verify_running(self.index)?;
         let result = {
+            let kdamond = self.hierarchy.kdamond(self.index);
             let mut batch = RuntimeBatch {
                 hierarchy: self.hierarchy,
                 kdamond_index: self.index,
+                kdamond,
+                context_count: None,
+                cached_context: None,
+            };
+            operation(&mut batch)
+        };
+        self.hierarchy.verify_running_identity(self.index)?;
+        result
+    }
+
+    /// Runs cached reads under one pair of complete ownership checks.
+    pub fn read_batch<T>(
+        &self,
+        operation: impl FnOnce(&mut RuntimeReadBatch<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.hierarchy.verify_running(self.index)?;
+        let result = {
+            let kdamond = self.hierarchy.kdamond(self.index);
+            let mut batch = RuntimeReadBatch {
+                hierarchy: self.hierarchy,
+                kdamond_index: self.index,
+                kdamond,
+                context_count: None,
+                cached_context: None,
             };
             operation(&mut batch)
         };
@@ -275,9 +300,34 @@ impl HierarchyRuntimeBatch<'_> {
     /// Borrows batched runtime access to one running kdamond.
     pub fn kdamond(&mut self, kdamond_index: usize) -> Result<RuntimeBatch<'_>> {
         self.hierarchy.expected_running_pid(kdamond_index)?;
+        let kdamond = self.hierarchy.kdamond(kdamond_index);
         Ok(RuntimeBatch {
             hierarchy: self.hierarchy,
             kdamond_index,
+            kdamond,
+            context_count: None,
+            cached_context: None,
+        })
+    }
+}
+
+/// Cached reads across kdamonds between complete ownership checks.
+#[derive(Debug)]
+pub struct HierarchyReadBatch<'a> {
+    pub(super) hierarchy: &'a ManagedHierarchy,
+}
+
+impl HierarchyReadBatch<'_> {
+    /// Borrows batched cached access to one running kdamond.
+    pub fn kdamond(&mut self, kdamond_index: usize) -> Result<RuntimeReadBatch<'_>> {
+        self.hierarchy.expected_running_pid(kdamond_index)?;
+        let kdamond = self.hierarchy.kdamond(kdamond_index);
+        Ok(RuntimeReadBatch {
+            hierarchy: self.hierarchy,
+            kdamond_index,
+            kdamond,
+            context_count: None,
+            cached_context: None,
         })
     }
 }
@@ -290,6 +340,9 @@ impl HierarchyRuntimeBatch<'_> {
 pub struct RuntimeBatch<'a> {
     pub(super) hierarchy: &'a mut ManagedHierarchy,
     pub(super) kdamond_index: usize,
+    kdamond: crate::sysfs::Kdamond,
+    context_count: Option<usize>,
+    cached_context: Option<(usize, crate::sysfs::Context, usize)>,
 }
 
 impl RuntimeBatch<'_> {
@@ -314,7 +367,7 @@ impl RuntimeBatch<'_> {
 
     /// Reads the last materialized scheme statistics.
     pub fn cached_scheme_stats(
-        &self,
+        &mut self,
         context_index: usize,
         scheme_index: usize,
     ) -> Result<SchemeStats> {
@@ -339,7 +392,7 @@ impl RuntimeBatch<'_> {
 
     /// Reads one scheme's already materialized tried regions.
     pub fn cached_tried_regions(
-        &self,
+        &mut self,
         context_index: usize,
         scheme_index: usize,
         capacity_hint: usize,
@@ -362,7 +415,7 @@ impl RuntimeBatch<'_> {
 
     /// Reads one scheme's already materialized total tried units.
     pub fn cached_tried_bytes_units(
-        &self,
+        &mut self,
         context_index: usize,
         scheme_index: usize,
     ) -> Result<u64> {
@@ -388,7 +441,7 @@ impl RuntimeBatch<'_> {
 
     /// Reads the last materialized effective quota units.
     pub fn cached_effective_quota_units(
-        &self,
+        &mut self,
         context_index: usize,
         scheme_index: usize,
     ) -> Result<u64> {
@@ -410,9 +463,18 @@ impl RuntimeBatch<'_> {
         self.command(&KdamondCommand::ClearSchemesTriedRegions)
     }
 
-    fn scheme(&self, context_index: usize, scheme_index: usize) -> Result<crate::sysfs::Scheme> {
-        self.hierarchy
-            .scheme(self.kdamond_index, context_index, scheme_index)
+    fn scheme(
+        &mut self,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<crate::sysfs::Scheme> {
+        cached_scheme(
+            &self.kdamond,
+            context_index,
+            scheme_index,
+            &mut self.context_count,
+            &mut self.cached_context,
+        )
     }
 
     fn command(&self, command: &KdamondCommand) -> Result<()> {
@@ -422,11 +484,138 @@ impl RuntimeBatch<'_> {
 
     fn issue_command(&self, command: &KdamondCommand) -> Result<()> {
         self.verify_identity()?;
-        retry_busy(|| self.hierarchy.kdamond(self.kdamond_index).command(command))
+        retry_busy(|| self.kdamond.command(command))
     }
 
     fn verify_identity(&self) -> Result<()> {
         self.hierarchy
-            .verify_running_identity_only(self.kdamond_index)
+            .verify_running_identity_with(self.kdamond_index, &self.kdamond)
     }
+}
+
+/// Read-only runtime operations batched between complete ownership checks.
+#[derive(Debug)]
+pub struct RuntimeReadBatch<'a> {
+    hierarchy: &'a ManagedHierarchy,
+    kdamond_index: usize,
+    kdamond: crate::sysfs::Kdamond,
+    context_count: Option<usize>,
+    cached_context: Option<(usize, crate::sysfs::Context, usize)>,
+}
+
+impl RuntimeReadBatch<'_> {
+    /// Returns the selected kdamond index.
+    #[must_use]
+    pub const fn kdamond_index(&self) -> usize {
+        self.kdamond_index
+    }
+
+    /// Reads one scheme's last materialized statistics.
+    pub fn scheme_stats(
+        &mut self,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<SchemeStats> {
+        let stats = self.scheme(context_index, scheme_index)?.stats()?;
+        self.verify_identity()?;
+        Ok(stats)
+    }
+
+    /// Reads one scheme's already materialized tried regions.
+    pub fn tried_regions(
+        &mut self,
+        context_index: usize,
+        scheme_index: usize,
+        capacity_hint: usize,
+    ) -> Result<RawSnapshot> {
+        let snapshot = self
+            .scheme(context_index, scheme_index)?
+            .tried_regions(capacity_hint)?;
+        self.verify_identity()?;
+        Ok(snapshot)
+    }
+
+    /// Reads one scheme's already materialized tried total in core units.
+    pub fn tried_bytes_units(&mut self, context_index: usize, scheme_index: usize) -> Result<u64> {
+        let units = self
+            .scheme(context_index, scheme_index)?
+            .tried_bytes_units()?;
+        self.verify_identity()?;
+        Ok(units)
+    }
+
+    /// Reads one scheme's last materialized effective quota in core units.
+    pub fn effective_quota_units(
+        &mut self,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<u64> {
+        let units = self
+            .scheme(context_index, scheme_index)?
+            .quotas()
+            .effective_size_units()?;
+        self.verify_identity()?;
+        Ok(units)
+    }
+
+    fn scheme(
+        &mut self,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<crate::sysfs::Scheme> {
+        cached_scheme(
+            &self.kdamond,
+            context_index,
+            scheme_index,
+            &mut self.context_count,
+            &mut self.cached_context,
+        )
+    }
+
+    fn verify_identity(&self) -> Result<()> {
+        self.hierarchy
+            .verify_running_identity_with(self.kdamond_index, &self.kdamond)
+    }
+}
+
+fn cached_scheme(
+    kdamond: &crate::sysfs::Kdamond,
+    context_index: usize,
+    scheme_index: usize,
+    context_count: &mut Option<usize>,
+    cached_context: &mut Option<(usize, crate::sysfs::Context, usize)>,
+) -> Result<crate::sysfs::Scheme> {
+    let count = if let Some(count) = *context_count {
+        count
+    } else {
+        let count = kdamond.context_count()?;
+        *context_count = Some(count);
+        count
+    };
+    if context_index >= count {
+        return Err(Error::IndexOutOfBounds {
+            kind: "context",
+            index: context_index,
+            count,
+        });
+    }
+    if cached_context
+        .as_ref()
+        .is_none_or(|(cached_index, _, _)| *cached_index != context_index)
+    {
+        let context = kdamond.context(context_index);
+        let scheme_count = context.scheme_count()?;
+        *cached_context = Some((context_index, context, scheme_count));
+    }
+    let (_, context, scheme_count) = cached_context
+        .as_ref()
+        .expect("the selected context was cached");
+    if scheme_index >= *scheme_count {
+        return Err(Error::IndexOutOfBounds {
+            kind: "scheme",
+            index: scheme_index,
+            count: *scheme_count,
+        });
+    }
+    Ok(context.scheme(scheme_index))
 }

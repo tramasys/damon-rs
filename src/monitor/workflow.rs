@@ -1,5 +1,9 @@
 //! High-level vaddr, fvaddr, and paddr workflow builders.
 
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::JoinHandle;
+use std::time::Instant;
+
 use super::{
     AccessCountRange, AccessPattern, Action, AddressUnit, AgeRange, Capabilities,
     CapabilitySupport, ContextConfig, Damon, DamonConfig, Duration, Error, ExclusiveSession,
@@ -14,6 +18,7 @@ pub(super) struct WorkflowOptions<'a> {
     sample: Duration,
     aggregation: Duration,
     update: Duration,
+    refresh: Duration,
     min_regions: u64,
     max_regions: u64,
     initial_regions: Vec<InitialRegionConfig>,
@@ -30,6 +35,7 @@ impl<'a> WorkflowOptions<'a> {
             sample: intervals.sample(),
             aggregation: intervals.aggregation(),
             update: intervals.update(),
+            refresh: Duration::ZERO,
             min_regions: region_bounds.min(),
             max_regions: region_bounds.max(),
             initial_regions: Vec::new(),
@@ -148,6 +154,16 @@ macro_rules! impl_common_workflow_builder {
             #[must_use]
             pub const fn operations_update_interval(mut self, interval: Duration) -> Self {
                 self.options.update = interval;
+                self
+            }
+
+            /// Sets the kernel's periodic sysfs result refresh interval.
+            ///
+            /// Zero disables periodic refresh. Kernels without `refresh_ms`
+            /// reject a non-zero value during staging.
+            #[must_use]
+            pub const fn result_refresh_interval(mut self, interval: Duration) -> Self {
+                self.options.refresh = interval;
                 self
             }
 
@@ -366,6 +382,7 @@ struct PreparedWorkflow {
     custom_scheme_count: usize,
     capacity_hint: usize,
     sample_interval: Duration,
+    refresh_interval: Duration,
 }
 
 fn prepare_workflow(
@@ -402,7 +419,10 @@ fn prepare_workflow(
     context.schemes = options.schemes;
     let snapshot_scheme_index = context.schemes.len();
 
-    let mut kdamond = KdamondConfig::default();
+    let mut kdamond = KdamondConfig {
+        refresh_interval: options.refresh,
+        ..KdamondConfig::default()
+    };
     kdamond.contexts.push(context);
     let mut base_config = DamonConfig::default();
     base_config.kdamonds.push(kdamond);
@@ -421,6 +441,7 @@ fn prepare_workflow(
         custom_scheme_count: snapshot_scheme_index,
         capacity_hint: usize::try_from(region_bounds.max()).unwrap_or(usize::MAX),
         sample_interval: intervals.sample(),
+        refresh_interval: options.refresh,
     })
 }
 
@@ -455,6 +476,7 @@ fn start_workflow(
         custom_scheme_count,
         capacity_hint,
         sample_interval,
+        refresh_interval,
         ..
     } = prepared;
     let (snapshot_query, maximum_snapshot_apply_interval) = match prepare_snapshot_query(
@@ -487,6 +509,7 @@ fn start_workflow(
         snapshot_query,
         custom_scheme_count,
         maximum_snapshot_apply_interval,
+        refresh_interval,
         cached_snapshots: Vec::new(),
     })
 }
@@ -637,7 +660,7 @@ fn snapshot_query_configuration(
         config,
         vec![SnapshotDescriptor {
             scheme_index: first_scheme_index,
-            scope: SnapshotScope::Ungrouped,
+            scope: SnapshotScope::Scheme,
         }]
         .into_boxed_slice(),
     )
@@ -688,6 +711,136 @@ enum SnapshotQuery {
     },
 }
 
+/// State returned by [`SnapshotRequest::wait_until`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum SnapshotWait {
+    /// The request completed and can be consumed with [`SnapshotRequest::finish`].
+    Ready,
+    /// The request is still running and retains ownership of the monitor.
+    Pending,
+}
+
+/// A completed asynchronous snapshot request and its owned monitor.
+#[derive(Debug)]
+pub struct SnapshotOutcome {
+    monitor: Monitor,
+    snapshots: Result<Vec<ScopedSnapshot>>,
+}
+
+impl SnapshotOutcome {
+    /// Returns the monitor recovered from the request.
+    #[must_use]
+    pub const fn monitor(&self) -> &Monitor {
+        &self.monitor
+    }
+
+    /// Returns the materialization result without consuming the outcome.
+    pub fn snapshots(&self) -> std::result::Result<&[ScopedSnapshot], &Error> {
+        match &self.snapshots {
+            Ok(snapshots) => Ok(snapshots),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Splits the outcome into the recovered monitor and materialization result.
+    pub fn into_parts(self) -> (Monitor, Result<Vec<ScopedSnapshot>>) {
+        (self.monitor, self.snapshots)
+    }
+}
+
+/// A snapshot command running on a dedicated worker thread.
+///
+/// Linux exposes the command as a synchronous sysfs write with no
+/// cancellation. A pending request therefore owns its [`Monitor`] until the
+/// write returns. Dropping a pending request waits for the worker so no hidden
+/// thread can continue mutating the session after the request disappears.
+#[derive(Debug)]
+pub struct SnapshotRequest {
+    receiver: Receiver<(Monitor, Result<Vec<ScopedSnapshot>>)>,
+    worker: Option<JoinHandle<()>>,
+    outcome: Option<SnapshotOutcome>,
+}
+
+impl SnapshotRequest {
+    /// Returns whether the worker has completed without blocking.
+    pub fn is_ready(&mut self) -> Result<bool> {
+        if self.outcome.is_some() {
+            return Ok(true);
+        }
+        match self.receiver.try_recv() {
+            Ok((monitor, snapshots)) => {
+                self.outcome = Some(SnapshotOutcome { monitor, snapshots });
+                self.join_worker()?;
+                Ok(true)
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(false),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.join_worker()?;
+                Err(Error::SnapshotWorkerDisconnected)
+            }
+        }
+    }
+
+    /// Waits until `deadline` without claiming to cancel a pending syscall.
+    ///
+    /// A [`SnapshotWait::Pending`] result keeps this request and its monitor in
+    /// a clearly pending state. Call this method again or use [`Self::finish`].
+    pub fn wait_until(&mut self, deadline: Instant) -> Result<SnapshotWait> {
+        if self.outcome.is_some() {
+            return Ok(SnapshotWait::Ready);
+        }
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        match self.receiver.recv_timeout(timeout) {
+            Ok((monitor, snapshots)) => {
+                self.outcome = Some(SnapshotOutcome { monitor, snapshots });
+                self.join_worker()?;
+                Ok(SnapshotWait::Ready)
+            }
+            Err(RecvTimeoutError::Timeout) => Ok(SnapshotWait::Pending),
+            Err(RecvTimeoutError::Disconnected) => {
+                self.join_worker()?;
+                Err(Error::SnapshotWorkerDisconnected)
+            }
+        }
+    }
+
+    /// Waits for completion and returns the monitor even if materialization failed.
+    pub fn finish(mut self) -> Result<SnapshotOutcome> {
+        if self.outcome.is_none() {
+            let (monitor, snapshots) = self
+                .receiver
+                .recv()
+                .map_err(|_| Error::SnapshotWorkerDisconnected)?;
+            self.outcome = Some(SnapshotOutcome { monitor, snapshots });
+        }
+        self.join_worker()?;
+        self.outcome.take().ok_or(Error::SnapshotWorkerDisconnected)
+    }
+
+    fn join_worker(&mut self) -> Result<()> {
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| Error::SnapshotWorkerDisconnected)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SnapshotRequest {
+    fn drop(&mut self) {
+        if self.outcome.is_none() {
+            if let Ok((monitor, snapshots)) = self.receiver.recv() {
+                self.outcome = Some(SnapshotOutcome { monitor, snapshots });
+            }
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 fn materialize_scoped_snapshots(
     session: &mut ExclusiveSession,
     descriptors: &[SnapshotDescriptor],
@@ -700,28 +853,36 @@ fn materialize_scoped_snapshots(
             reason: "requires at least one scheme",
         });
     };
-    session.runtime_batch(|batch| {
+    let requested_at = std::time::SystemTime::now();
+    let started_at = std::time::Instant::now();
+    let raw_snapshots = session.runtime_batch(|batch| {
         let mut snapshots = Vec::with_capacity(descriptors.len());
         let raw = batch.tried_regions(0, first.scheme_index, capacity_hint)?;
-        snapshots.push(ScopedSnapshot::new(
-            0,
-            0,
-            first.scheme_index,
-            first.scope,
-            raw.with_effective_address_unit(address_unit),
-        ));
+        snapshots.push((first, raw.with_effective_address_unit(address_unit)));
         for descriptor in remaining {
             let raw = batch.cached_tried_regions(0, descriptor.scheme_index, capacity_hint)?;
-            snapshots.push(ScopedSnapshot::new(
+            snapshots.push((descriptor, raw.with_effective_address_unit(address_unit)));
+        }
+        Ok(snapshots)
+    })?;
+    let timing = crate::SnapshotTiming::new(
+        requested_at,
+        std::time::SystemTime::now(),
+        started_at.elapsed(),
+    );
+    Ok(raw_snapshots
+        .into_iter()
+        .map(|(descriptor, snapshot)| {
+            ScopedSnapshot::new(
                 0,
                 0,
                 descriptor.scheme_index,
                 descriptor.scope,
-                raw.with_effective_address_unit(address_unit),
-            ));
-        }
-        Ok(snapshots)
-    })
+                timing,
+                snapshot,
+            )
+        })
+        .collect())
 }
 
 /// A running high-level DAMON monitor holding a cooperative session lock.
@@ -739,6 +900,7 @@ pub struct Monitor {
     snapshot_query: SnapshotQuery,
     custom_scheme_count: usize,
     maximum_snapshot_apply_interval: Duration,
+    refresh_interval: Duration,
     cached_snapshots: Vec<ScopedSnapshot>,
 }
 
@@ -789,6 +951,15 @@ impl Monitor {
         }
     }
 
+    /// Returns the configured periodic sysfs result refresh interval.
+    ///
+    /// When non-zero, cached result methods can avoid explicit refresh
+    /// commands when the caller accepts data from the kernel's last refresh.
+    #[must_use]
+    pub const fn result_refresh_interval(&self) -> Duration {
+        self.refresh_interval
+    }
+
     /// Refreshes and reads one custom scheme's runtime counters.
     ///
     /// Size fields remain in DAMON core address units. Use
@@ -832,15 +1003,15 @@ impl Monitor {
     }
 
     /// Reads every custom scheme's last materialized runtime counters.
-    pub fn cached_scheme_stats_all(&mut self) -> Result<Vec<SchemeStats>> {
+    pub fn cached_scheme_stats_all(&self) -> Result<Vec<SchemeStats>> {
         let count = self.custom_scheme_count;
         self.session
-            .as_mut()
+            .as_ref()
             .ok_or(Error::NotRunning)?
-            .runtime_batch(|batch| {
+            .read_batch(|batch| {
                 let mut stats = Vec::with_capacity(count);
                 for scheme_index in 0..count {
-                    stats.push(batch.cached_scheme_stats(0, scheme_index)?);
+                    stats.push(batch.scheme_stats(0, scheme_index)?);
                 }
                 Ok(stats)
             })
@@ -895,19 +1066,19 @@ impl Monitor {
     }
 
     /// Reads every custom scheme's last materialized effective quota.
-    pub fn cached_effective_quota_units_all(&mut self) -> Result<Vec<u64>> {
+    pub fn cached_effective_quota_units_all(&self) -> Result<Vec<u64>> {
         self.ensure_feature_supported(
             SysfsFeature::SchemeQuotaEffectiveBytes,
             "DAMOS effective quota reporting",
         )?;
         let count = self.custom_scheme_count;
         self.session
-            .as_mut()
+            .as_ref()
             .ok_or(Error::NotRunning)?
-            .runtime_batch(|batch| {
+            .read_batch(|batch| {
                 let mut quotas = Vec::with_capacity(count);
                 for scheme_index in 0..count {
-                    quotas.push(batch.cached_effective_quota_units(0, scheme_index)?);
+                    quotas.push(batch.effective_quota_units(0, scheme_index)?);
                 }
                 Ok(quotas)
             })
@@ -946,7 +1117,7 @@ impl Monitor {
     /// Materializes all target-scoped or ungrouped snapshot results.
     ///
     /// One target-filtered private scheme is used per target when the kernel
-    /// accepts target filters. Otherwise one [`SnapshotScope::Ungrouped`]
+    /// accepts target filters. Otherwise one [`SnapshotScope::Scheme`]
     /// result is returned. Target identity is never inferred from addresses.
     pub fn materialize_snapshots(&mut self) -> Result<&[ScopedSnapshot]> {
         let capacity_hint = self.capacity_hint;
@@ -1001,6 +1172,50 @@ impl Monitor {
         Ok(&self.cached_snapshots)
     }
 
+    /// Materializes one result and transfers its allocation to the caller.
+    pub fn materialize_snapshot_owned(&mut self) -> Result<ScopedSnapshot> {
+        let result_count = match &self.snapshot_query {
+            SnapshotQuery::Unsupported => None,
+            SnapshotQuery::Permanent { descriptors }
+            | SnapshotQuery::OnDemand { descriptors, .. } => Some(descriptors.len()),
+        };
+        if let Some(count) = result_count.filter(|count| *count != 1) {
+            return Err(Error::MultipleSnapshotResults { count });
+        }
+        self.materialize_snapshots()?;
+        self.cached_snapshots.pop().ok_or(Error::OwnershipLost {
+            reason: "a successful singular snapshot request returned no result",
+        })
+    }
+
+    /// Materializes all results and transfers their allocations to the caller.
+    pub fn materialize_snapshots_owned(&mut self) -> Result<Vec<ScopedSnapshot>> {
+        self.materialize_snapshots()?;
+        Ok(std::mem::take(&mut self.cached_snapshots))
+    }
+
+    /// Starts a blocking snapshot command on a worker that owns this monitor.
+    ///
+    /// The request can be polled with a deadline, but the kernel write cannot
+    /// be cancelled. Use [`SnapshotRequest::finish`] to recover the monitor and
+    /// inspect the snapshot result.
+    pub fn request_snapshot(self) -> Result<SnapshotRequest> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("damon-snapshot".into())
+            .spawn(move || {
+                let mut monitor = self;
+                let snapshots = monitor.materialize_snapshots_owned();
+                let _ = sender.send((monitor, snapshots));
+            })
+            .map_err(|source| Error::SnapshotWorkerSpawn { source })?;
+        Ok(SnapshotRequest {
+            receiver,
+            worker: Some(worker),
+            outcome: None,
+        })
+    }
+
     /// Returns snapshots from the last successful materialization.
     ///
     /// This performs no sysfs access. The slice is empty before the first
@@ -1008,6 +1223,12 @@ impl Monitor {
     #[must_use]
     pub fn cached_snapshots(&self) -> &[ScopedSnapshot] {
         &self.cached_snapshots
+    }
+
+    /// Transfers the cached result allocation to the caller without sysfs access.
+    #[must_use]
+    pub fn take_cached_snapshots(&mut self) -> Vec<ScopedSnapshot> {
+        std::mem::take(&mut self.cached_snapshots)
     }
 
     /// Returns the last singular snapshot without accessing sysfs.

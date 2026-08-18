@@ -1,4 +1,5 @@
 use super::*;
+use std::str::FromStr;
 
 #[test]
 fn operation_parser_preserves_new_kernel_values() {
@@ -7,6 +8,27 @@ fn operation_parser_preserves_new_kernel_values() {
         Operation::parse("future"),
         Operation::Unknown("future".into())
     );
+}
+
+#[test]
+fn public_string_parsers_preserve_atomic_future_values() {
+    assert_eq!(
+        Operation::from_str("future_operation").expect("parse operation"),
+        Operation::Unknown("future_operation".into())
+    );
+    assert_eq!(
+        Action::from_str("future_action").expect("parse action"),
+        Action::Unknown("future_action".into())
+    );
+    assert_eq!(
+        SchemeFilterType::from_str("future_filter").expect("parse filter"),
+        SchemeFilterType::Unknown("future_filter".into())
+    );
+    assert_eq!(
+        KdamondState::from_str("future_state").expect("parse state"),
+        KdamondState::Unknown("future_state".into())
+    );
+    assert!(KdamondCommand::from_str("bad\ncommand").is_err());
 }
 
 #[test]
@@ -163,11 +185,11 @@ fn semantic_features_match_the_official_damo_sysfs_map() {
         ),
         (SysfsFeature::ObsoleteTarget, "sysfs/obsolete_target"),
         (
-            SysfsFeature::SchemeSnapshotCount,
+            SysfsFeature::SchemeApplicationSnapshotCount,
             "sysfs/damos_stat_nr_snapshots",
         ),
         (
-            SysfsFeature::SchemeMaximumSnapshotCount,
+            SysfsFeature::SchemeApplicationSnapshotLimit,
             "sysfs/damos_max_nr_snapshots",
         ),
         (

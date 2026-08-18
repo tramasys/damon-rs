@@ -379,11 +379,11 @@ fn scheme_semantic_capabilities(scheme: &Scheme) -> Result<Vec<FeatureCapability
             stats.join("sz_ops_filter_passed"),
         ),
         (
-            SysfsFeature::SchemeSnapshotCount,
+            SysfsFeature::SchemeApplicationSnapshotCount,
             stats.join("nr_snapshots"),
         ),
         (
-            SysfsFeature::SchemeMaximumSnapshotCount,
+            SysfsFeature::SchemeApplicationSnapshotLimit,
             stats.join("max_nr_snapshots"),
         ),
         (

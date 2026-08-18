@@ -113,10 +113,10 @@ pub enum SysfsFeature {
     SchemeDestinations,
     /// Bytes passed by operations-layer filters.
     SchemeOperationsFilterPassedBytes,
-    /// Number of DAMOS snapshots (`sysfs/damos_stat_nr_snapshots`).
-    SchemeSnapshotCount,
-    /// Configurable maximum number of DAMOS snapshots.
-    SchemeMaximumSnapshotCount,
+    /// Number of DAMOS application snapshots (`sysfs/damos_stat_nr_snapshots`).
+    SchemeApplicationSnapshotCount,
+    /// Snapshot count at which DAMOS scheme application is deactivated.
+    SchemeApplicationSnapshotLimit,
     /// DAMOS collapse action (`sysfs/damos_action_collapse`).
     CollapseAction,
     /// DAMOS page allocation action.
@@ -204,8 +204,8 @@ impl SysfsFeature {
             Self::SchemeMigration => Some("sysfs/schemes_migrate"),
             Self::SchemeDestinations => Some("sysfs/schemes_dests"),
             Self::SchemeOperationsFilterPassedBytes => Some("sysfs/sz_ops_filter_passed"),
-            Self::SchemeSnapshotCount => Some("sysfs/damos_stat_nr_snapshots"),
-            Self::SchemeMaximumSnapshotCount => Some("sysfs/damos_max_nr_snapshots"),
+            Self::SchemeApplicationSnapshotCount => Some("sysfs/damos_stat_nr_snapshots"),
+            Self::SchemeApplicationSnapshotLimit => Some("sysfs/damos_max_nr_snapshots"),
             Self::CollapseAction => Some("sysfs/damos_action_collapse"),
             Self::MonitoringIntervalsGoal => Some("sysfs/intervals_goal"),
             Self::ProbeTypeAnonymous => Some("sysfs/probe_type_anon"),

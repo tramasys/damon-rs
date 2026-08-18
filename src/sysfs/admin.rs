@@ -5,7 +5,9 @@ use crate::config::Pid;
 use crate::{Error, Result};
 
 use super::configuration;
-use super::ownership::{ConfigurationFingerprint, ConfigurationSnapshot, capture_configuration};
+use super::ownership::{
+    ConfigurationFingerprint, ConfigurationSnapshot, ObservedConfiguration, capture_configuration,
+};
 use super::sysfs_io::{
     duration_millis, invalid_kernel_value, path_exists, read_i32, read_text, read_u32, read_usize,
     write_bytes, write_value, write_value_if_present,
@@ -69,6 +71,21 @@ impl DamonAdmin {
     pub(crate) fn configuration_snapshot(&self) -> Result<ConfigurationSnapshot> {
         ConfigurationSnapshot::capture(&self.root)
     }
+
+    /// Reads the known typed hierarchy and every writable configuration value.
+    ///
+    /// The writable values include unknown future attributes and use paths
+    /// relative to this admin root.
+    pub fn observed_configuration(&self) -> Result<ObservedConfiguration> {
+        let snapshot = self.configuration_snapshot()?;
+        let configuration = self.configuration()?;
+        if !snapshot.matches_complete_current_except(&[])? {
+            return Err(Error::OwnershipLost {
+                reason: "the DAMON hierarchy changed while it was being observed",
+            });
+        }
+        Ok(snapshot.into_observed(configuration))
+    }
 }
 
 /// A `kdamonds/<N>` sysfs directory.
@@ -88,11 +105,7 @@ impl Kdamond {
     pub fn state(&self) -> Result<KdamondState> {
         let path = self.path.join("state");
         let value = read_text(&path)?;
-        Ok(match value.trim() {
-            "on" => KdamondState::On,
-            "off" => KdamondState::Off,
-            other => KdamondState::Unknown(other.into()),
-        })
+        value.trim().parse()
     }
 
     /// Sends a command to this kdamond.

@@ -70,7 +70,7 @@ configured interval as a scheduling hint. Cached session reads and
 
 High-level vaddr and fvaddr workflows support multiple process targets. When
 target filters are accepted, one private query scheme isolates each target.
-Otherwise `Monitor::snapshots()` returns one `SnapshotScope::Ungrouped` result.
+Otherwise the monitor returns one `SnapshotScope::Scheme` result.
 The crate never infers target identity from address ranges. Results from
 multiple low-level targets remain in kernel materialization order and do not
 imply global address ordering.

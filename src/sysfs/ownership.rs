@@ -1,9 +1,12 @@
 use std::io;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::error::io_error;
 use crate::{Error, Result};
+
+use super::DamonConfig;
 
 use super::sysfs_io::{
     all_files_recursive, path_is_writable, read_configuration_value_equals, read_text, write_bytes,
@@ -13,6 +16,62 @@ use super::sysfs_io::{
 struct ConfigurationEntry {
     path: PathBuf,
     value: Box<str>,
+}
+
+/// One writable DAMON configuration value captured at a relative sysfs path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WritableConfigurationValue {
+    path: PathBuf,
+    value: Box<str>,
+}
+
+impl WritableConfigurationValue {
+    pub(crate) fn new(path: PathBuf, value: Box<str>) -> Self {
+        Self { path, value }
+    }
+
+    /// Returns the path relative to the DAMON admin root.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the exact text value without the trailing sysfs newline.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+/// A typed hierarchy observation paired with every writable sysfs value.
+///
+/// [`DamonConfig`] models attributes known to this crate. `writable_values`
+/// also contains unknown future attributes and can therefore identify the
+/// exact observed writable hierarchy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedConfiguration {
+    configuration: DamonConfig,
+    writable_values: Box<[WritableConfigurationValue]>,
+}
+
+impl ObservedConfiguration {
+    /// Returns the known typed configuration.
+    #[must_use]
+    pub const fn configuration(&self) -> &DamonConfig {
+        &self.configuration
+    }
+
+    /// Returns all writable values, including unknown future attributes.
+    #[must_use]
+    pub const fn writable_values(&self) -> &[WritableConfigurationValue] {
+        &self.writable_values
+    }
+
+    /// Splits the observation into its typed and lossless components.
+    #[must_use]
+    pub fn into_parts(self) -> (DamonConfig, Box<[WritableConfigurationValue]>) {
+        (self.configuration, self.writable_values)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,6 +100,16 @@ impl ConfigurationFingerprint {
             }
         }
         Ok(true)
+    }
+
+    fn equals_except(&self, other: &Self, ignored: &[PathBuf]) -> bool {
+        self.entries
+            .iter()
+            .filter(|entry| ignored.binary_search(&entry.path).is_err())
+            .eq(other
+                .entries
+                .iter()
+                .filter(|entry| ignored.binary_search(&entry.path).is_err()))
     }
 
     pub(crate) fn matches_current_under_except(
@@ -113,12 +182,128 @@ impl ConfigurationSnapshot {
         })
     }
 
-    pub(crate) fn fingerprint(&self) -> ConfigurationFingerprint {
-        self.fingerprint.clone()
+    pub(crate) fn matches_current_except(&self, ignored: &[PathBuf]) -> Result<bool> {
+        self.fingerprint.matches_current_except(ignored)
     }
 
-    pub(crate) fn into_fingerprint(self) -> ConfigurationFingerprint {
+    pub(crate) fn matches_complete_current_except(&self, ignored: &[PathBuf]) -> Result<bool> {
+        let current = capture_configuration(&self.root)?;
+        Ok(self.fingerprint.equals_except(&current, ignored))
+    }
+
+    pub(crate) fn matches_current_under_except(
+        &self,
+        root: &Path,
+        ignored: &[PathBuf],
+    ) -> Result<bool> {
+        self.fingerprint.matches_current_under_except(root, ignored)
+    }
+
+    pub(crate) fn matches_current_outside_except(
+        &self,
+        ignored_root: &Path,
+        ignored: &[PathBuf],
+    ) -> Result<bool> {
         self.fingerprint
+            .matches_current_outside_except(ignored_root, ignored)
+    }
+
+    pub(crate) fn refreshed_paths_except(
+        &self,
+        paths: &[PathBuf],
+        ignored: &[PathBuf],
+    ) -> Result<Self> {
+        Ok(Self {
+            root: self.root.clone(),
+            fingerprint: self.fingerprint.refreshed_paths_except(paths, ignored)?,
+        })
+    }
+
+    pub(crate) fn into_observed(self, configuration: DamonConfig) -> ObservedConfiguration {
+        let writable_values = self.writable_values();
+        ObservedConfiguration {
+            configuration,
+            writable_values,
+        }
+    }
+
+    pub(crate) fn writable_values(&self) -> Box<[WritableConfigurationValue]> {
+        self.fingerprint
+            .entries
+            .iter()
+            .map(|entry| WritableConfigurationValue {
+                path: entry
+                    .path
+                    .strip_prefix(&self.root)
+                    .unwrap_or(&entry.path)
+                    .to_path_buf(),
+                value: entry.value.clone(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    pub(crate) fn from_writable_values(
+        root: &Path,
+        values: &[WritableConfigurationValue],
+    ) -> Result<Self> {
+        let mut entries = Vec::with_capacity(values.len().min(4_096));
+        for value in values {
+            if value.path.as_os_str().is_empty()
+                || value.path.is_absolute()
+                || value
+                    .path
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return Err(Error::InvalidReceipt {
+                    reason: "contains a non-relative writable path",
+                });
+            }
+            entries.push(ConfigurationEntry {
+                path: root.join(&value.path),
+                value: value.value.clone(),
+            });
+        }
+        entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        if entries
+            .windows(2)
+            .any(|entries| entries[0].path == entries[1].path)
+        {
+            return Err(Error::InvalidReceipt {
+                reason: "contains duplicate writable paths",
+            });
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            fingerprint: ConfigurationFingerprint {
+                entries: entries.into(),
+            },
+        })
+    }
+
+    pub(crate) fn paths_affected_by_writes(&self, writes: &[PathBuf]) -> Vec<PathBuf> {
+        let mut affected = Vec::new();
+        for write in writes {
+            affected.push(write.clone());
+            let relative = write.strip_prefix(&self.root).unwrap_or(write);
+            if !is_reconstruction_count(relative) {
+                continue;
+            }
+            let Some(parent) = write.parent() else {
+                continue;
+            };
+            affected.extend(
+                self.fingerprint
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.path.starts_with(parent))
+                    .map(|entry| entry.path.clone()),
+            );
+        }
+        affected.sort_unstable();
+        affected.dedup();
+        affected
     }
 
     pub(crate) fn matches_current(&self) -> Result<bool> {
@@ -135,21 +320,64 @@ impl ConfigurationSnapshot {
     }
 
     pub(crate) fn restore(&self) -> Result<()> {
+        self.restore_except(&[])
+    }
+
+    pub(crate) fn restore_except(&self, ignored: &[PathBuf]) -> Result<()> {
         let mut entries = self.fingerprint.entries.iter().collect::<Vec<_>>();
         entries.sort_unstable_by(|left, right| {
             restoration_key(&self.root, left).cmp(&restoration_key(&self.root, right))
         });
         for entry in entries {
+            if ignored.binary_search(&entry.path).is_ok() {
+                continue;
+            }
             if is_reconstruction_count(&entry.path)
                 || !read_configuration_value_equals(&entry.path, entry.value.as_bytes())?
             {
                 write_bytes(&entry.path, entry.value.as_bytes())?;
             }
         }
-        if !self.matches_current()? {
+        if !self.matches_current_except(ignored)? {
             return Err(Error::OwnershipLost {
                 reason: "the restored hierarchy does not match its captured configuration",
             });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_paths_except(
+        &self,
+        paths: &[PathBuf],
+        ignored: &[PathBuf],
+    ) -> Result<()> {
+        let mut entries = self
+            .fingerprint
+            .entries
+            .iter()
+            .filter(|entry| paths.binary_search(&entry.path).is_ok())
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| {
+            restoration_key(&self.root, left).cmp(&restoration_key(&self.root, right))
+        });
+        for entry in entries {
+            if ignored.binary_search(&entry.path).is_ok() {
+                continue;
+            }
+            if is_reconstruction_count(&entry.path)
+                || !read_configuration_value_equals(&entry.path, entry.value.as_bytes())?
+            {
+                write_bytes(&entry.path, entry.value.as_bytes())?;
+            }
+        }
+        for entry in self.fingerprint.entries.iter().filter(|entry| {
+            paths.binary_search(&entry.path).is_ok() && ignored.binary_search(&entry.path).is_err()
+        }) {
+            if !read_configuration_value_equals(&entry.path, entry.value.as_bytes())? {
+                return Err(Error::OwnershipLost {
+                    reason: "a transaction path changed during partial rollback",
+                });
+            }
         }
         Ok(())
     }

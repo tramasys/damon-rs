@@ -1,4 +1,5 @@
 use std::fmt;
+use std::str::FromStr;
 use std::time::Duration;
 
 use crate::{Error, Result};
@@ -47,6 +48,40 @@ impl AddressUnit {
             }),
         }
     }
+
+    /// Converts bytes to address units and rejects a non-integral result.
+    pub const fn units_from_bytes_exact(self, bytes: u64) -> Result<u64> {
+        if bytes % self.0 != 0 {
+            return Err(Error::AddressConversionInexact {
+                bytes,
+                unit_bytes: self.0,
+            });
+        }
+        Ok(bytes / self.0)
+    }
+
+    /// Converts bytes to the greatest number of complete address units.
+    #[must_use]
+    pub const fn floor_units(self, bytes: u64) -> u64 {
+        bytes / self.0
+    }
+
+    /// Converts bytes to the least number of address units that cover them.
+    #[must_use]
+    pub const fn ceil_units(self, bytes: u64) -> u64 {
+        let quotient = bytes / self.0;
+        if bytes % self.0 == 0 {
+            quotient
+        } else {
+            quotient + 1
+        }
+    }
+
+    /// Alias for [`Self::ceil_units`] for range and capacity calculations.
+    #[must_use]
+    pub const fn units_covering_bytes(self, bytes: u64) -> u64 {
+        self.ceil_units(bytes)
+    }
 }
 
 impl Default for AddressUnit {
@@ -91,6 +126,26 @@ impl TryFrom<u32> for Pid {
 
     fn try_from(value: u32) -> Result<Self> {
         Self::new(value)
+    }
+}
+
+impl From<Pid> for u32 {
+    fn from(value: Pid) -> Self {
+        value.get()
+    }
+}
+
+impl FromStr for Pid {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let raw = value
+            .parse::<u32>()
+            .map_err(|_| Error::InvalidConfiguration {
+                field: "pid",
+                reason: "must be a positive 32-bit decimal process identifier",
+            })?;
+        Self::new(raw)
     }
 }
 
@@ -235,6 +290,21 @@ mod tests {
         assert!(Pid::new(0).is_err());
         assert!(Pid::new(2_147_483_647).is_ok());
         assert!(Pid::new(2_147_483_648).is_err());
+        assert_eq!("42".parse::<Pid>().expect("parse pid").get(), 42);
+        assert!("0".parse::<Pid>().is_err());
+    }
+
+    #[test]
+    fn address_unit_converts_byte_counts_with_explicit_rounding() {
+        let unit = AddressUnit::new(4_096).expect("valid unit");
+        assert_eq!(unit.units_from_bytes_exact(8_192).expect("exact"), 2);
+        assert!(matches!(
+            unit.units_from_bytes_exact(4_097),
+            Err(Error::AddressConversionInexact { .. })
+        ));
+        assert_eq!(unit.floor_units(4_097), 1);
+        assert_eq!(unit.ceil_units(4_097), 2);
+        assert_eq!(unit.units_covering_bytes(0), 0);
     }
 
     #[test]

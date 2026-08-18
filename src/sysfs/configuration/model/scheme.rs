@@ -390,8 +390,8 @@ pub struct SchemeConfig {
     pub filters: Vec<FilterConfig>,
     /// Weighted migration destinations.
     pub destinations: Vec<DestinationConfig>,
-    /// Maximum number of retained snapshots, or zero for the kernel default.
-    pub maximum_snapshots: u64,
+    /// Snapshot count that deactivates further application, or zero for no limit.
+    pub application_snapshot_limit: u64,
 }
 
 impl SchemeConfig {
@@ -407,7 +407,7 @@ impl SchemeConfig {
             watermarks: WatermarksConfig::default(),
             filters: Vec::new(),
             destinations: Vec::new(),
-            maximum_snapshots: 0,
+            application_snapshot_limit: 0,
         }
     }
 

@@ -79,7 +79,7 @@ through the monitor's effective address unit. Initial regions are validated
 against the kernel's operation-specific alignment before staging. Vaddr and
 fvaddr builders accept multiple process targets. Scoped snapshot results
 identify targets only when the staged query configuration proves that identity
-and otherwise report `Ungrouped`.
+and otherwise report scheme-scoped results without invented target identity.
 
 `Damon::exclusive_session()` provides the same lifecycle for any validated
 single-kdamond `DamonConfig`. Explicit `close()` reports restoration failures,

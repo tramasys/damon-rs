@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -308,10 +309,50 @@ pub(super) fn write_bool(path: &Path, value: bool) -> Result<()> {
 pub(super) fn write_bytes(path: &Path, value: &[u8]) -> Result<()> {
     #[cfg(test)]
     if let Some(result) = test_backend::write(path, value) {
-        return result.map_err(|error| io_error("write", path, error));
+        let result = result.map_err(|error| io_error("write", path, error));
+        if result.is_ok() {
+            record_write(path);
+        }
+        return result;
     }
     let mut file = open_for_write(path)?;
-    write_once(&mut file, path, value)
+    write_once(&mut file, path, value)?;
+    record_write(path);
+    Ok(())
+}
+
+thread_local! {
+    static WRITE_JOURNAL: RefCell<Option<Vec<PathBuf>>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn collect_writes<T>(operation: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
+    struct ResetJournal;
+
+    impl Drop for ResetJournal {
+        fn drop(&mut self) {
+            WRITE_JOURNAL.with(|journal| {
+                journal.borrow_mut().take();
+            });
+        }
+    }
+
+    WRITE_JOURNAL.with(|journal| {
+        let previous = journal.borrow_mut().replace(Vec::new());
+        assert!(previous.is_none(), "DAMON write journals cannot be nested");
+    });
+    let reset = ResetJournal;
+    let result = operation();
+    let writes = WRITE_JOURNAL.with(|journal| journal.borrow_mut().take().unwrap_or_default());
+    drop(reset);
+    (result, writes)
+}
+
+fn record_write(path: &Path) {
+    WRITE_JOURNAL.with(|journal| {
+        if let Some(paths) = journal.borrow_mut().as_mut() {
+            paths.push(path.to_path_buf());
+        }
+    });
 }
 
 pub(super) fn write_once(writer: &mut impl Write, path: &Path, value: &[u8]) -> Result<()> {

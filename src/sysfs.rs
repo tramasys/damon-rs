@@ -35,8 +35,10 @@ pub use admin::{DamonAdmin, Kdamond};
 pub use capabilities::*;
 pub use context::Context;
 pub(crate) use ownership::{ConfigurationFingerprint, ConfigurationSnapshot};
+pub use ownership::{ObservedConfiguration, WritableConfigurationValue};
 pub use probe::{Probe, ProbeFilter};
 pub use scheme::Scheme;
+pub(crate) use sysfs_io::collect_writes;
 pub use target::Target;
 
 #[cfg(test)]

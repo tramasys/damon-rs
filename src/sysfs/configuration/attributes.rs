@@ -32,10 +32,10 @@ pub struct SchemeStats {
     pub operations_filter_passed_units: Option<u64>,
     /// Number of quota limit exceedances.
     pub quota_exceeds: u64,
-    /// Number of snapshots represented by the counters, when exposed.
-    pub snapshots: Option<u64>,
-    /// Configured maximum number of snapshots, when exposed.
-    pub maximum_snapshots: Option<u64>,
+    /// Number of monitoring snapshots at which application was attempted, when exposed.
+    pub application_snapshots: Option<u64>,
+    /// Snapshot count that deactivates further application, when exposed.
+    pub application_snapshot_limit: Option<u64>,
 }
 
 /// A typed handle to one staged initial region.

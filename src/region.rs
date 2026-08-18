@@ -1,5 +1,6 @@
 use std::iter::FusedIterator;
 use std::slice;
+use std::time::{Duration, SystemTime};
 
 use crate::{AddressUnit, Error, Pid, Result};
 
@@ -152,7 +153,9 @@ impl TargetIdentity {
 pub enum SnapshotScope {
     /// Exactly one configured target produced the result.
     Target(TargetIdentity),
-    /// The kernel flattened results from multiple targets without identity.
+    /// Results are proven to belong to one scheme but not to one target.
+    Scheme,
+    /// The result source could not establish either target or scheme identity.
     Ungrouped,
 }
 
@@ -366,6 +369,16 @@ impl RawSnapshot {
         self.regions.iter()
     }
 
+    /// Consumes the snapshot and returns its raw region storage and totals.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<RawRegion>, Option<u64>, u64) {
+        (
+            self.regions,
+            self.reported_total_units,
+            self.materialized_total_units,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn allocated_region_capacity(&self) -> usize {
         self.regions.capacity()
@@ -546,6 +559,46 @@ pub struct Snapshot {
     address_unit: AddressUnit,
 }
 
+/// Timing information for one completed high-level snapshot request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotTiming {
+    requested_at: SystemTime,
+    completed_at: SystemTime,
+    elapsed: Duration,
+}
+
+impl SnapshotTiming {
+    pub(crate) const fn new(
+        requested_at: SystemTime,
+        completed_at: SystemTime,
+        elapsed: Duration,
+    ) -> Self {
+        Self {
+            requested_at,
+            completed_at,
+            elapsed,
+        }
+    }
+
+    /// Returns the wall-clock time immediately before the blocking request.
+    #[must_use]
+    pub const fn requested_at(self) -> SystemTime {
+        self.requested_at
+    }
+
+    /// Returns the wall-clock time after materialization and ownership verification.
+    #[must_use]
+    pub const fn completed_at(self) -> SystemTime {
+        self.completed_at
+    }
+
+    /// Returns monotonic elapsed time for materialization, reads, and ownership checks.
+    #[must_use]
+    pub const fn elapsed(self) -> Duration {
+        self.elapsed
+    }
+}
+
 /// A snapshot paired with its hierarchy coordinates and proven scope.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScopedSnapshot {
@@ -553,6 +606,7 @@ pub struct ScopedSnapshot {
     context_index: usize,
     scheme_index: usize,
     scope: SnapshotScope,
+    timing: SnapshotTiming,
     snapshot: Snapshot,
 }
 
@@ -562,6 +616,7 @@ impl ScopedSnapshot {
         context_index: usize,
         scheme_index: usize,
         scope: SnapshotScope,
+        timing: SnapshotTiming,
         snapshot: Snapshot,
     ) -> Self {
         Self {
@@ -569,6 +624,7 @@ impl ScopedSnapshot {
             context_index,
             scheme_index,
             scope,
+            timing,
             snapshot,
         }
     }
@@ -600,6 +656,12 @@ impl ScopedSnapshot {
         self.scope
     }
 
+    /// Returns timing for the request that produced this result.
+    #[must_use]
+    pub const fn timing(&self) -> SnapshotTiming {
+        self.timing
+    }
+
     /// Returns the point-in-time DAMON results.
     #[must_use]
     pub const fn snapshot(&self) -> &Snapshot {
@@ -610,6 +672,19 @@ impl ScopedSnapshot {
     #[must_use]
     pub fn into_snapshot(self) -> Snapshot {
         self.snapshot
+    }
+
+    /// Consumes the result and returns all identity, timing, and snapshot fields.
+    #[must_use]
+    pub fn into_parts(self) -> (usize, usize, usize, SnapshotScope, SnapshotTiming, Snapshot) {
+        (
+            self.kdamond_index,
+            self.context_index,
+            self.scheme_index,
+            self.scope,
+            self.timing,
+            self.snapshot,
+        )
     }
 }
 
@@ -653,6 +728,18 @@ impl Snapshot {
     #[must_use]
     pub const fn raw(&self) -> &RawSnapshot {
         &self.raw
+    }
+
+    /// Consumes the scaled snapshot and returns its raw snapshot and address unit.
+    #[must_use]
+    pub fn into_parts(self) -> (RawSnapshot, AddressUnit) {
+        (self.raw, self.address_unit)
+    }
+
+    /// Consumes the scaled snapshot and returns its raw snapshot.
+    #[must_use]
+    pub fn into_raw(self) -> RawSnapshot {
+        self.raw
     }
 
     /// Returns the matched total in DAMON core address units.

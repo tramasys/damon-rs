@@ -28,6 +28,7 @@ fn vaddr_workflow_composes_regions_probes_schemes_and_snapshot_query() {
         .vaddr()
         .pid(Pid::new(42).expect("valid pid"))
         .region(initial)
+        .result_refresh_interval(Duration::from_millis(250))
         .probe(ProbeConfig::default())
         .scheme(SchemeConfig::new(Action::PageOut, match_all_pattern()))
         .start()
@@ -36,6 +37,11 @@ fn vaddr_workflow_composes_regions_probes_schemes_and_snapshot_query() {
     assert_eq!(monitor.operation(), &Operation::VirtualAddress);
     assert_eq!(monitor.effective_address_unit(), AddressUnit::ONE);
     assert_eq!(monitor.scheme_count(), 1);
+    assert_eq!(
+        monitor.result_refresh_interval(),
+        Duration::from_millis(250)
+    );
+    assert_eq!(model.value("kdamonds/0/refresh_ms").as_deref(), Some("250"));
     assert_eq!(
         model
             .value("kdamonds/0/contexts/0/monitoring_attrs/probes/nr_probes")
@@ -86,6 +92,65 @@ fn vaddr_workflow_composes_regions_probes_schemes_and_snapshot_query() {
     monitor.pause().expect("pause workflow");
     monitor.resume().expect("resume workflow");
     monitor.stop().expect("restore hierarchy");
+}
+
+#[test]
+fn owned_snapshot_request_returns_monitor_and_completion_timing() {
+    let model = Model::new("vaddr\n");
+    model.set_tried_regions(vec![ModelRegion {
+        start: 1,
+        end: 2,
+        nr_accesses: 1,
+        age: 1,
+        filter_passed_units: None,
+        probe_hits: Vec::new(),
+    }]);
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let monitor = damon
+        .monitor_pid(Pid::new(42).expect("valid pid"))
+        .start()
+        .expect("start monitor");
+    let mut request = monitor.request_snapshot().expect("start snapshot request");
+    assert_eq!(
+        request
+            .wait_until(std::time::Instant::now() + Duration::from_secs(1))
+            .expect("wait for request"),
+        SnapshotWait::Ready
+    );
+    let outcome = request.finish().expect("finish request");
+    let (monitor, snapshots) = outcome.into_parts();
+    let snapshots = snapshots.expect("materialize snapshots");
+    assert_eq!(snapshots.len(), 1);
+    let timing = snapshots[0].timing();
+    assert!(timing.completed_at() >= timing.requested_at());
+    assert!(monitor.cached_snapshots().is_empty());
+    monitor.stop().expect("stop monitor");
+}
+
+#[test]
+fn owned_snapshot_extraction_reuses_the_cached_allocation() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut monitor = damon
+        .monitor_pid(Pid::new(42).expect("valid pid"))
+        .start()
+        .expect("start monitor");
+
+    let snapshot = monitor
+        .materialize_snapshot_owned()
+        .expect("take owned snapshot");
+    assert!(monitor.cached_snapshots().is_empty());
+    let (_, _, _, scope, _, scaled) = snapshot.into_parts();
+    assert!(matches!(scope, SnapshotScope::Target(_)));
+    let (raw, unit) = scaled.into_parts();
+    assert_eq!(unit, AddressUnit::ONE);
+    let (regions, reported, materialized) = raw.into_parts();
+    assert!(regions.is_empty());
+    assert_eq!(reported, Some(0));
+    assert_eq!(materialized, 0);
+    monitor.stop().expect("stop monitor");
 }
 
 #[test]
@@ -156,7 +221,7 @@ fn multi_target_snapshots_are_target_scoped_when_filters_are_supported() {
 }
 
 #[test]
-fn multi_target_snapshots_fall_back_to_honest_ungrouped_results() {
+fn multi_target_snapshots_fall_back_to_honest_scheme_scoped_results() {
     let model = Model::new("vaddr\n");
     model.set_supported_scheme_filter_types(
         "anon\nmemcg\nyoung\naddr\nhugepage_size\nunmapped\nactive\n",
@@ -181,7 +246,7 @@ fn multi_target_snapshots_fall_back_to_honest_ungrouped_results() {
     let snapshot = monitor
         .materialize_snapshot()
         .expect("materialize ungrouped snapshot");
-    assert_eq!(snapshot.scope(), SnapshotScope::Ungrouped);
+    assert_eq!(snapshot.scope(), SnapshotScope::Scheme);
     assert_eq!(monitor.cached_snapshots().len(), 1);
     monitor.stop().expect("stop workflow");
 }

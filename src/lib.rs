@@ -44,12 +44,24 @@ pub mod sysfs;
 pub use config::{AddressUnit, MonitoringIntervals, Pid, RegionBounds};
 pub use error::{Error, Result};
 pub use monitor::{
-    DEFAULT_SESSION_LOCK_PATH, Damon, ExclusiveSession, FvaddrSessionBuilder,
-    HierarchyRuntimeBatch, ManagedHierarchy, ManagedKdamond, Monitor, MonitorBuilder,
-    PaddrSessionBuilder, ProcessTarget, RuntimeBatch, VaddrSessionBuilder,
+    AttachedHierarchy, DEFAULT_SESSION_LOCK_PATH, Damon, ExclusiveSession, FvaddrSessionBuilder,
+    HierarchyReadBatch, HierarchyRuntimeBatch, ManagedHierarchy, ManagedKdamond, Monitor,
+    MonitorBuilder, PaddrSessionBuilder, PersistentKdamondIdentity, PersistentReceipt,
+    ProcessTarget, RuntimeBatch, RuntimeReadBatch, SnapshotOutcome, SnapshotRequest, SnapshotWait,
+    VaddrSessionBuilder,
 };
 pub use region::{
     ProbeHit, RawRegion, RawSnapshot, Region, RegionIter, ScopedSnapshot, Snapshot,
-    SnapshotCompleteness, SnapshotScope, TargetIdentity,
+    SnapshotCompleteness, SnapshotScope, SnapshotTiming, TargetIdentity,
 };
-pub use sysfs::{Capabilities, CapabilitySupport, Operation, OperationCapability, SysfsFeature};
+pub use sysfs::{
+    AccessCountRange, AccessPattern, Action, AgeRange, ByteSizeRange, Capabilities,
+    CapabilitySupport, ContextConfig, DamonConfig, DestinationConfig, FilterConfig, FilterLayer,
+    FilterPlacement, InitialRegionConfig, IntervalsGoalConfig, KdamondConfig,
+    ObservedConfiguration, Operation, OperationAttributesConfig, OperationCapability, ProbeConfig,
+    ProbeFilterConfig, ProbeFilterType, ProbePreparationAction, ProbePreparationConfig,
+    QuotaConfig, QuotaGoalConfig, QuotaGoalMetric, QuotaGoalTuner, QuotaWeights, RegionSizeRange,
+    SampleControlConfig, SampleFilterConfig, SampleFilterType, SamplePrimitivesConfig,
+    SchemeConfig, SchemeFilterType, SchemeStats, SysfsFeature, TargetConfig, WatermarkMetric,
+    WatermarksConfig, WritableConfigurationValue,
+};

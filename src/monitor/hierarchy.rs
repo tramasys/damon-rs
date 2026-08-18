@@ -1,11 +1,12 @@
 //! Multi-kdamond ownership and lifecycle management.
 
 use super::{
-    Capabilities, ConfigurationSnapshot, DamonAdmin, DamonConfig, Error, HierarchyRuntimeBatch,
-    Kdamond, KdamondCommand, KdamondState, ManagedKdamond, MonitoringIntervals, Pid,
-    QuotaGoalConfig, Result, SessionLock, StagedConfiguration, StagedOwnership,
-    ensure_hierarchy_stopped, restore_configuration, retry_busy, running_thread_pid,
-    stage_and_verify_configuration, with_rollback,
+    Capabilities, ConfigurationSnapshot, DamonAdmin, DamonConfig, Error, HierarchyReadBatch,
+    HierarchyRuntimeBatch, Kdamond, KdamondCommand, KdamondState, ManagedKdamond,
+    MonitoringIntervals, ObservedConfiguration, PathBuf, Pid, QuotaGoalConfig, Result, SessionLock,
+    StagedConfiguration, StagedOwnership, collect_writes, ensure_hierarchy_stopped,
+    restore_configuration, retry_busy, running_thread_pid, stage_and_verify_configuration,
+    with_rollback,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,6 +14,13 @@ enum KdamondSessionState {
     Staged,
     Running(Pid),
     UnidentifiedRunning,
+}
+
+pub(super) struct PersistentParts {
+    pub(super) configuration: ConfigurationSnapshot,
+    pub(super) volatile_paths: Box<[PathBuf]>,
+    pub(super) kdamond_count: usize,
+    pub(super) identities: Box<[(usize, Pid)]>,
 }
 
 /// A cooperatively exclusive, transactionally staged DAMON hierarchy.
@@ -27,7 +35,7 @@ enum KdamondSessionState {
 #[derive(Debug)]
 pub struct ManagedHierarchy {
     pub(super) admin: DamonAdmin,
-    previous: ConfigurationSnapshot,
+    previous: Option<ConfigurationSnapshot>,
     pub(super) staged: StagedOwnership,
     states: Box<[KdamondSessionState]>,
     _session_lock: SessionLock,
@@ -41,7 +49,7 @@ impl ManagedHierarchy {
         config: &DamonConfig,
         session_lock: SessionLock,
     ) -> Result<Self> {
-        let staged = StagedOwnership::new(staged_configuration.fingerprint, &admin, config);
+        let staged = StagedOwnership::new(staged_configuration.current, &admin, config);
         if let Err(operation) = staged.verify(&admin) {
             return Err(with_rollback(
                 operation,
@@ -50,7 +58,7 @@ impl ManagedHierarchy {
         }
         Ok(Self {
             admin,
-            previous: staged_configuration.previous,
+            previous: Some(staged_configuration.previous),
             staged,
             states: vec![KdamondSessionState::Staged; config.kdamonds.len()].into_boxed_slice(),
             _session_lock: session_lock,
@@ -91,6 +99,23 @@ impl ManagedHierarchy {
         self.verify_owned_state()?;
         let result = {
             let mut batch = HierarchyRuntimeBatch { hierarchy: self };
+            operation(&mut batch)
+        };
+        self.verify_owned_state()?;
+        result
+    }
+
+    /// Runs cached reads across kdamonds under one pair of ownership checks.
+    ///
+    /// Unlike [`Self::runtime_batch`], this requires only shared access and
+    /// exposes no kernel commands or configuration mutations.
+    pub fn read_batch<T>(
+        &self,
+        operation: impl FnOnce(&mut HierarchyReadBatch<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.verify_owned_state()?;
+        let result = {
+            let mut batch = HierarchyReadBatch { hierarchy: self };
             operation(&mut batch)
         };
         self.verify_owned_state()?;
@@ -247,6 +272,14 @@ impl ManagedHierarchy {
         Ok(configuration)
     }
 
+    /// Reads the known typed hierarchy and all writable values after verifying ownership.
+    pub fn observed_configuration(&self) -> Result<ObservedConfiguration> {
+        self.verify_owned_state()?;
+        let observation = retry_busy(|| self.admin.observed_configuration())?;
+        self.verify_owned_state()?;
+        Ok(observation)
+    }
+
     /// Transactionally updates selected running kdamonds.
     ///
     /// `config` describes the complete staged hierarchy. Unselected kdamonds
@@ -274,7 +307,13 @@ impl ManagedHierarchy {
         }
 
         self.verify_owned_state()?;
+        let previous_snapshot = retry_busy(|| self.admin.configuration_snapshot())?;
         let previous = retry_busy(|| self.admin.configuration())?;
+        if !retry_busy(|| previous_snapshot.matches_current_except(&self.staged.volatile_paths))? {
+            return Err(Error::OwnershipLost {
+                reason: "the running DAMON hierarchy changed while its rollback state was captured",
+            });
+        }
         self.verify_owned_state()?;
         let mut effective = config.clone();
         let mut comparable_previous = previous.clone();
@@ -295,12 +334,20 @@ impl ManagedHierarchy {
         }
         validate_obsolete_target_updates(&previous, &effective)?;
 
-        match self.stage_and_commit_running(&effective, Some(&previous), &selected) {
+        let (operation, writes) = collect_writes(|| {
+            self.stage_and_commit_running(&effective, Some(&previous), &selected)
+        });
+        match operation {
             Ok(staged) => {
                 self.staged = staged;
                 Ok(())
             }
-            Err(operation) => match self.stage_and_commit_running(&previous, None, &selected) {
+            Err(operation) => match self.restore_and_commit_running(
+                &previous_snapshot,
+                &previous,
+                &selected,
+                &writes,
+            ) {
                 Ok(staged) => {
                     self.staged = staged;
                     Err(operation)
@@ -325,10 +372,16 @@ impl ManagedHierarchy {
         self.expected_running_pid(kdamond_index)?;
 
         self.verify_owned_state()?;
+        let previous_snapshot = retry_busy(|| self.admin.configuration_snapshot())?;
         let quotas = self
             .scheme(kdamond_index, context_index, scheme_index)?
             .quotas();
         let mut quota = retry_busy(|| quotas.configuration())?;
+        if !retry_busy(|| previous_snapshot.matches_current_except(&self.staged.volatile_paths))? {
+            return Err(Error::OwnershipLost {
+                reason: "the running DAMON hierarchy changed while its rollback state was captured",
+            });
+        }
         self.verify_owned_state()?;
         let previous_goals = std::mem::replace(&mut quota.goals, goals.to_vec());
         quota.validate()?;
@@ -336,21 +389,23 @@ impl ManagedHierarchy {
             return Ok(());
         }
 
-        match self.stage_and_commit_quota_goals(
-            &quotas,
-            &quota.goals,
-            Some(&previous_goals),
-            kdamond_index,
-        ) {
+        let (operation, writes) = collect_writes(|| {
+            self.stage_and_commit_quota_goals(
+                &quotas,
+                &quota.goals,
+                Some(&previous_goals),
+                kdamond_index,
+            )
+        });
+        match operation {
             Ok(staged) => {
                 self.staged = staged;
                 Ok(())
             }
-            Err(operation) => match self.stage_and_commit_quota_goals(
-                &quotas,
-                &previous_goals,
-                Some(&quota.goals),
+            Err(operation) => match self.restore_and_commit_quota_goals(
+                &previous_snapshot,
                 kdamond_index,
+                &writes,
             ) {
                 Ok(staged) => {
                     self.staged = staged;
@@ -373,6 +428,70 @@ impl ManagedHierarchy {
 
     pub(super) fn kdamond(&self, index: usize) -> Kdamond {
         self.admin.kdamond(index)
+    }
+
+    pub(super) fn attach_persistent(
+        admin: DamonAdmin,
+        staged: StagedOwnership,
+        identities: &[(usize, Pid)],
+        session_lock: SessionLock,
+    ) -> Result<Self> {
+        staged.verify_complete(&admin)?;
+        let mut states = vec![KdamondSessionState::Staged; staged.kdamond_count()];
+        let mut previous_index = None;
+        for &(index, pid) in identities {
+            if index >= states.len() {
+                return Err(Error::InvalidReceipt {
+                    reason: "a running kdamond identity is outside the hierarchy",
+                });
+            }
+            if previous_index.is_some_and(|previous| previous >= index) {
+                return Err(Error::InvalidReceipt {
+                    reason: "running kdamond identities are not distinct and ordered",
+                });
+            }
+            states[index] = KdamondSessionState::Running(pid);
+            previous_index = Some(index);
+        }
+        let managed = Self {
+            admin,
+            previous: None,
+            staged,
+            states: states.into_boxed_slice(),
+            _session_lock: session_lock,
+            owns_hierarchy: true,
+        };
+        managed.verify_owned_state()?;
+        Ok(managed)
+    }
+
+    pub(super) fn persistent_parts(&self) -> Result<PersistentParts> {
+        self.verify_owned_state()?;
+        self.staged.verify_complete(&self.admin)?;
+        let identities = self
+            .states
+            .iter()
+            .enumerate()
+            .filter_map(|(index, state)| match state {
+                KdamondSessionState::Running(pid) => Some(Ok((index, *pid))),
+                KdamondSessionState::Staged => None,
+                KdamondSessionState::UnidentifiedRunning => Some(Err(Error::OwnershipLost {
+                    reason: "the kdamond started but its identity was not captured",
+                })),
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_boxed_slice();
+        Ok(PersistentParts {
+            configuration: self.staged.configuration.clone(),
+            volatile_paths: self.staged.volatile_paths.clone(),
+            kdamond_count: self.states.len(),
+            identities,
+        })
+    }
+
+    pub(super) fn disarm_cleanup(&mut self) {
+        self.previous = None;
+        self.owns_hierarchy = false;
     }
 
     pub(super) fn scheme(
@@ -424,13 +543,13 @@ impl ManagedHierarchy {
         self.staged.verify(&self.admin)?;
 
         match stage_and_verify_configuration(&self.admin, config, Some(&previous)) {
-            Ok(fingerprint) => {
-                self.staged = StagedOwnership::new(fingerprint, &self.admin, config);
+            Ok(current) => {
+                self.staged = StagedOwnership::new(current, &self.admin, config);
                 Ok(())
             }
             Err(operation) => match stage_and_verify_configuration(&self.admin, &previous, None) {
-                Ok(fingerprint) => {
-                    self.staged = StagedOwnership::new(fingerprint, &self.admin, &previous);
+                Ok(current) => {
+                    self.staged = StagedOwnership::new(current, &self.admin, &previous);
                     Err(operation)
                 }
                 Err(rollback) => Err(Error::Rollback {
@@ -494,12 +613,28 @@ impl ManagedHierarchy {
 
     pub(super) fn verify_running_identity_only(&self, kdamond_index: usize) -> Result<()> {
         self.validate_kdamond_index(kdamond_index)?;
+        let kdamond = self.kdamond(kdamond_index);
+        self.verify_running_identity_with(kdamond_index, &kdamond)
+    }
+
+    pub(super) fn verify_running_identity_with(
+        &self,
+        kdamond_index: usize,
+        kdamond: &Kdamond,
+    ) -> Result<()> {
         if self.admin.kdamond_count()? != self.states.len() {
             return Err(Error::OwnershipLost {
                 reason: "the staged kdamond count changed",
             });
         }
-        self.verify_running_identity_without_count(kdamond_index)
+        let expected = self.expected_running_pid(kdamond_index)?;
+        let current = retry_busy(|| kdamond.pid())?.ok_or(Error::NotRunning)?;
+        if current != expected {
+            return Err(Error::OwnershipLost {
+                reason: "the kdamond kernel-thread ID changed",
+            });
+        }
+        Ok(())
     }
 
     fn verify_running_identity_without_count(&self, kdamond_index: usize) -> Result<()> {
@@ -668,13 +803,50 @@ impl ManagedHierarchy {
                 });
             }
             self.verify_owned_identities_only()?;
-            let staged =
-                StagedOwnership::new(cleaned_snapshot.into_fingerprint(), &self.admin, &cleaned);
+            let staged = StagedOwnership::new(cleaned_snapshot, &self.admin, &cleaned);
             staged.verify(&self.admin)?;
             return Ok(staged);
         }
 
-        let staged = StagedOwnership::new(snapshot.into_fingerprint(), &self.admin, config);
+        let staged = StagedOwnership::new(snapshot, &self.admin, config);
+        staged.verify(&self.admin)?;
+        Ok(staged)
+    }
+
+    fn restore_and_commit_running(
+        &self,
+        snapshot: &ConfigurationSnapshot,
+        config: &DamonConfig,
+        selected: &[usize],
+        writes: &[PathBuf],
+    ) -> Result<StagedOwnership> {
+        self.verify_owned_identities_only()?;
+        if let Err(boundary) = self.verify_rollback_boundary(snapshot, writes) {
+            return Err(with_rollback(
+                boundary,
+                self.restore_written_and_commit_running(snapshot, writes, selected),
+            ));
+        }
+        let affected = snapshot.paths_affected_by_writes(writes);
+        retry_busy(|| snapshot.restore_paths_except(&affected, &self.staged.volatile_paths))?;
+        self.verify_owned_identities_only()?;
+        if !retry_busy(|| snapshot.matches_current_except(&self.staged.volatile_paths))? {
+            return Err(Error::OwnershipLost {
+                reason: "the running DAMON hierarchy changed during rollback",
+            });
+        }
+        for &index in selected {
+            self.verify_running_identity_only(index)?;
+            retry_busy(|| self.kdamond(index).command(&KdamondCommand::Commit))?;
+            self.verify_running_identity_only(index)?;
+        }
+        let current = retry_busy(|| self.admin.configuration_snapshot())?;
+        if !retry_busy(|| snapshot.matches_current_except(&self.staged.volatile_paths))? {
+            return Err(Error::OwnershipLost {
+                reason: "the running DAMON hierarchy changed after rollback commit",
+            });
+        }
+        let staged = StagedOwnership::new(current, &self.admin, config);
         staged.verify(&self.admin)?;
         Ok(staged)
     }
@@ -745,9 +917,90 @@ impl ManagedHierarchy {
         })?;
         self.verify_running_identity_only(kdamond_index)?;
 
-        let staged = self.staged.with_configuration(snapshot.into_fingerprint());
+        let staged = self.staged.with_configuration(snapshot);
         staged.verify(&self.admin)?;
         Ok(staged)
+    }
+
+    fn restore_and_commit_quota_goals(
+        &self,
+        snapshot: &ConfigurationSnapshot,
+        kdamond_index: usize,
+        writes: &[PathBuf],
+    ) -> Result<StagedOwnership> {
+        self.verify_owned_identities_only()?;
+        if let Err(boundary) = self.verify_rollback_boundary(snapshot, writes) {
+            return Err(with_rollback(
+                boundary,
+                self.restore_written_and_commit_quota_goals(snapshot, writes, kdamond_index),
+            ));
+        }
+        let affected = snapshot.paths_affected_by_writes(writes);
+        retry_busy(|| snapshot.restore_paths_except(&affected, &self.staged.volatile_paths))?;
+        self.verify_running_identity_only(kdamond_index)?;
+        retry_busy(|| {
+            self.kdamond(kdamond_index)
+                .command(&KdamondCommand::CommitSchemesQuotaGoals)
+        })?;
+        self.verify_running_identity_only(kdamond_index)?;
+        if !retry_busy(|| snapshot.matches_current_except(&self.staged.volatile_paths))? {
+            return Err(Error::OwnershipLost {
+                reason: "the running DAMON hierarchy changed after quota-goal rollback",
+            });
+        }
+        let current = retry_busy(|| self.admin.configuration_snapshot())?;
+        let staged = self.staged.with_configuration(current);
+        staged.verify(&self.admin)?;
+        Ok(staged)
+    }
+
+    fn restore_written_and_commit_running(
+        &self,
+        snapshot: &ConfigurationSnapshot,
+        writes: &[PathBuf],
+        selected: &[usize],
+    ) -> Result<()> {
+        let affected = snapshot.paths_affected_by_writes(writes);
+        retry_busy(|| snapshot.restore_paths_except(&affected, &self.staged.volatile_paths))?;
+        for &index in selected {
+            self.verify_running_identity_only(index)?;
+            retry_busy(|| self.kdamond(index).command(&KdamondCommand::Commit))?;
+            self.verify_running_identity_only(index)?;
+        }
+        Ok(())
+    }
+
+    fn restore_written_and_commit_quota_goals(
+        &self,
+        snapshot: &ConfigurationSnapshot,
+        writes: &[PathBuf],
+        kdamond_index: usize,
+    ) -> Result<()> {
+        let affected = snapshot.paths_affected_by_writes(writes);
+        retry_busy(|| snapshot.restore_paths_except(&affected, &self.staged.volatile_paths))?;
+        self.verify_running_identity_only(kdamond_index)?;
+        retry_busy(|| {
+            self.kdamond(kdamond_index)
+                .command(&KdamondCommand::CommitSchemesQuotaGoals)
+        })?;
+        self.verify_running_identity_only(kdamond_index)
+    }
+
+    fn verify_rollback_boundary(
+        &self,
+        snapshot: &ConfigurationSnapshot,
+        writes: &[PathBuf],
+    ) -> Result<()> {
+        let mut allowed = snapshot.paths_affected_by_writes(writes);
+        allowed.extend(self.staged.volatile_paths.iter().cloned());
+        allowed.sort_unstable();
+        allowed.dedup();
+        if !retry_busy(|| snapshot.matches_current_except(&allowed))? {
+            return Err(Error::OwnershipLost {
+                reason: "an unrelated writable value changed during the transaction",
+            });
+        }
+        Ok(())
     }
 
     fn verify_owned_identities_only(&self) -> Result<()> {
@@ -809,8 +1062,11 @@ impl ManagedHierarchy {
         }
         self.stop_all()?;
         self.staged.verify(&self.admin)?;
-        if !retry_busy(|| self.previous.matches_current())? {
-            restore_configuration(&self.admin, &self.previous)?;
+        let previous = self.previous.as_ref().ok_or(Error::OwnershipLost {
+            reason: "the managed hierarchy has no restoration snapshot",
+        })?;
+        if !retry_busy(|| previous.matches_current())? {
+            restore_configuration(&self.admin, previous)?;
         }
         self.owns_hierarchy = false;
         Ok(())
@@ -948,6 +1204,8 @@ fn normalize_running_tuned_intervals(
 
 impl Drop for ManagedHierarchy {
     fn drop(&mut self) {
-        let _ = self.close_inner();
+        if self.previous.is_some() {
+            let _ = self.close_inner();
+        }
     }
 }

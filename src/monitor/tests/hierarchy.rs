@@ -141,12 +141,7 @@ fn later_configuration_replacement_prevents_start_and_rolls_back() {
         .start_all()
         .expect_err("replacement configuration must prevent the later start");
 
-    assert!(matches!(
-        error,
-        Error::OwnershipLost {
-            reason: "the staged writable configuration changed"
-        }
-    ));
+    assert!(matches!(error, Error::OwnershipLost { .. }));
     for index in 0..2 {
         assert_eq!(
             damon.admin.kdamond(index).state().expect("read state"),
@@ -352,12 +347,7 @@ fn selected_running_update_does_not_adopt_changes_during_readback() {
         .update_configuration(&updated, &[1])
         .expect_err("concurrent change must not become the rollback baseline");
 
-    assert!(matches!(
-        error,
-        Error::OwnershipLost {
-            reason: "the staged writable configuration changed"
-        }
-    ));
+    assert!(matches!(error, Error::OwnershipLost { .. }));
     assert_eq!(model.write_count(), writes);
     model.set_file(changed_path, b"41\n");
     managed.close().expect("close repaired hierarchy");

@@ -2,12 +2,12 @@
 
 use super::{
     AddressUnit, Capabilities, DEFAULT_SESSION_LOCK_PATH, DamonAdmin, DamonConfig, Error,
-    FvaddrSessionBuilder, KdamondCommand, ManagedHierarchy, MonitorBuilder, PaddrSessionBuilder,
-    Path, PathBuf, Pid, QuotaGoalConfig, RawSnapshot, Result, RuntimeBatch, SchemeStats,
-    SessionLock, StagedConfiguration, VaddrSessionBuilder, WorkflowOptions,
-    ensure_hierarchy_stopped, replaceable_configuration_read_error, restore_after_capability_probe,
-    restore_configuration, retry_busy, stage_and_verify_configuration, stage_capability_probe,
-    with_rollback,
+    FvaddrSessionBuilder, KdamondCommand, ManagedHierarchy, MonitorBuilder, ObservedConfiguration,
+    PaddrSessionBuilder, Path, PathBuf, Pid, QuotaGoalConfig, RawSnapshot, Result, RuntimeBatch,
+    RuntimeReadBatch, SchemeStats, SessionLock, StagedConfiguration, VaddrSessionBuilder,
+    WorkflowOptions, ensure_hierarchy_stopped, replaceable_configuration_read_error,
+    restore_after_capability_probe, restore_configuration, retry_busy,
+    stage_and_verify_configuration, stage_capability_probe, with_rollback,
 };
 
 /// Entry point for high-level DAMON monitoring.
@@ -39,11 +39,19 @@ impl Damon {
     /// Cooperating controllers must use the same lock path. The lock is
     /// advisory because the kernel DAMON sysfs ABI has no ownership primitive.
     /// The lock file's parent directory should be trusted and non-writable by
-    /// unprivileged users on a production system.
+    /// unprivileged users on a production system. Both paths must be absolute.
     pub fn at_with_lock(path: impl AsRef<Path>, lock_path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let lock_path = lock_path.as_ref();
+        if !path.is_absolute() || !lock_path.is_absolute() {
+            return Err(Error::InvalidConfiguration {
+                field: "high-level DAMON paths",
+                reason: "admin and advisory lock paths must be absolute",
+            });
+        }
         Ok(Self {
             admin: DamonAdmin::open(path)?,
-            lock_path: lock_path.as_ref().to_path_buf(),
+            lock_path: lock_path.to_path_buf(),
         })
     }
 
@@ -122,6 +130,15 @@ impl Damon {
         )
     }
 
+    /// Reads the known typed hierarchy and every writable configuration value.
+    ///
+    /// This acquires the cooperative lock for the complete observation but
+    /// cannot exclude controllers that ignore that lock.
+    pub fn observed_configuration(&self) -> Result<ObservedConfiguration> {
+        let _session_lock = SessionLock::acquire(&self.lock_path)?;
+        retry_busy(|| self.admin.observed_configuration())
+    }
+
     /// Stages a complete configuration and retains exclusive cooperative
     /// ownership until the returned session is closed or dropped.
     ///
@@ -170,17 +187,14 @@ impl Damon {
             .is_some_and(|observed| config.equivalent_after_kernel_normalization(observed))
         {
             return Ok(StagedConfiguration {
-                fingerprint: previous.fingerprint(),
+                current: previous.clone(),
                 previous,
             });
         }
 
         let operation = stage_and_verify_configuration(&self.admin, config, observed.as_ref());
         match operation {
-            Ok(fingerprint) => Ok(StagedConfiguration {
-                previous,
-                fingerprint,
-            }),
+            Ok(current) => Ok(StagedConfiguration { previous, current }),
             Err(operation) => Err(with_rollback(
                 operation,
                 restore_configuration(&self.admin, &previous),
@@ -266,6 +280,11 @@ impl ExclusiveSession {
     /// Reads the complete staged configuration after verifying ownership.
     pub fn configuration(&self) -> Result<DamonConfig> {
         self.managed.configuration()
+    }
+
+    /// Reads the known typed hierarchy and all writable values after verification.
+    pub fn observed_configuration(&self) -> Result<ObservedConfiguration> {
+        self.managed.observed_configuration()
     }
 
     /// Discovers capabilities for a staged context and scheme without mutation.
@@ -476,6 +495,17 @@ impl ExclusiveSession {
         operation: impl FnOnce(&mut RuntimeBatch<'_>) -> Result<T>,
     ) -> Result<T> {
         self.managed.runtime(0)?.runtime_batch(operation)
+    }
+
+    /// Runs cached reads under one pair of complete ownership checks.
+    pub fn read_batch<T>(
+        &self,
+        operation: impl FnOnce(&mut RuntimeReadBatch<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.managed.read_batch(|hierarchy| {
+            let mut kdamond = hierarchy.kdamond(0)?;
+            operation(&mut kdamond)
+        })
     }
 
     /// Refreshes auto-tuned interval values for the running kdamond.

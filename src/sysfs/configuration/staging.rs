@@ -522,22 +522,22 @@ impl Scheme {
                 || read_u64(&path.join("sz_ops_filter_passed")),
             )?,
             quota_exceeds: read_u64(&path.join("qt_exceeds"))?,
-            snapshots: optional_read(&path.join("nr_snapshots"), || {
+            application_snapshots: optional_read(&path.join("nr_snapshots"), || {
                 read_u64(&path.join("nr_snapshots"))
             })?,
-            maximum_snapshots: optional_read(&path.join("max_nr_snapshots"), || {
+            application_snapshot_limit: optional_read(&path.join("max_nr_snapshots"), || {
                 read_u64(&path.join("max_nr_snapshots"))
             })?,
         })
     }
 
-    /// Reads the configured maximum number of retained snapshots.
-    pub fn maximum_snapshots(&self) -> Result<u64> {
+    /// Reads the snapshot count that deactivates further scheme application.
+    pub fn application_snapshot_limit(&self) -> Result<u64> {
         read_u64(&self.path.join("stats/max_nr_snapshots"))
     }
 
-    /// Sets the maximum number of retained snapshots.
-    pub fn set_maximum_snapshots(&self, value: u64) -> Result<()> {
+    /// Sets the snapshot count that deactivates further scheme application.
+    pub fn set_application_snapshot_limit(&self, value: u64) -> Result<()> {
         write_value(&self.path.join("stats/max_nr_snapshots"), value)
     }
 
@@ -559,9 +559,10 @@ impl Scheme {
             watermarks: self.watermarks().configuration()?,
             filters,
             destinations: self.read_destinations()?,
-            maximum_snapshots: optional_read(&self.path.join("stats/max_nr_snapshots"), || {
-                self.maximum_snapshots()
-            })?
+            application_snapshot_limit: optional_read(
+                &self.path.join("stats/max_nr_snapshots"),
+                || self.application_snapshot_limit(),
+            )?
             .unwrap_or(0),
         })
     }
@@ -662,15 +663,15 @@ impl Scheme {
             }
         }
         if needs_stage(
-            observed.map(|value| &value.maximum_snapshots),
-            &config.maximum_snapshots,
+            observed.map(|value| &value.application_snapshot_limit),
+            &config.application_snapshot_limit,
         ) {
             stage_optional_default(
                 &self.path.join("stats/max_nr_snapshots"),
-                &config.maximum_snapshots,
+                &config.application_snapshot_limit,
                 &0,
-                "DAMOS maximum snapshot count",
-                || self.set_maximum_snapshots(config.maximum_snapshots),
+                "DAMOS application snapshot limit",
+                || self.set_application_snapshot_limit(config.application_snapshot_limit),
             )?;
         }
         Ok(())

@@ -67,7 +67,7 @@ fn owned_linux_7_2_configuration_round_trips_every_input() {
         node_id: 3,
         weight: 17,
     }];
-    scheme.maximum_snapshots = 64;
+    scheme.application_snapshot_limit = 64;
 
     let mut context = ContextConfig::new(Operation::VirtualAddress);
     context.address_unit = AddressUnit::ONE;
@@ -100,6 +100,20 @@ fn owned_linux_7_2_configuration_round_trips_every_input() {
         .configuration()
         .expect("read complete configuration");
     assert_kdamond_configs_equivalent(config, observed);
+}
+
+#[test]
+fn byte_range_constructors_make_rounding_policy_explicit() {
+    let unit = AddressUnit::new(4_096).expect("valid unit");
+    assert_eq!(
+        InitialRegionConfig::from_byte_range_exact(4_096, 12_288, unit).expect("exact range"),
+        InitialRegionConfig::new(1, 3).expect("raw range")
+    );
+    assert!(InitialRegionConfig::from_byte_range_exact(1, 4_096, unit).is_err());
+    assert_eq!(
+        InitialRegionConfig::from_byte_range_covering(1, 4_097, unit).expect("covering range"),
+        InitialRegionConfig::new(0, 2).expect("raw range")
+    );
 }
 
 #[test]
@@ -435,8 +449,8 @@ fn owned_configuration_preserves_absent_optional_attributes() {
     assert!(context_config.schemes[0].destinations.is_empty());
     let stats = context.scheme(0).stats().expect("read legacy scheme stats");
     assert_eq!(stats.operations_filter_passed_units, None);
-    assert_eq!(stats.snapshots, None);
-    assert_eq!(stats.maximum_snapshots, None);
+    assert_eq!(stats.application_snapshots, None);
+    assert_eq!(stats.application_snapshot_limit, None);
     kdamond
         .stage_configuration(&config)
         .expect("restage configuration without unavailable attributes");

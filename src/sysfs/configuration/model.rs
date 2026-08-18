@@ -8,6 +8,7 @@ use super::{
     validate_required_path, validate_scaled_initial_regions, validate_sysfs_string, validate_token,
 };
 use std::fmt;
+use std::str::FromStr;
 
 pub(super) const KERNEL_INDEX_MAX: usize = i32::MAX as usize;
 pub(super) const MAX_EAGER_READ_CAPACITY: usize = 4_096;
@@ -59,6 +60,15 @@ macro_rules! kernel_string_enum {
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str(self.kernel_name())
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = Error;
+
+            fn from_str(value: &str) -> Result<Self> {
+                validate_token("kernel enum value", value)?;
+                Ok(Self::parse(value))
             }
         }
 

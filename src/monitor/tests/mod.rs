@@ -12,6 +12,7 @@ use crate::sysfs::{
 
 mod hierarchy;
 mod ownership;
+mod persistent;
 mod runtime;
 mod session;
 mod workflow;
@@ -86,7 +87,7 @@ fn exercise_session_runtime(model: &Model, session: &mut ExclusiveSession) {
     let stats = session.scheme_stats(0, 0).expect("read scheme stats");
     assert_eq!(stats.regions_tried, 3);
     assert_eq!(stats.size_applied_units, 8_192);
-    assert_eq!(stats.snapshots, Some(9));
+    assert_eq!(stats.application_snapshots, Some(9));
     let snapshot = session.tried_regions(0, 0, 1).expect("read tried regions");
     assert_eq!(snapshot.len(), 1);
     assert_eq!(snapshot.total_units(), 4_096);

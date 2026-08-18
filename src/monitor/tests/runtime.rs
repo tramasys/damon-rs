@@ -479,6 +479,77 @@ fn quota_goal_update_handles_count_changes_without_full_configuration_rebuilds()
 }
 
 #[test]
+fn running_count_change_rollback_restores_unknown_writable_values() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let config = transaction_config(42, Action::Stat);
+    damon
+        .stage_configuration(&config)
+        .expect("stage preceding hierarchy");
+    let future_attribute = "kdamonds/0/contexts/0/targets/0/future_target_attribute";
+    model.set_file(future_attribute, b"preserve\n");
+    let mut session = damon.exclusive_session(&config).expect("stage session");
+    session.start().expect("start session");
+    let mut updated = config.clone();
+    updated.kdamonds[0].contexts[0]
+        .targets
+        .push(TargetConfig::for_pid(Pid::new(43).expect("valid pid")));
+    model.fail_next_write("kdamonds/0/state", 22);
+
+    let error = session
+        .update_configuration(&updated)
+        .expect_err("failed commit must roll back the reconstructed targets");
+
+    assert!(matches!(error, Error::Io { .. }));
+    assert_eq!(
+        session.configuration().expect("read rolled back hierarchy"),
+        config
+    );
+    assert_eq!(model.value(future_attribute).as_deref(), Some("preserve"));
+    session.close().expect("close session");
+}
+
+#[test]
+fn quota_goal_count_rollback_restores_unknown_writable_values() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut config = transaction_config(42, Action::Stat);
+    config.kdamonds[0].contexts[0].schemes[0]
+        .quota
+        .reset_interval = Duration::from_secs(1);
+    config.kdamonds[0].contexts[0].schemes[0]
+        .quota
+        .goals
+        .push(QuotaGoalConfig::new(QuotaGoalMetric::UserInput, 100));
+    damon
+        .stage_configuration(&config)
+        .expect("stage preceding hierarchy");
+    let future_attribute = "kdamonds/0/contexts/0/schemes/0/quotas/goals/0/future_goal_attribute";
+    model.set_file(future_attribute, b"preserve\n");
+    let mut session = damon.exclusive_session(&config).expect("stage session");
+    session.start().expect("start session");
+    let goals = [
+        QuotaGoalConfig::new(QuotaGoalMetric::UserInput, 100),
+        QuotaGoalConfig::new(QuotaGoalMetric::UserInput, 200),
+    ];
+    model.fail_next_write("kdamonds/0/state", 22);
+
+    let error = session
+        .update_scheme_quota_goals(0, 0, &goals)
+        .expect_err("failed commit must roll back reconstructed goals");
+
+    assert!(matches!(error, Error::Io { .. }));
+    assert_eq!(
+        session.configuration().expect("read rolled back hierarchy"),
+        config
+    );
+    assert_eq!(model.value(future_attribute).as_deref(), Some("preserve"));
+    session.close().expect("close session");
+}
+
+#[test]
 fn cached_tried_results_do_not_issue_refresh_commands() {
     let model = Model::new("vaddr\n");
     configure_runtime_results(&model);

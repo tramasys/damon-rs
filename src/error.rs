@@ -92,6 +92,13 @@ pub enum Error {
         /// The number of bytes per address unit.
         unit_bytes: u64,
     },
+    /// Converting bytes to DAMON core units would require rounding.
+    AddressConversionInexact {
+        /// Byte count that cannot be represented exactly.
+        bytes: u64,
+        /// Number of bytes per address unit.
+        unit_bytes: u64,
+    },
     /// A requested indexed sysfs child is not currently staged.
     IndexOutOfBounds {
         /// The kind of indexed child.
@@ -105,6 +112,30 @@ pub enum Error {
     SessionLockBusy {
         /// The advisory lock file.
         path: PathBuf,
+    },
+    /// A persistent lifecycle receipt is malformed or uses an unsupported version.
+    InvalidReceipt {
+        /// Why the receipt cannot be used.
+        reason: &'static str,
+    },
+    /// A receipt does not describe the selected DAMON instance.
+    ReceiptMismatch {
+        /// Which receipt binding did not match.
+        reason: &'static str,
+    },
+    /// A background snapshot worker could not be created.
+    SnapshotWorkerSpawn {
+        /// The underlying thread creation error.
+        source: io::Error,
+    },
+    /// A background snapshot worker terminated without returning the monitor.
+    SnapshotWorkerDisconnected,
+    /// A persistent mutation completed or failed but its resulting state could not be verified.
+    PersistentStateUncertain {
+        /// The mutation error, or `None` when the mutation itself succeeded.
+        operation: Option<Box<Error>>,
+        /// The error encountered while refreshing the receipt.
+        verification: Box<Error>,
     },
     /// The high-level session can no longer prove ownership of its sysfs slot.
     OwnershipLost {
@@ -200,6 +231,10 @@ impl fmt::Display for Error {
                 formatter,
                 "DAMON address conversion overflows u64 ({units} units at {unit_bytes} bytes each)"
             ),
+            Self::AddressConversionInexact { bytes, unit_bytes } => write!(
+                formatter,
+                "DAMON address conversion is inexact ({bytes} bytes at {unit_bytes} bytes per unit)"
+            ),
             Self::IndexOutOfBounds { kind, index, count } => write!(
                 formatter,
                 "DAMON {kind} index {index} is out of bounds for {count} staged children"
@@ -209,6 +244,46 @@ impl fmt::Display for Error {
                 "another DAMON session holds the advisory lock {}",
                 path.display()
             ),
+            error @ (Self::InvalidReceipt { .. }
+            | Self::ReceiptMismatch { .. }
+            | Self::SnapshotWorkerSpawn { .. }
+            | Self::SnapshotWorkerDisconnected
+            | Self::PersistentStateUncertain { .. }
+            | Self::OwnershipLost { .. }
+            | Self::Io { .. }
+            | Self::Rollback { .. }) => error.fmt_operational(formatter),
+        }
+    }
+}
+
+impl Error {
+    fn fmt_operational(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidReceipt { reason } => {
+                write!(formatter, "invalid DAMON persistent receipt: {reason}")
+            }
+            Self::ReceiptMismatch { reason } => write!(
+                formatter,
+                "DAMON persistent receipt does not match: {reason}"
+            ),
+            Self::SnapshotWorkerSpawn { source } => {
+                write!(formatter, "failed to spawn DAMON snapshot worker: {source}")
+            }
+            Self::SnapshotWorkerDisconnected => formatter
+                .write_str("DAMON snapshot worker terminated without returning its monitor"),
+            Self::PersistentStateUncertain {
+                operation,
+                verification,
+            } => match operation {
+                Some(operation) => write!(
+                    formatter,
+                    "persistent DAMON operation failed ({operation}) and its resulting state could not be verified ({verification})"
+                ),
+                None => write!(
+                    formatter,
+                    "persistent DAMON operation completed but its resulting state could not be verified ({verification})"
+                ),
+            },
             Self::OwnershipLost { reason } => {
                 write!(formatter, "DAMON session ownership was lost: {reason}")
             }
@@ -228,11 +303,10 @@ impl fmt::Display for Error {
                 formatter,
                 "DAMON operation failed ({operation}); restoring the prior state also failed ({rollback})"
             ),
+            _ => unreachable!("only operational errors use this formatter"),
         }
     }
-}
 
-impl Error {
     /// Returns whether this error represents Linux `EBUSY`.
     #[must_use]
     pub fn is_resource_busy(&self) -> bool {
@@ -248,8 +322,14 @@ impl Error {
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
+            Self::Io { source, .. } | Self::SnapshotWorkerSpawn { source } => Some(source),
             Self::Rollback { operation, .. } => Some(operation),
+            Self::PersistentStateUncertain {
+                operation,
+                verification,
+            } => operation
+                .as_deref()
+                .map_or(Some(verification.as_ref()), |error| Some(error)),
             _ => None,
         }
     }

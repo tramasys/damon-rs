@@ -1,6 +1,53 @@
 use super::*;
 
 #[test]
+fn observations_pair_typed_configuration_with_future_writable_values() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let config = transaction_config(42, Action::Stat);
+    damon
+        .stage_configuration(&config)
+        .expect("stage configuration");
+    let future_path = "kdamonds/0/contexts/0/future_configuration_input";
+    model.set_file(future_path, b"future-value\n");
+
+    let observation = damon.observed_configuration().expect("observe hierarchy");
+
+    assert_eq!(observation.configuration(), &config);
+    let future = observation
+        .writable_values()
+        .iter()
+        .find(|value| value.path() == Path::new(future_path))
+        .expect("future writable value");
+    assert_eq!(future.value(), "future-value");
+}
+
+#[test]
+fn observations_reject_new_writable_paths_that_appear_during_the_read() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let config = transaction_config(42, Action::Stat);
+    damon
+        .stage_configuration(&config)
+        .expect("stage configuration");
+    model.after_next_read(
+        "kdamonds/nr_kdamonds",
+        vec![Mutation::SetFile {
+            path: "kdamonds/0/contexts/0/new_future_input".into(),
+            value: b"appeared\n".to_vec(),
+        }],
+    );
+
+    let error = damon
+        .observed_configuration()
+        .expect_err("a changing writable file set must invalidate the observation");
+
+    assert!(matches!(error, Error::OwnershipLost { .. }));
+}
+
+#[test]
 fn busy_operations_are_retried() {
     let mut attempts = 0;
     let value = retry_busy(|| {

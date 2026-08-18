@@ -224,8 +224,8 @@ fn assert_typed_scheme_output(first: &Scheme, second: &Scheme) {
             size_applied_units: 4,
             operations_filter_passed_units: Some(5),
             quota_exceeds: 6,
-            snapshots: Some(7),
-            maximum_snapshots: Some(19),
+            application_snapshots: Some(7),
+            application_snapshot_limit: Some(19),
         }
     );
     assert_eq!(

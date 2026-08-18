@@ -277,6 +277,6 @@ fn first_scheme_difference(base: &str, expected: &SchemeConfig, observed: &Schem
     field!("watermarks", watermarks);
     field!("filters", filters);
     field!("dests", destinations);
-    field!("stats/max_nr_snapshots", maximum_snapshots);
+    field!("stats/max_nr_snapshots", application_snapshot_limit);
     configuration_mismatch(base.to_owned(), expected, observed)
 }

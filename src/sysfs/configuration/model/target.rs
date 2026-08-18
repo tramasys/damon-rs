@@ -1,8 +1,8 @@
 //! Target, probe, and sampling configuration values.
 
 use super::{
-    Pid, ProbeFilterType, ProbePreparationAction, Result, SampleFilterType, invalid, invalid_const,
-    validate_count, validate_required_path, validate_sysfs_string, validate_token,
+    AddressUnit, Pid, ProbeFilterType, ProbePreparationAction, Result, SampleFilterType, invalid,
+    invalid_const, validate_count, validate_required_path, validate_sysfs_string, validate_token,
 };
 
 /// An initial target address range in DAMON core address units.
@@ -25,6 +25,33 @@ impl InitialRegionConfig {
             );
         }
         Ok(Self { start, end })
+    }
+
+    /// Creates a region from byte boundaries that are exactly representable in `unit`.
+    pub fn from_byte_range_exact(
+        start_bytes: u64,
+        end_bytes: u64,
+        unit: AddressUnit,
+    ) -> Result<Self> {
+        Self::new(
+            unit.units_from_bytes_exact(start_bytes)?,
+            unit.units_from_bytes_exact(end_bytes)?,
+        )
+    }
+
+    /// Creates the smallest core-unit region covering a non-empty byte range.
+    pub fn from_byte_range_covering(
+        start_bytes: u64,
+        end_bytes: u64,
+        unit: AddressUnit,
+    ) -> Result<Self> {
+        if start_bytes >= end_bytes {
+            return invalid_const(
+                "initial byte region",
+                "start must be less than the exclusive end",
+            );
+        }
+        Self::new(unit.floor_units(start_bytes), unit.ceil_units(end_bytes))
     }
 }
 

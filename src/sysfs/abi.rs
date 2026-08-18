@@ -1,6 +1,9 @@
 use std::fmt;
+use std::str::FromStr;
 
 use crate::{AddressUnit, Error, Result};
+
+use super::configuration::validate_token;
 
 /// A DAMON monitoring operations set.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -41,6 +44,15 @@ impl Operation {
 impl fmt::Display for Operation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.kernel_name())
+    }
+}
+
+impl FromStr for Operation {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        validate_token("monitoring operation", value)?;
+        Ok(Self::parse(value))
     }
 }
 
@@ -92,6 +104,27 @@ impl KdamondCommand {
     }
 }
 
+impl FromStr for KdamondCommand {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        validate_token("kdamond command", value)?;
+        Ok(match value {
+            "on" => Self::On,
+            "off" => Self::Off,
+            "commit" => Self::Commit,
+            "commit_schemes_quota_goals" => Self::CommitSchemesQuotaGoals,
+            "update_schemes_stats" => Self::UpdateSchemesStats,
+            "update_schemes_tried_bytes" => Self::UpdateSchemesTriedBytes,
+            "update_schemes_tried_regions" => Self::UpdateSchemesTriedRegions,
+            "clear_schemes_tried_regions" => Self::ClearSchemesTriedRegions,
+            "update_schemes_effective_quotas" => Self::UpdateSchemesEffectiveQuotas,
+            "update_tuned_intervals" => Self::UpdateTunedIntervals,
+            other => Self::Unknown(other.into()),
+        })
+    }
+}
+
 /// Current state reported by a kdamond.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -102,6 +135,37 @@ pub enum KdamondState {
     Off,
     /// A state introduced by a newer kernel.
     Unknown(Box<str>),
+}
+
+impl KdamondState {
+    /// Returns the state string used by the kernel ABI.
+    #[must_use]
+    pub fn kernel_name(&self) -> &str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Unknown(state) => state,
+        }
+    }
+}
+
+impl fmt::Display for KdamondState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.kernel_name())
+    }
+}
+
+impl FromStr for KdamondState {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        validate_token("kdamond state", value)?;
+        Ok(match value {
+            "on" => Self::On,
+            "off" => Self::Off,
+            other => Self::Unknown(other.into()),
+        })
+    }
 }
 
 /// A DAMOS action.
@@ -183,6 +247,15 @@ impl Action {
 impl fmt::Display for Action {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.kernel_name())
+    }
+}
+
+impl FromStr for Action {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        validate_token("DAMOS action", value)?;
+        Ok(Self::parse(value))
     }
 }
 
@@ -426,5 +499,14 @@ impl ProbeFilterType {
 impl fmt::Display for ProbeFilterType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.kernel_name())
+    }
+}
+
+impl FromStr for ProbeFilterType {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        validate_token("monitoring probe filter type", value)?;
+        Ok(Self::parse(value))
     }
 }

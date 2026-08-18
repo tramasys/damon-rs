@@ -8,7 +8,7 @@ use super::{
 
 pub(super) struct StagedConfiguration {
     pub(super) previous: ConfigurationSnapshot,
-    pub(super) fingerprint: ConfigurationFingerprint,
+    pub(super) current: ConfigurationSnapshot,
 }
 
 pub(super) fn replaceable_configuration_read_error(error: &Error) -> bool {
@@ -22,7 +22,7 @@ pub(super) fn stage_and_verify_configuration(
     admin: &DamonAdmin,
     config: &DamonConfig,
     observed: Option<&DamonConfig>,
-) -> Result<ConfigurationFingerprint> {
+) -> Result<ConfigurationSnapshot> {
     retry_busy(|| {
         ensure_hierarchy_stopped(admin)?;
         admin.stage_validated_configuration_from(config, observed)
@@ -40,7 +40,7 @@ pub(super) fn stage_and_verify_configuration(
         });
     }
     retry_busy(|| ensure_hierarchy_stopped(admin))?;
-    Ok(staged.into_fingerprint())
+    Ok(staged)
 }
 
 pub(super) fn restore_configuration(
@@ -138,14 +138,18 @@ pub(super) fn restore_after_capability_probe(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct StagedOwnership {
-    pub(super) configuration: ConfigurationFingerprint,
+    pub(super) configuration: ConfigurationSnapshot,
     pub(super) volatile_paths: Box<[PathBuf]>,
     kdamond_count: usize,
 }
 
 impl StagedOwnership {
+    pub(super) const fn kdamond_count(&self) -> usize {
+        self.kdamond_count
+    }
+
     pub(super) fn new(
-        configuration: ConfigurationFingerprint,
+        configuration: ConfigurationSnapshot,
         admin: &DamonAdmin,
         config: &DamonConfig,
     ) -> Self {
@@ -172,6 +176,20 @@ impl StagedOwnership {
         }
     }
 
+    pub(super) fn from_parts(
+        configuration: ConfigurationSnapshot,
+        mut volatile_paths: Vec<PathBuf>,
+        kdamond_count: usize,
+    ) -> Self {
+        volatile_paths.sort_unstable();
+        volatile_paths.dedup();
+        Self {
+            configuration,
+            volatile_paths: volatile_paths.into_boxed_slice(),
+            kdamond_count,
+        }
+    }
+
     pub(super) fn verify(&self, admin: &DamonAdmin) -> Result<()> {
         self.verify_count(admin)?;
         if !self
@@ -180,6 +198,19 @@ impl StagedOwnership {
         {
             return Err(Error::OwnershipLost {
                 reason: "the staged writable configuration changed",
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_complete(&self, admin: &DamonAdmin) -> Result<()> {
+        self.verify_count(admin)?;
+        if !self
+            .configuration
+            .matches_complete_current_except(&self.volatile_paths)?
+        {
+            return Err(Error::OwnershipLost {
+                reason: "the complete staged writable hierarchy changed",
             });
         }
         Ok(())
@@ -211,7 +242,7 @@ impl StagedOwnership {
         Ok(())
     }
 
-    pub(super) fn with_configuration(&self, configuration: ConfigurationFingerprint) -> Self {
+    pub(super) fn with_configuration(&self, configuration: ConfigurationSnapshot) -> Self {
         Self {
             configuration,
             volatile_paths: self.volatile_paths.clone(),
