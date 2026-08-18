@@ -466,12 +466,15 @@ impl ExclusiveSession {
     /// Transactionally stages and commits a changed running configuration.
     ///
     /// The requested hierarchy must still contain this session's one runnable
-    /// kdamond. On failure, the method stages and commits the preceding owned
-    /// configuration before returning the error. Controllers that ignore the
-    /// advisory lock can still interfere because sysfs has no ownership or
-    /// atomic-commit primitive.
+    /// kdamond. Obsolete targets must match the preceding target at the same
+    /// index. Their one-shot markers are removed from the staged hierarchy
+    /// after a successful commit, and scheme target-filter indexes refer to the
+    /// retained post-commit target list. On failure, the method stages and
+    /// commits the preceding owned configuration before returning the error.
+    /// Controllers that ignore the advisory lock can still interfere because
+    /// sysfs has no ownership or atomic-commit primitive.
     pub fn update_configuration(&mut self, config: &DamonConfig) -> Result<()> {
-        config.validate_runnable()?;
+        config.validate_running_update()?;
         if config.kdamonds.len() != 1 {
             return Err(Error::InvalidConfiguration {
                 field: "exclusive session kdamond count",
@@ -481,6 +484,7 @@ impl ExclusiveSession {
         self.verify_running()?;
         let previous = retry_busy(|| self.admin.configuration())?;
         self.verify_running()?;
+        validate_obsolete_target_updates(&previous, config)?;
 
         match self.stage_and_commit_running(config, Some(&previous)) {
             Ok(staged) => {
@@ -724,6 +728,36 @@ impl ExclusiveSession {
         self.verify_running_identity_only()?;
         retry_busy(|| self.kdamond.command(&KdamondCommand::Commit))?;
         self.verify_running_identity_only()?;
+
+        if contains_obsolete_targets(config) {
+            let cleaned = without_obsolete_targets(config);
+            retry_busy(|| {
+                self.verify_running_identity_only()?;
+                self.admin
+                    .stage_validated_configuration_from(&cleaned, Some(config))
+            })?;
+            self.verify_running_identity_only()?;
+            let cleaned_snapshot = retry_busy(|| self.admin.configuration_snapshot())?;
+            let mut cleaned_staged_config = retry_busy(|| self.admin.configuration())?;
+            normalize_running_tuned_intervals(&cleaned, Some(config), &mut cleaned_staged_config)?;
+            if let Some(error) = cleaned.mismatch_error(&cleaned_staged_config) {
+                return Err(error);
+            }
+            if !retry_busy(|| cleaned_snapshot.values_match_current())? {
+                return Err(Error::OwnershipLost {
+                    reason: "the running DAMON hierarchy changed during obsolete-target cleanup",
+                });
+            }
+            self.verify_running_identity_only()?;
+            let staged = StagedOwnership::new(
+                cleaned_snapshot.into_fingerprint(),
+                &self.kdamond,
+                &cleaned.kdamonds[0],
+            );
+            staged.verify(&self.admin)?;
+            return Ok(staged);
+        }
+
         let staged = StagedOwnership::new(
             snapshot.into_fingerprint(),
             &self.kdamond,
@@ -884,6 +918,56 @@ impl ExclusiveSession {
         self.state = SessionState::Closed;
         Ok(())
     }
+}
+
+fn validate_obsolete_target_updates(previous: &DamonConfig, requested: &DamonConfig) -> Result<()> {
+    for (previous_kdamond, requested_kdamond) in previous.kdamonds.iter().zip(&requested.kdamonds) {
+        for (previous_context, requested_context) in previous_kdamond
+            .contexts
+            .iter()
+            .zip(&requested_kdamond.contexts)
+        {
+            for (index, requested_target) in requested_context.targets.iter().enumerate() {
+                if !requested_target.obsolete {
+                    continue;
+                }
+                let Some(previous_target) = previous_context.targets.get(index) else {
+                    return Err(Error::InvalidConfiguration {
+                        field: "obsolete target",
+                        reason: "must identify an existing target at the same index",
+                    });
+                };
+                let mut retained_target = requested_target.clone();
+                retained_target.obsolete = false;
+                if previous_target.obsolete || retained_target != *previous_target {
+                    return Err(Error::InvalidConfiguration {
+                        field: "obsolete target",
+                        reason: "must match the existing target at the same index",
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn contains_obsolete_targets(config: &DamonConfig) -> bool {
+    config.kdamonds.iter().any(|kdamond| {
+        kdamond
+            .contexts
+            .iter()
+            .any(|context| context.targets.iter().any(|target| target.obsolete))
+    })
+}
+
+fn without_obsolete_targets(config: &DamonConfig) -> DamonConfig {
+    let mut cleaned = config.clone();
+    for kdamond in &mut cleaned.kdamonds {
+        for context in &mut kdamond.contexts {
+            context.targets.retain(|target| !target.obsolete);
+        }
+    }
+    cleaned
 }
 
 fn normalize_running_tuned_intervals(
@@ -2091,6 +2175,106 @@ mod tests {
             updated
         );
         session.close().expect("close updated session");
+    }
+
+    #[test]
+    fn running_target_removals_are_cleaned_before_consecutive_updates() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let mut original = transaction_config(42, Action::Stat);
+        original.kdamonds[0].contexts[0]
+            .targets
+            .push(TargetConfig::for_pid(Pid::new(43).expect("valid pid")));
+        let mut session = damon.exclusive_session(&original).expect("stage session");
+        session.start().expect("start session");
+
+        let mut remove_first = original.clone();
+        remove_first.kdamonds[0].contexts[0].targets[0].obsolete = true;
+        let mut stale_filter_index = remove_first.clone();
+        stale_filter_index.kdamonds[0].contexts[0].schemes[0]
+            .filters
+            .push(FilterConfig::target(1, true, false));
+        assert!(matches!(
+            session.update_configuration(&stale_filter_index),
+            Err(Error::InvalidConfiguration { .. })
+        ));
+        session
+            .update_configuration(&remove_first)
+            .expect("commit target removal");
+
+        let cleaned = session
+            .configuration()
+            .expect("read cleaned staged hierarchy");
+        assert_eq!(cleaned.kdamonds[0].contexts[0].targets.len(), 1);
+        assert_eq!(
+            cleaned.kdamonds[0].contexts[0].targets[0].pid,
+            Some(Pid::new(43).expect("valid pid"))
+        );
+        assert!(!cleaned.kdamonds[0].contexts[0].targets[0].obsolete);
+        assert_eq!(
+            model
+                .value("kdamonds/0/contexts/0/targets/nr_targets")
+                .as_deref(),
+            Some("1")
+        );
+
+        let mut consecutive = cleaned.clone();
+        consecutive.kdamonds[0].contexts[0].schemes[0].action = Action::PageOut;
+        session
+            .update_configuration(&consecutive)
+            .expect("commit consecutive update from cleaned state");
+        assert_eq!(
+            model
+                .active_value("kdamonds/0/contexts/0/targets/0/pid_target")
+                .as_deref(),
+            Some("43")
+        );
+
+        let error = session
+            .update_configuration(&remove_first)
+            .expect_err("a stale obsolete marker must not target the replacement index");
+        assert!(matches!(error, Error::InvalidConfiguration { .. }));
+        assert_eq!(
+            model
+                .active_value("kdamonds/0/contexts/0/schemes/0/action")
+                .as_deref(),
+            Some("pageout")
+        );
+        session.close().expect("close updated session");
+    }
+
+    #[test]
+    fn failed_obsolete_target_cleanup_restores_the_preceding_active_targets() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let mut original = transaction_config(42, Action::Stat);
+        original.kdamonds[0].contexts[0]
+            .targets
+            .push(TargetConfig::for_pid(Pid::new(43).expect("valid pid")));
+        let mut session = damon.exclusive_session(&original).expect("stage session");
+        session.start().expect("start session");
+
+        let mut remove_first = original.clone();
+        remove_first.kdamonds[0].contexts[0].targets[0].obsolete = true;
+        model.fail_next_write("kdamonds/0/contexts/0/targets/nr_targets", 5);
+        let error = session
+            .update_configuration(&remove_first)
+            .expect_err("failed cleanup must roll back the active removal");
+
+        assert!(matches!(error, Error::Io { .. }));
+        assert_eq!(
+            session.configuration().expect("read rolled-back hierarchy"),
+            original
+        );
+        assert_eq!(
+            model
+                .active_value("kdamonds/0/contexts/0/targets/0/pid_target")
+                .as_deref(),
+            Some("42")
+        );
+        session.close().expect("close rolled-back session");
     }
 
     #[test]

@@ -606,7 +606,10 @@ pub struct SampleControlConfig {
 }
 
 impl SampleControlConfig {
-    /// Validates this control and all sample filters.
+    /// Validates the staged shape of this control and all sample filters.
+    ///
+    /// Operation-dependent primitive effectiveness is checked by
+    /// [`ContextConfig::validate_runnable`].
     pub fn validate(&self) -> Result<()> {
         validate_count("sample filter count", self.filters.len())?;
         for filter in &self.filters {
@@ -622,7 +625,10 @@ impl SampleControlConfig {
 pub struct TargetConfig {
     /// Process ID for virtual-address operations.
     pub pid: Option<Pid>,
-    /// Whether this target should be removed during an online commit.
+    /// Whether this existing target should be removed by the next online commit.
+    ///
+    /// High-level sessions accept this only for running updates and clear the
+    /// one-shot marker by rebuilding the staged target hierarchy after commit.
     pub obsolete: bool,
     /// Initial monitoring regions.
     pub initial_regions: Vec<InitialRegionConfig>,
@@ -1261,7 +1267,32 @@ impl ContextConfig {
     /// Validates the operation-specific invariants required before starting
     /// this context on the running kernel's current DAMON ABI.
     pub fn validate_runnable(&self) -> Result<()> {
+        self.validate_runnable_for_lifecycle(false)
+    }
+
+    pub(crate) fn validate_running_update(&self) -> Result<()> {
+        self.validate_runnable_for_lifecycle(true)
+    }
+
+    fn validate_runnable_for_lifecycle(&self, allow_obsolete_targets: bool) -> Result<()> {
         self.validate()?;
+        if !allow_obsolete_targets && self.targets.iter().any(|target| target.obsolete) {
+            return invalid(
+                "obsolete target",
+                "is valid only as a one-shot update to a running context",
+            );
+        }
+        let retained_target_count = self
+            .targets
+            .iter()
+            .filter(|target| !target.obsolete)
+            .count();
+        if retained_target_count == 0 {
+            return invalid(
+                "monitoring targets",
+                "a running context requires at least one non-obsolete target",
+            );
+        }
         if self.probes.len() > CURRENT_MAX_PROBES {
             return invalid(
                 "monitoring probe count",
@@ -1269,23 +1300,25 @@ impl ContextConfig {
             );
         }
         self.validate_weighted_probes()?;
+        self.validate_runnable_sample_control()?;
         match self.operation {
             Operation::VirtualAddress => {
-                if self.targets.is_empty() {
-                    return invalid("virtual-address targets", "requires at least one target");
-                }
-                if self.targets.iter().any(|target| target.pid.is_none()) {
+                if self
+                    .targets
+                    .iter()
+                    .filter(|target| !target.obsolete)
+                    .any(|target| target.pid.is_none())
+                {
                     return invalid("virtual-address target", "requires a process identifier");
                 }
             }
             Operation::FixedVirtualAddress => {
-                if self.targets.is_empty() {
-                    return invalid(
-                        "fixed virtual-address targets",
-                        "requires at least one target",
-                    );
-                }
-                if self.targets.iter().any(|target| target.pid.is_none()) {
+                if self
+                    .targets
+                    .iter()
+                    .filter(|target| !target.obsolete)
+                    .any(|target| target.pid.is_none())
+                {
                     return invalid(
                         "fixed virtual-address target",
                         "requires a process identifier",
@@ -1294,6 +1327,7 @@ impl ContextConfig {
                 if self
                     .targets
                     .iter()
+                    .filter(|target| !target.obsolete)
                     .any(|target| target.initial_regions.is_empty())
                 {
                     return invalid(
@@ -1303,7 +1337,7 @@ impl ContextConfig {
                 }
             }
             Operation::PhysicalAddress => {
-                if self.targets.len() != 1 {
+                if self.targets.len() != 1 || retained_target_count != 1 {
                     return invalid(
                         "physical-address targets",
                         "requires exactly one target on current DAMON kernels",
@@ -1323,14 +1357,38 @@ impl ContextConfig {
                     );
                 }
             }
-            Operation::Unknown(_) => {
-                if self.targets.is_empty() {
-                    return invalid("monitoring targets", "requires at least one target");
-                }
-            }
+            Operation::Unknown(_) => {}
         }
         for scheme in &self.schemes {
-            scheme.validate_runnable_for(&self.operation, self.targets.len())?;
+            scheme.validate_runnable_for(&self.operation, retained_target_count)?;
+        }
+        Ok(())
+    }
+
+    fn validate_runnable_sample_control(&self) -> Result<()> {
+        let primitives = self.sample_control.primitives;
+        if primitives.page_table == primitives.page_fault {
+            return invalid(
+                "sample primitives",
+                "exactly one of page-table and page-fault sampling must be enabled",
+            );
+        }
+        if primitives.page_fault
+            && matches!(
+                self.operation,
+                Operation::VirtualAddress | Operation::FixedVirtualAddress
+            )
+        {
+            return invalid(
+                "page-fault sampling",
+                "is supported only for physical-address monitoring",
+            );
+        }
+        if !self.sample_control.filters.is_empty() && !primitives.page_fault {
+            return invalid(
+                "sample filters",
+                "require page-fault sampling to have an effect",
+            );
         }
         Ok(())
     }
@@ -1398,6 +1456,14 @@ impl DamonConfig {
     /// and unknown future operation values. This stricter check is used by
     /// high-level sessions that will start monitoring.
     pub fn validate_runnable(&self) -> Result<()> {
+        self.validate_runnable_for_lifecycle(false)
+    }
+
+    pub(crate) fn validate_running_update(&self) -> Result<()> {
+        self.validate_runnable_for_lifecycle(true)
+    }
+
+    fn validate_runnable_for_lifecycle(&self, allow_obsolete_targets: bool) -> Result<()> {
         self.validate()?;
         if self.kdamonds.is_empty() {
             return invalid("kdamond count", "requires at least one kdamond");
@@ -1409,7 +1475,11 @@ impl DamonConfig {
                     "current DAMON requires exactly one context per running kdamond",
                 );
             }
-            kdamond.contexts[0].validate_runnable()?;
+            if allow_obsolete_targets {
+                kdamond.contexts[0].validate_running_update()?;
+            } else {
+                kdamond.contexts[0].validate_runnable()?;
+            }
         }
         Ok(())
     }

@@ -3316,6 +3316,28 @@ pub(crate) mod test_backend {
             );
         }
 
+        fn validate_sample_primitives(&self, kdamond: &Path) -> io::Result<()> {
+            let base = kdamond.join("contexts/0/monitoring_attrs/sample/primitives");
+            let enabled = |name: &str| match self.nodes.get(&base.join(name)) {
+                Some(Node::File(value)) => match std::str::from_utf8(value).map(str::trim) {
+                    Ok("Y" | "1") => Ok(Some(true)),
+                    Ok("N" | "0") => Ok(Some(false)),
+                    _ => Err(io::Error::from_raw_os_error(22)),
+                },
+                Some(Node::Directory) => Err(io::Error::from(io::ErrorKind::IsADirectory)),
+                None => Ok(None),
+            };
+            let (Some(page_table), Some(page_fault)) =
+                (enabled("page_table")?, enabled("page_fault")?)
+            else {
+                return Ok(());
+            };
+            if page_table == page_fault {
+                return Err(io::Error::from_raw_os_error(22));
+            }
+            Ok(())
+        }
+
         fn commit_quota_goals(&mut self) {
             let staged_goals: Vec<_> = self
                 .nodes
@@ -3438,6 +3460,7 @@ pub(crate) mod test_backend {
             if !listed_value_contains(&self.available_operations, selected) {
                 return Err(io::Error::from_raw_os_error(22));
             }
+            self.validate_sample_primitives(kdamond)?;
             self.capture_active_files();
             self.next_kdamond_pid += 1;
             self.file(kdamond.join("state"), b"on\n");
@@ -3480,6 +3503,7 @@ pub(crate) mod test_backend {
                 }
                 "commit" => {
                     self.ensure_running(path)?;
+                    self.validate_sample_primitives(kdamond)?;
                     self.capture_active_files();
                 }
                 "commit_schemes_quota_goals" => {
@@ -4718,6 +4742,61 @@ mod tests {
             kdamond.configuration().expect("read current damo controls"),
             config
         );
+    }
+
+    #[test]
+    fn modeled_kernel_rejects_invalid_sample_primitives_on_start_and_commit() {
+        let model = test_backend::Model::new("vaddr\n");
+        model.enable_current_damo_extensions();
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+
+        let mut context = ContextConfig::new(Operation::VirtualAddress);
+        context
+            .targets
+            .push(TargetConfig::for_pid(Pid::new(42).expect("valid pid")));
+        context.sample_control.primitives = SamplePrimitivesConfig {
+            page_table: true,
+            page_fault: true,
+        };
+        let config = KdamondConfig {
+            refresh_interval: Duration::ZERO,
+            contexts: vec![context],
+        };
+        kdamond
+            .stage_configuration(&config)
+            .expect("stage structurally valid primitive combination");
+        assert!(kdamond.command(&KdamondCommand::On).is_err());
+
+        let mut valid = config.clone();
+        valid.contexts[0].sample_control.primitives = SamplePrimitivesConfig::default();
+        kdamond
+            .stage_configuration(&valid)
+            .expect("stage valid primitive combination");
+        assert_eq!(
+            model
+                .value("kdamonds/0/contexts/0/monitoring_attrs/sample/primitives/page_table")
+                .as_deref(),
+            Some("Y")
+        );
+        assert_eq!(
+            model
+                .value("kdamonds/0/contexts/0/monitoring_attrs/sample/primitives/page_fault")
+                .as_deref(),
+            Some("N")
+        );
+        kdamond.command(&KdamondCommand::On).expect("start kdamond");
+
+        let mut invalid_update = valid;
+        invalid_update.contexts[0].sample_control.primitives = SamplePrimitivesConfig {
+            page_table: false,
+            page_fault: false,
+        };
+        kdamond
+            .stage_configuration(&invalid_update)
+            .expect("stage invalid running update");
+        assert!(kdamond.command(&KdamondCommand::Commit).is_err());
     }
 
     #[test]

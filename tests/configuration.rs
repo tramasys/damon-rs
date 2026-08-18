@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use damon::sysfs::{
     AccessCountRange, AccessPattern, Action, ByteSizeRange, ContextConfig, DamonConfig,
-    FilterConfig, FilterLayer, InitialRegionConfig, KdamondConfig, OperationAttributesConfig,
-    ProbeConfig, ProbePreparationAction, ProbePreparationConfig, QuotaConfig, RegionSizeRange,
-    SampleControlConfig, SampleFilterConfig, SamplePrimitivesConfig, SchemeConfig,
-    SchemeFilterType, TargetConfig,
+    FilterConfig, FilterLayer, InitialRegionConfig, KdamondConfig, Operation,
+    OperationAttributesConfig, ProbeConfig, ProbePreparationAction, ProbePreparationConfig,
+    QuotaConfig, RegionSizeRange, SampleControlConfig, SampleFilterConfig, SamplePrimitivesConfig,
+    SchemeConfig, SchemeFilterType, TargetConfig,
 };
 use damon::{Pid, RegionBounds};
 
@@ -116,5 +116,65 @@ fn runnable_validation_enforces_current_weighted_probe_limits() {
     )
     .expect("valid intervals");
     context.probes[0].weight = u32::MAX;
+    assert!(context.validate_runnable().is_err());
+}
+
+#[test]
+fn runnable_validation_enforces_effective_sample_controls() {
+    let mut virtual_context = ContextConfig::new(Operation::VirtualAddress);
+    virtual_context
+        .targets
+        .push(TargetConfig::for_pid(Pid::new(42).expect("valid pid")));
+
+    virtual_context.sample_control.primitives.page_table = false;
+    assert!(virtual_context.validate().is_ok());
+    assert!(virtual_context.validate_runnable().is_err());
+
+    virtual_context.sample_control.primitives.page_table = true;
+    virtual_context.sample_control.primitives.page_fault = true;
+    assert!(virtual_context.validate_runnable().is_err());
+
+    virtual_context.sample_control.primitives.page_table = false;
+    assert!(virtual_context.validate_runnable().is_err());
+
+    virtual_context.sample_control.primitives = SamplePrimitivesConfig::default();
+    virtual_context
+        .sample_control
+        .filters
+        .push(SampleFilterConfig::write(true, true));
+    assert!(virtual_context.validate_runnable().is_err());
+
+    let mut physical_context = ContextConfig::new(Operation::PhysicalAddress);
+    let mut target = TargetConfig::address_space();
+    target.initial_regions =
+        vec![InitialRegionConfig::new(0, 4096).expect("valid physical-address region")];
+    physical_context.targets.push(target);
+    physical_context.sample_control.primitives.page_table = false;
+    physical_context.sample_control.primitives.page_fault = true;
+    physical_context
+        .sample_control
+        .filters
+        .push(SampleFilterConfig::write(true, true));
+    physical_context
+        .validate_runnable()
+        .expect("physical-address page-fault sampling is effective");
+
+    let mut future_context = physical_context;
+    future_context.operation = Operation::Unknown("future_operation".into());
+    future_context
+        .validate_runnable()
+        .expect("unknown future operations remain forward-compatible");
+}
+
+#[test]
+fn obsolete_targets_are_not_valid_initial_running_state() {
+    let mut context = ContextConfig::new(Operation::VirtualAddress);
+    let mut target = TargetConfig::for_pid(Pid::new(42).expect("valid pid"));
+    target.obsolete = true;
+    context.targets.push(target);
+
+    context
+        .validate()
+        .expect("obsolete markers remain representable while stopped");
     assert!(context.validate_runnable().is_err());
 }
