@@ -59,8 +59,6 @@ if [[ -d "$damon_admin" ]]; then
 else
     echo "DAMON sysfs: unavailable"
 fi
-
-rustc --version
 ```
 
 ## Example
