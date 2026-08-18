@@ -80,6 +80,11 @@ pub enum Error {
     },
     /// Summing tried-region sizes overflowed the snapshot representation.
     SnapshotSizeOverflow,
+    /// A singular snapshot was requested from a multi-result query.
+    MultipleSnapshotResults {
+        /// Number of scoped snapshots produced by the query.
+        count: usize,
+    },
     /// Converting DAMON core address units to bytes overflowed `u64`.
     AddressConversionOverflow {
         /// The raw number of DAMON address units.
@@ -187,6 +192,10 @@ impl fmt::Display for Error {
             Self::SnapshotSizeOverflow => {
                 formatter.write_str("DAMON snapshot total size exceeds u64::MAX")
             }
+            Self::MultipleSnapshotResults { count } => write!(
+                formatter,
+                "DAMON query produced {count} scoped snapshots, use materialize_snapshots()"
+            ),
             Self::AddressConversionOverflow { units, unit_bytes } => write!(
                 formatter,
                 "DAMON address conversion overflows u64 ({units} units at {unit_bytes} bytes each)"

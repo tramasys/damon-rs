@@ -1,8 +1,9 @@
 //! Multi-kdamond ownership and lifecycle management.
 
 use super::{
-    ConfigurationSnapshot, DamonAdmin, DamonConfig, Error, Kdamond, KdamondCommand, KdamondState,
-    MonitoringIntervals, Pid, Result, SessionLock, StagedConfiguration, StagedOwnership,
+    Capabilities, ConfigurationSnapshot, DamonAdmin, DamonConfig, Error, HierarchyRuntimeBatch,
+    Kdamond, KdamondCommand, KdamondState, ManagedKdamond, MonitoringIntervals, Pid,
+    QuotaGoalConfig, Result, SessionLock, StagedConfiguration, StagedOwnership,
     ensure_hierarchy_stopped, restore_configuration, retry_busy, running_thread_pid,
     stage_and_verify_configuration, with_rollback,
 };
@@ -61,6 +62,59 @@ impl ManagedHierarchy {
     #[must_use]
     pub const fn kdamond_count(&self) -> usize {
         self.states.len()
+    }
+
+    /// Borrows an ownership-safe runtime view of one running kdamond.
+    ///
+    /// Constructing the view performs no sysfs access. Each operation verifies
+    /// the hierarchy and selected kernel-thread identity at its trust
+    /// boundaries.
+    pub fn runtime(&mut self, kdamond_index: usize) -> Result<ManagedKdamond<'_>> {
+        self.expected_running_pid(kdamond_index)?;
+        Ok(ManagedKdamond {
+            hierarchy: self,
+            index: kdamond_index,
+        })
+    }
+
+    /// Runs operations across managed kdamonds under one pair of complete
+    /// hierarchy ownership checks.
+    ///
+    /// Individual operations still verify the selected kernel-thread identity
+    /// at their trust boundaries. If both the closure and final ownership check
+    /// fail, the ownership error is returned because the closure's outputs
+    /// cannot be trusted.
+    pub fn runtime_batch<T>(
+        &mut self,
+        operation: impl FnOnce(&mut HierarchyRuntimeBatch<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.verify_owned_state()?;
+        let result = {
+            let mut batch = HierarchyRuntimeBatch { hierarchy: self };
+            operation(&mut batch)
+        };
+        self.verify_owned_state()?;
+        result
+    }
+
+    /// Discovers capabilities for one staged scheme.
+    ///
+    /// This is available before or after starting the hierarchy. The complete
+    /// owned state is verified before and after capability discovery.
+    pub fn capabilities(
+        &self,
+        kdamond_index: usize,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<Capabilities> {
+        self.validate_kdamond_index(kdamond_index)?;
+        self.verify_owned_state()?;
+        let capabilities = retry_busy(|| {
+            self.kdamond(kdamond_index)
+                .capabilities(context_index, scheme_index)
+        })?;
+        self.verify_owned_state()?;
+        Ok(capabilities)
     }
 
     /// Starts every staged kdamond in index order.
@@ -163,9 +217,9 @@ impl ManagedHierarchy {
     /// Returns whether one identified managed kdamond is still running.
     pub fn is_running(&self, kdamond_index: usize) -> Result<bool> {
         self.validate_kdamond_index(kdamond_index)?;
-        self.staged.verify(&self.admin)?;
         match self.states[kdamond_index] {
             KdamondSessionState::Staged => {
+                self.staged.verify(&self.admin)?;
                 match retry_busy(|| self.kdamond(kdamond_index).state())? {
                     KdamondState::Off => Ok(false),
                     KdamondState::On => Err(Error::OwnershipLost {
@@ -216,9 +270,7 @@ impl ManagedHierarchy {
             });
         }
         for &index in &selected {
-            if !matches!(self.states[index], KdamondSessionState::Running(_)) {
-                return Err(Error::NotRunning);
-            }
+            self.expected_running_pid(index)?;
         }
 
         self.verify_owned_state()?;
@@ -261,6 +313,57 @@ impl ManagedHierarchy {
         }
     }
 
+    pub(super) fn update_scheme_quota_goals(
+        &mut self,
+        kdamond_index: usize,
+        context_index: usize,
+        scheme_index: usize,
+        goals: &[QuotaGoalConfig],
+    ) -> Result<()> {
+        self.validate_kdamond_index(kdamond_index)?;
+        crate::sysfs::SchemeQuotas::validate_goals(goals)?;
+        self.expected_running_pid(kdamond_index)?;
+
+        self.verify_owned_state()?;
+        let quotas = self
+            .scheme(kdamond_index, context_index, scheme_index)?
+            .quotas();
+        let mut quota = retry_busy(|| quotas.configuration())?;
+        self.verify_owned_state()?;
+        let previous_goals = std::mem::replace(&mut quota.goals, goals.to_vec());
+        quota.validate()?;
+        if quota.goals == previous_goals {
+            return Ok(());
+        }
+
+        match self.stage_and_commit_quota_goals(
+            &quotas,
+            &quota.goals,
+            Some(&previous_goals),
+            kdamond_index,
+        ) {
+            Ok(staged) => {
+                self.staged = staged;
+                Ok(())
+            }
+            Err(operation) => match self.stage_and_commit_quota_goals(
+                &quotas,
+                &previous_goals,
+                Some(&quota.goals),
+                kdamond_index,
+            ) {
+                Ok(staged) => {
+                    self.staged = staged;
+                    Err(operation)
+                }
+                Err(rollback) => Err(Error::Rollback {
+                    operation: Box::new(operation),
+                    rollback: Box::new(rollback),
+                }),
+            },
+        }
+    }
+
     /// Stops owned kdamonds and restores the preceding stopped hierarchy.
     ///
     /// Unlike [`Drop`], this method reports stop and restoration failures.
@@ -270,6 +373,34 @@ impl ManagedHierarchy {
 
     pub(super) fn kdamond(&self, index: usize) -> Kdamond {
         self.admin.kdamond(index)
+    }
+
+    pub(super) fn scheme(
+        &self,
+        kdamond_index: usize,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<crate::sysfs::Scheme> {
+        self.validate_kdamond_index(kdamond_index)?;
+        let kdamond = self.kdamond(kdamond_index);
+        let context_count = kdamond.context_count()?;
+        if context_index >= context_count {
+            return Err(Error::IndexOutOfBounds {
+                kind: "context",
+                index: context_index,
+                count: context_count,
+            });
+        }
+        let context = kdamond.context(context_index);
+        let scheme_count = context.scheme_count()?;
+        if scheme_index >= scheme_count {
+            return Err(Error::IndexOutOfBounds {
+                kind: "scheme",
+                index: scheme_index,
+                count: scheme_count,
+            });
+        }
+        Ok(context.scheme(scheme_index))
     }
 
     pub(super) fn replace_staged_configuration(&mut self, config: &DamonConfig) -> Result<()> {
@@ -372,9 +503,7 @@ impl ManagedHierarchy {
     }
 
     fn verify_running_identity_without_count(&self, kdamond_index: usize) -> Result<()> {
-        let KdamondSessionState::Running(expected) = self.states[kdamond_index] else {
-            return Err(Error::NotRunning);
-        };
+        let expected = self.expected_running_pid(kdamond_index)?;
         let current = retry_busy(|| self.kdamond(kdamond_index).pid())?.ok_or(Error::NotRunning)?;
         if current != expected {
             return Err(Error::OwnershipLost {
@@ -385,9 +514,7 @@ impl ManagedHierarchy {
     }
 
     fn verify_running_state_and_identity_without_count(&self, kdamond_index: usize) -> Result<()> {
-        let KdamondSessionState::Running(expected) = self.states[kdamond_index] else {
-            return Err(Error::NotRunning);
-        };
+        let expected = self.expected_running_pid(kdamond_index)?;
         let current = running_thread_pid(&self.kdamond(kdamond_index))?;
         if current != expected {
             return Err(Error::OwnershipLost {
@@ -552,6 +679,77 @@ impl ManagedHierarchy {
         Ok(staged)
     }
 
+    fn stage_and_commit_quota_goals(
+        &self,
+        quotas: &crate::sysfs::SchemeQuotas,
+        goals: &[QuotaGoalConfig],
+        observed: Option<&[QuotaGoalConfig]>,
+        kdamond_index: usize,
+    ) -> Result<StagedOwnership> {
+        self.verify_owned_identities_only()?;
+        retry_busy(|| {
+            self.verify_owned_identities_only()?;
+            quotas.stage_goals_from(goals, observed)
+        })?;
+        self.verify_owned_identities_only()?;
+        let goals_root = quotas.path().join("goals");
+        let unchanged_matches = if observed.is_some_and(|values| values.len() == goals.len()) {
+            let mut ignored = self.staged.volatile_paths.to_vec();
+            for (index, goal) in goals.iter().enumerate() {
+                if observed.is_some_and(|values| &values[index] == goal) {
+                    continue;
+                }
+                let goal_path = quotas.goal(index).path().to_path_buf();
+                ignored.push(goal_path.join("target_metric"));
+                ignored.push(goal_path.join("target_value"));
+                ignored.push(goal_path.join("current_value"));
+                if goal.node_id.is_some() {
+                    ignored.push(goal_path.join("nid"));
+                }
+                if goal.cgroup_path.is_some() {
+                    ignored.push(goal_path.join("path"));
+                }
+            }
+            ignored.sort_unstable();
+            ignored.dedup();
+            self.staged.configuration.matches_current_except(&ignored)?
+        } else {
+            self.staged
+                .configuration
+                .matches_current_outside_except(&goals_root, &self.staged.volatile_paths)?
+        };
+        if !unchanged_matches {
+            return Err(Error::OwnershipLost {
+                reason: "the running DAMON hierarchy changed during quota-goal staging",
+            });
+        }
+        let snapshot = retry_busy(|| self.admin.configuration_snapshot())?;
+        let staged_goals = retry_busy(|| quotas.goal_configurations())?;
+        if staged_goals != goals {
+            return Err(Error::ConfigurationMismatch {
+                path: "quotas/goals".into(),
+                expected: format!("{goals:?}").into(),
+                observed: format!("{staged_goals:?}").into(),
+            });
+        }
+        if !retry_busy(|| snapshot.values_match_current())? {
+            return Err(Error::OwnershipLost {
+                reason: "the running DAMON hierarchy changed during quota-goal staging",
+            });
+        }
+        self.verify_owned_identities_only()?;
+        self.verify_running_identity_only(kdamond_index)?;
+        retry_busy(|| {
+            self.kdamond(kdamond_index)
+                .command(&KdamondCommand::CommitSchemesQuotaGoals)
+        })?;
+        self.verify_running_identity_only(kdamond_index)?;
+
+        let staged = self.staged.with_configuration(snapshot.into_fingerprint());
+        staged.verify(&self.admin)?;
+        Ok(staged)
+    }
+
     fn verify_owned_identities_only(&self) -> Result<()> {
         if self.admin.kdamond_count()? != self.states.len() {
             return Err(Error::OwnershipLost {
@@ -592,6 +790,17 @@ impl ManagedHierarchy {
             });
         }
         Ok(())
+    }
+
+    pub(super) fn expected_running_pid(&self, index: usize) -> Result<Pid> {
+        self.validate_kdamond_index(index)?;
+        match self.states[index] {
+            KdamondSessionState::Running(pid) => Ok(pid),
+            KdamondSessionState::Staged => Err(Error::NotRunning),
+            KdamondSessionState::UnidentifiedRunning => Err(Error::OwnershipLost {
+                reason: "the kdamond started but its identity was not captured",
+            }),
+        }
     }
 
     pub(super) fn close_inner(&mut self) -> Result<()> {

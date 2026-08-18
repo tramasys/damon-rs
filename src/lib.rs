@@ -17,7 +17,7 @@
 //! let pid = Pid::new(std::process::id())?;
 //! let mut monitor = damon.monitor_pid(pid).start()?;
 //!
-//! for region in monitor.snapshot()?.regions() {
+//! for region in monitor.materialize_snapshot()?.snapshot().regions() {
 //!     println!(
 //!         "{:#x}-{:#x}: {} accesses",
 //!         region.start_bytes()?,
@@ -44,10 +44,12 @@ pub mod sysfs;
 pub use config::{AddressUnit, MonitoringIntervals, Pid, RegionBounds};
 pub use error::{Error, Result};
 pub use monitor::{
-    DEFAULT_SESSION_LOCK_PATH, Damon, ExclusiveSession, FvaddrSessionBuilder, ManagedHierarchy,
-    Monitor, MonitorBuilder, PaddrSessionBuilder, RuntimeBatch, VaddrSessionBuilder,
+    DEFAULT_SESSION_LOCK_PATH, Damon, ExclusiveSession, FvaddrSessionBuilder,
+    HierarchyRuntimeBatch, ManagedHierarchy, ManagedKdamond, Monitor, MonitorBuilder,
+    PaddrSessionBuilder, ProcessTarget, RuntimeBatch, VaddrSessionBuilder,
 };
 pub use region::{
-    ProbeHit, RawRegion, RawSnapshot, Region, RegionIter, Snapshot, SnapshotCompleteness,
+    ProbeHit, RawRegion, RawSnapshot, Region, RegionIter, ScopedSnapshot, Snapshot,
+    SnapshotCompleteness, SnapshotScope, TargetIdentity,
 };
 pub use sysfs::{Capabilities, CapabilitySupport, Operation, OperationCapability, SysfsFeature};

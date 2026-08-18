@@ -80,7 +80,7 @@ fn exercise_session_runtime(model: &Model, session: &mut ExclusiveSession) {
     );
     session.commit().expect("commit staged inputs");
     session
-        .commit_scheme_quota_goals()
+        .update_scheme_quota_goals(0, 0, &[])
         .expect("commit quota goals");
 
     let stats = session.scheme_stats(0, 0).expect("read scheme stats");

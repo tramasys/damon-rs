@@ -181,7 +181,7 @@ fn snapshot_rechecks_ownership_after_materialization_command() {
     );
 
     let error = monitor
-        .snapshot()
+        .materialize_snapshot()
         .expect_err("post-command ownership change must discard results");
     assert!(matches!(
         error,
@@ -217,7 +217,7 @@ fn snapshot_rechecks_ownership_after_reading_results() {
     );
 
     let error = monitor
-        .snapshot()
+        .materialize_snapshot()
         .expect_err("post-read ownership change must discard results");
     assert!(matches!(
         error,

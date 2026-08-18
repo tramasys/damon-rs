@@ -1,7 +1,7 @@
 use std::iter::FusedIterator;
 use std::slice;
 
-use crate::{AddressUnit, Error, Result};
+use crate::{AddressUnit, Error, Pid, Result};
 
 const INLINE_PROBE_HITS: usize = 4;
 
@@ -112,6 +112,48 @@ pub enum SnapshotCompleteness {
     },
     /// The kernel does not expose an independent reported total.
     Unverifiable,
+}
+
+/// Identity of a target proven by the staged query configuration.
+///
+/// DAMON sysfs does not serialize target identifiers in ordinary tried-region
+/// results. This identity is attached only when one configured target is the
+/// sole possible source, or when a target filter isolates its target index.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub struct TargetIdentity {
+    target_index: usize,
+    pid: Option<Pid>,
+}
+
+impl TargetIdentity {
+    pub(crate) const fn new(target_index: usize, pid: Option<Pid>) -> Self {
+        Self { target_index, pid }
+    }
+
+    /// Returns the target's index in the committed context.
+    #[must_use]
+    pub const fn target_index(self) -> usize {
+        self.target_index
+    }
+
+    /// Returns the process identifier for a process target.
+    ///
+    /// Physical-address targets have no process identifier.
+    #[must_use]
+    pub const fn pid(self) -> Option<Pid> {
+        self.pid
+    }
+}
+
+/// The strongest scope the library can prove for a snapshot.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum SnapshotScope {
+    /// Exactly one configured target produced the result.
+    Target(TargetIdentity),
+    /// The kernel flattened results from multiple targets without identity.
+    Ungrouped,
 }
 
 /// A monitored region returned directly by DAMON in core address units.
@@ -323,6 +365,11 @@ impl RawSnapshot {
     pub fn iter(&self) -> std::slice::Iter<'_, RawRegion> {
         self.regions.iter()
     }
+
+    #[cfg(test)]
+    pub(crate) fn allocated_region_capacity(&self) -> usize {
+        self.regions.capacity()
+    }
 }
 
 impl<'a> IntoIterator for &'a RawSnapshot {
@@ -497,6 +544,79 @@ impl FusedIterator for RegionIter<'_> {}
 pub struct Snapshot {
     raw: RawSnapshot,
     address_unit: AddressUnit,
+}
+
+/// A snapshot paired with its hierarchy coordinates and proven scope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopedSnapshot {
+    kdamond_index: usize,
+    context_index: usize,
+    scheme_index: usize,
+    scope: SnapshotScope,
+    snapshot: Snapshot,
+}
+
+impl ScopedSnapshot {
+    pub(crate) const fn new(
+        kdamond_index: usize,
+        context_index: usize,
+        scheme_index: usize,
+        scope: SnapshotScope,
+        snapshot: Snapshot,
+    ) -> Self {
+        Self {
+            kdamond_index,
+            context_index,
+            scheme_index,
+            scope,
+            snapshot,
+        }
+    }
+
+    /// Returns the kdamond index that owns the queried scheme.
+    #[must_use]
+    pub const fn kdamond_index(&self) -> usize {
+        self.kdamond_index
+    }
+
+    /// Returns the context index that owns the queried scheme.
+    #[must_use]
+    pub const fn context_index(&self) -> usize {
+        self.context_index
+    }
+
+    /// Returns the scheme index when the snapshot was materialized.
+    ///
+    /// Private on-demand query schemes can be removed immediately afterward,
+    /// so this index does not imply that the scheme is still staged.
+    #[must_use]
+    pub const fn scheme_index(&self) -> usize {
+        self.scheme_index
+    }
+
+    /// Returns the strongest target scope proven for these results.
+    #[must_use]
+    pub const fn scope(&self) -> SnapshotScope {
+        self.scope
+    }
+
+    /// Returns the point-in-time DAMON results.
+    #[must_use]
+    pub const fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
+    /// Consumes the scoped result and returns its snapshot.
+    #[must_use]
+    pub fn into_snapshot(self) -> Snapshot {
+        self.snapshot
+    }
+}
+
+impl AsRef<Snapshot> for ScopedSnapshot {
+    fn as_ref(&self) -> &Snapshot {
+        &self.snapshot
+    }
 }
 
 impl Snapshot {

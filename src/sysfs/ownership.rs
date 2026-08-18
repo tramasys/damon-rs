@@ -65,6 +65,22 @@ impl ConfigurationFingerprint {
         Ok(true)
     }
 
+    pub(crate) fn matches_current_outside_except(
+        &self,
+        ignored_root: &Path,
+        ignored: &[PathBuf],
+    ) -> Result<bool> {
+        for entry in self.entries.iter() {
+            if entry.path.starts_with(ignored_root) || ignored.binary_search(&entry.path).is_ok() {
+                continue;
+            }
+            if !read_configuration_value_equals(&entry.path, entry.value.as_bytes())? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn refreshed_paths_except(
         &self,
         paths: &[PathBuf],

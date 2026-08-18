@@ -63,11 +63,17 @@ Kernels without tried-region queries can still run a monitor, but
 `Monitor::snapshot()` returns `UnsupportedFeature`.
 
 The kernel command is synchronous and can wait for every configured scheme's
-next apply interval. The sysfs ABI provides no timeout.
+next apply interval. The sysfs ABI provides no timeout or cancellation.
+`Monitor::maximum_snapshot_apply_interval()` exposes the largest effective
+configured interval as a scheduling hint. Cached session reads and
+`Monitor::cached_snapshots()` perform no materialization command.
 
-High-level workflows contain one target and return its regions in address
-order. Results from multiple low-level targets remain in kernel materialization
-order and do not imply global address ordering.
+High-level vaddr and fvaddr workflows support multiple process targets. When
+target filters are accepted, one private query scheme isolates each target.
+Otherwise `Monitor::snapshots()` returns one `SnapshotScope::Ungrouped` result.
+The crate never infers target identity from address ranges. Results from
+multiple low-level targets remain in kernel materialization order and do not
+imply global address ordering.
 
 ## Numeric representation
 

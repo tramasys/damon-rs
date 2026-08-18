@@ -58,6 +58,42 @@ fn managed_hierarchy_starts_stops_and_restores_every_kdamond() {
 }
 
 #[test]
+fn managed_hierarchy_runtime_targets_one_owned_kdamond() {
+    let model = Model::new("vaddr\n");
+    configure_runtime_results(&model);
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut managed = damon
+        .managed_hierarchy(&multi_transaction_config())
+        .expect("stage managed hierarchy");
+    managed.start_all().expect("start all kdamonds");
+    model.after_next_write(
+        "kdamonds/1/state",
+        b"update_schemes_stats".to_vec(),
+        vec![Mutation::SetFile {
+            path: "kdamonds/1/contexts/0/schemes/0/stats/nr_tried".into(),
+            value: b"77\n".to_vec(),
+        }],
+    );
+
+    let stats = managed
+        .runtime(1)
+        .expect("borrow second runtime")
+        .runtime_batch(|batch| {
+            assert_eq!(batch.kdamond_index(), 1);
+            batch.scheme_stats(0, 0)
+        })
+        .expect("read second kdamond stats");
+
+    assert_eq!(stats.regions_tried, 77);
+    assert!(matches!(
+        managed.runtime(2),
+        Err(Error::IndexOutOfBounds { .. })
+    ));
+    managed.close().expect("close hierarchy");
+}
+
+#[test]
 fn later_start_failure_rolls_back_identified_kdamonds() {
     let model = Model::new("vaddr\n");
     let lock = TestLock::new();
@@ -428,5 +464,119 @@ fn selected_running_update_preserves_unselected_tuned_intervals() {
             .as_deref(),
         Some("pageout")
     );
+    managed.close().expect("close hierarchy");
+}
+
+#[test]
+fn unidentified_running_state_is_reported_as_ownership_loss() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut managed = damon
+        .managed_hierarchy(&transaction_config(42, Action::Stat))
+        .expect("stage managed hierarchy");
+    model.after_next_write(
+        "kdamonds/0/state",
+        b"on".to_vec(),
+        vec![Mutation::SetFile {
+            path: "kdamonds/0/pid".into(),
+            value: b"-1\n".to_vec(),
+        }],
+    );
+
+    assert!(managed.start_all().is_err());
+    assert!(matches!(
+        managed.runtime(0),
+        Err(Error::OwnershipLost {
+            reason: "the kdamond started but its identity was not captured"
+        })
+    ));
+    assert!(matches!(
+        managed.is_running(0),
+        Err(Error::OwnershipLost {
+            reason: "the kdamond started but its identity was not captured"
+        })
+    ));
+
+    damon
+        .admin
+        .kdamond(0)
+        .command(&KdamondCommand::Off)
+        .expect("stop unidentified model kdamond");
+    managed.close().expect("restore hierarchy");
+}
+
+#[test]
+fn running_state_check_performs_one_complete_fingerprint_scan() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut managed = damon
+        .managed_hierarchy(&transaction_config(42, Action::Stat))
+        .expect("stage managed hierarchy");
+    managed.start_all().expect("start hierarchy");
+
+    let reads = model.read_count();
+    managed.verify_running(0).expect("verify running state");
+    let verification_reads = model.read_count() - reads;
+    let reads = model.read_count();
+    assert!(managed.is_running(0).expect("read running state"));
+    let state_reads = model.read_count() - reads;
+
+    assert_eq!(state_reads, verification_reads);
+    managed.close().expect("close hierarchy");
+}
+
+#[test]
+fn hierarchy_runtime_batch_avoids_repeated_cross_kdamond_scans() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut managed = damon
+        .managed_hierarchy(&multi_transaction_config())
+        .expect("stage managed hierarchy");
+    managed.start_all().expect("start hierarchy");
+
+    let reads = model.read_count();
+    managed
+        .runtime(0)
+        .expect("first runtime")
+        .cached_scheme_stats(0, 0)
+        .expect("read first stats");
+    managed
+        .runtime(1)
+        .expect("second runtime")
+        .cached_scheme_stats(0, 0)
+        .expect("read second stats");
+    let ordinary_reads = model.read_count() - reads;
+
+    let reads = model.read_count();
+    managed
+        .runtime_batch(|batch| {
+            batch.kdamond(0)?.cached_scheme_stats(0, 0)?;
+            batch.kdamond(1)?.cached_scheme_stats(0, 0)?;
+            Ok(())
+        })
+        .expect("read hierarchy batch");
+    let batched_reads = model.read_count() - reads;
+
+    assert!(batched_reads < ordinary_reads);
+    managed.close().expect("close hierarchy");
+}
+
+#[test]
+fn managed_capabilities_are_available_before_start() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let managed = damon
+        .managed_hierarchy(&transaction_config(42, Action::Stat))
+        .expect("stage managed hierarchy");
+
+    let capabilities = managed
+        .capabilities(0, 0, 0)
+        .expect("discover staged capabilities");
+
+    assert!(capabilities.supports_operation(&Operation::VirtualAddress));
     managed.close().expect("close hierarchy");
 }

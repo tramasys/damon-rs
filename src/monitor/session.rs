@@ -3,10 +3,11 @@
 use super::{
     AddressUnit, Capabilities, DEFAULT_SESSION_LOCK_PATH, DamonAdmin, DamonConfig, Error,
     FvaddrSessionBuilder, KdamondCommand, ManagedHierarchy, MonitorBuilder, PaddrSessionBuilder,
-    Path, PathBuf, Pid, RawSnapshot, Result, RuntimeBatch, SchemeStats, SessionLock,
-    StagedConfiguration, VaddrSessionBuilder, WorkflowOptions, ensure_hierarchy_stopped,
-    replaceable_configuration_read_error, restore_after_capability_probe, restore_configuration,
-    retry_busy, stage_and_verify_configuration, stage_capability_probe, with_rollback,
+    Path, PathBuf, Pid, QuotaGoalConfig, RawSnapshot, Result, RuntimeBatch, SchemeStats,
+    SessionLock, StagedConfiguration, VaddrSessionBuilder, WorkflowOptions,
+    ensure_hierarchy_stopped, replaceable_configuration_read_error, restore_after_capability_probe,
+    restore_configuration, retry_busy, stage_and_verify_configuration, stage_capability_probe,
+    with_rollback,
 };
 
 /// Entry point for high-level DAMON monitoring.
@@ -63,7 +64,7 @@ impl Damon {
     pub fn vaddr(&self) -> VaddrSessionBuilder<'_> {
         VaddrSessionBuilder {
             options: WorkflowOptions::new(self),
-            pid: None,
+            targets: Vec::new(),
         }
     }
 
@@ -72,7 +73,7 @@ impl Damon {
     pub fn fvaddr(&self) -> FvaddrSessionBuilder<'_> {
         FvaddrSessionBuilder {
             options: WorkflowOptions::new(self),
-            pid: None,
+            targets: Vec::new(),
         }
     }
 
@@ -329,10 +330,17 @@ impl ExclusiveSession {
         self.managed.update_configuration(config, &[0])
     }
 
-    /// Applies staged DAMOS quota-goal changes to the running kdamond.
-    pub fn commit_scheme_quota_goals(&mut self) -> Result<()> {
-        self.command_after_ownership_check(&KdamondCommand::CommitSchemesQuotaGoals)?;
-        self.verify_running_identity()
+    /// Transactionally replaces one scheme's quota goals and commits only
+    /// quota-goal inputs to the running kdamond.
+    pub fn update_scheme_quota_goals(
+        &mut self,
+        context_index: usize,
+        scheme_index: usize,
+        goals: &[QuotaGoalConfig],
+    ) -> Result<()> {
+        self.managed
+            .runtime(0)?
+            .update_scheme_quota_goals(context_index, scheme_index, goals)
     }
 
     /// Pauses the first monitoring context and commits the request.
@@ -347,12 +355,12 @@ impl ExclusiveSession {
 
     /// Pauses one monitoring context and commits the request.
     pub fn pause_context(&mut self, context_index: usize) -> Result<()> {
-        self.set_context_paused(context_index, true)
+        self.managed.runtime(0)?.pause_context(context_index)
     }
 
     /// Resumes one monitoring context and commits the request.
     pub fn resume_context(&mut self, context_index: usize) -> Result<()> {
-        self.set_context_paused(context_index, false)
+        self.managed.runtime(0)?.resume_context(context_index)
     }
 
     /// Refreshes and reads one scheme's runtime statistics.
@@ -361,11 +369,9 @@ impl ExclusiveSession {
         context_index: usize,
         scheme_index: usize,
     ) -> Result<SchemeStats> {
-        let scheme = self.scheme(context_index, scheme_index)?;
-        self.command_after_ownership_check(&KdamondCommand::UpdateSchemesStats)?;
-        let stats = scheme.stats()?;
-        self.verify_running_identity()?;
-        Ok(stats)
+        self.managed
+            .runtime(0)?
+            .scheme_stats(context_index, scheme_index)
     }
 
     /// Reads the last materialized scheme statistics without requesting a
@@ -388,18 +394,43 @@ impl ExclusiveSession {
         scheme_index: usize,
         capacity_hint: usize,
     ) -> Result<RawSnapshot> {
-        let scheme = self.scheme(context_index, scheme_index)?;
-        self.command_after_ownership_check(&KdamondCommand::UpdateSchemesTriedRegions)?;
-        let snapshot = scheme.tried_regions(capacity_hint)?;
+        self.managed
+            .runtime(0)?
+            .tried_regions(context_index, scheme_index, capacity_hint)
+    }
+
+    /// Reads one scheme's already materialized tried regions.
+    pub fn cached_tried_regions(
+        &self,
+        context_index: usize,
+        scheme_index: usize,
+        capacity_hint: usize,
+    ) -> Result<RawSnapshot> {
+        self.verify_running()?;
+        let snapshot = self
+            .scheme(context_index, scheme_index)?
+            .tried_regions(capacity_hint)?;
         self.verify_running_identity()?;
         Ok(snapshot)
     }
 
     /// Refreshes and reads one scheme's total tried size in core address units.
     pub fn tried_bytes_units(&mut self, context_index: usize, scheme_index: usize) -> Result<u64> {
-        let scheme = self.scheme(context_index, scheme_index)?;
-        self.command_after_ownership_check(&KdamondCommand::UpdateSchemesTriedBytes)?;
-        let units = scheme.tried_bytes_units()?;
+        self.managed
+            .runtime(0)?
+            .tried_bytes_units(context_index, scheme_index)
+    }
+
+    /// Reads one scheme's already materialized total tried units.
+    pub fn cached_tried_bytes_units(
+        &self,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<u64> {
+        self.verify_running()?;
+        let units = self
+            .scheme(context_index, scheme_index)?
+            .tried_bytes_units()?;
         self.verify_running_identity()?;
         Ok(units)
     }
@@ -410,11 +441,9 @@ impl ExclusiveSession {
         context_index: usize,
         scheme_index: usize,
     ) -> Result<u64> {
-        let scheme = self.scheme(context_index, scheme_index)?;
-        self.command_after_ownership_check(&KdamondCommand::UpdateSchemesEffectiveQuotas)?;
-        let units = scheme.quotas().effective_size_units()?;
-        self.verify_running_identity()?;
-        Ok(units)
+        self.managed
+            .runtime(0)?
+            .effective_quota_units(context_index, scheme_index)
     }
 
     /// Reads the last materialized effective quota without requesting a
@@ -446,86 +475,17 @@ impl ExclusiveSession {
         &mut self,
         operation: impl FnOnce(&mut RuntimeBatch<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.verify_running()?;
-        let result = {
-            let mut batch = RuntimeBatch { session: self };
-            operation(&mut batch)
-        };
-        let ownership = self.verify_running_identity();
-        ownership?;
-        result
+        self.managed.runtime(0)?.runtime_batch(operation)
     }
 
     /// Refreshes auto-tuned interval values for the running kdamond.
     pub fn update_tuned_intervals(&mut self) -> Result<()> {
-        self.command_after_ownership_check(&KdamondCommand::UpdateTunedIntervals)?;
-        self.verify_running_identity()
+        self.managed.runtime(0)?.update_tuned_intervals()
     }
 
     /// Clears all materialized tried-region results.
     pub fn clear_tried_regions(&mut self) -> Result<()> {
-        self.command_after_ownership_check(&KdamondCommand::ClearSchemesTriedRegions)?;
-        self.verify_running_identity()
-    }
-
-    fn set_context_paused(&mut self, context_index: usize, paused: bool) -> Result<()> {
-        self.verify_running()?;
-        let kdamond = self.managed.kdamond(0);
-        let context_count = kdamond.context_count()?;
-        if context_index >= context_count {
-            return Err(Error::IndexOutOfBounds {
-                kind: "context",
-                index: context_index,
-                count: context_count,
-            });
-        }
-        let context = kdamond.context(context_index);
-        if !context.pause_control_available()? {
-            return Err(Error::UnsupportedFeature {
-                feature: "DAMON context pause",
-            });
-        }
-        let previous = context.is_paused()?;
-        if previous == paused {
-            return Ok(());
-        }
-        let previous_fingerprint = self.managed.staged.configuration.clone();
-        let pause_path = context.path().join("pause");
-        context.set_paused(paused)?;
-        let operation = (|| {
-            retry_busy(|| kdamond.command(&KdamondCommand::Commit))?;
-            self.verify_running_identity_only()?;
-            let observed = context.is_paused()?;
-            if observed != paused {
-                return Err(Error::ConfigurationMismatch {
-                    path: format!("contexts/{context_index}/pause").into(),
-                    expected: paused.to_string().into(),
-                    observed: observed.to_string().into(),
-                });
-            }
-            let refreshed = self.managed.staged.configuration.refreshed_paths_except(
-                std::slice::from_ref(&pause_path),
-                &self.managed.staged.volatile_paths,
-            )?;
-            self.verify_running_identity_only()?;
-            self.managed.staged.configuration = refreshed;
-            Ok(())
-        })();
-        if let Err(operation) = operation {
-            let rollback = (|| {
-                context.set_paused(previous)?;
-                retry_busy(|| kdamond.command(&KdamondCommand::Commit))?;
-                let restored = previous_fingerprint.refreshed_paths_except(
-                    std::slice::from_ref(&pause_path),
-                    &self.managed.staged.volatile_paths,
-                )?;
-                self.verify_running_identity_only()?;
-                self.managed.staged.configuration = restored;
-                Ok(())
-            })();
-            return Err(with_rollback(operation, rollback));
-        }
-        Ok(())
+        self.managed.runtime(0)?.clear_tried_regions()
     }
 
     fn command_after_ownership_check(&self, command: &KdamondCommand) -> Result<()> {
@@ -558,10 +518,6 @@ impl ExclusiveSession {
         Ok(context.scheme(scheme_index))
     }
 
-    pub(super) fn kdamond(&self) -> crate::sysfs::Kdamond {
-        self.managed.kdamond(0)
-    }
-
     fn verify_owned_state(&self) -> Result<()> {
         self.managed.verify_owned_state()
     }
@@ -572,9 +528,5 @@ impl ExclusiveSession {
 
     fn verify_running_identity(&self) -> Result<()> {
         self.managed.verify_running_identity(0)
-    }
-
-    pub(super) fn verify_running_identity_only(&self) -> Result<()> {
-        self.managed.verify_running_identity_only(0)
     }
 }

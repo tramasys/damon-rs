@@ -396,6 +396,14 @@ impl Capabilities {
         self.sync_operation_features();
     }
 
+    pub(crate) fn confirm_feature(&mut self, feature: SysfsFeature) {
+        set_feature_support(&mut self.features, feature, CapabilitySupport::Supported);
+    }
+
+    pub(crate) fn reject_feature(&mut self, feature: SysfsFeature) {
+        set_feature_support(&mut self.features, feature, CapabilitySupport::Unsupported);
+    }
+
     pub(crate) fn apply_feature_capabilities(
         &mut self,
         capabilities: impl IntoIterator<Item = FeatureCapability>,

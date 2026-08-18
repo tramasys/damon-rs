@@ -7,6 +7,14 @@ use super::{
 };
 
 impl SchemeQuotas {
+    pub(crate) fn validate_goals(goals: &[QuotaGoalConfig]) -> Result<()> {
+        validate_count("quota goal count", goals.len())?;
+        for goal in goals {
+            goal.validate()?;
+        }
+        Ok(())
+    }
+
     /// Returns this quota directory's sysfs path.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -125,23 +133,12 @@ impl SchemeQuotas {
 
     /// Reads the owned quota configuration.
     pub fn configuration(&self) -> Result<QuotaConfig> {
-        let goals_path = self.path.join("goals/nr_goals");
-        let goals = if path_exists(&goals_path)? {
-            let count = self.goal_count()?;
-            let mut values = Vec::with_capacity(count.min(MAX_EAGER_READ_CAPACITY));
-            for index in 0..count {
-                values.push(self.goal(index).configuration()?);
-            }
-            values
-        } else {
-            Vec::new()
-        };
         Ok(QuotaConfig {
             time: self.time()?,
             size_units: self.size_units()?,
             reset_interval: self.reset_interval()?,
             weights: self.weights()?,
-            goals,
+            goals: self.goal_configurations()?,
             goal_tuner: optional_read(&self.path.join("goal_tuner"), || self.goal_tuner())?
                 .unwrap_or_default(),
             failure_charge_numerator: optional_read(&self.path.join("fail_charge_num"), || {
@@ -154,6 +151,48 @@ impl SchemeQuotas {
             )?
             .unwrap_or(0),
         })
+    }
+
+    pub(crate) fn goal_configurations(&self) -> Result<Vec<QuotaGoalConfig>> {
+        let goals_path = self.path.join("goals/nr_goals");
+        if !path_exists(&goals_path)? {
+            return Ok(Vec::new());
+        }
+        let count = self.goal_count()?;
+        let mut values = Vec::with_capacity(count.min(MAX_EAGER_READ_CAPACITY));
+        for index in 0..count {
+            values.push(self.goal(index).configuration()?);
+        }
+        Ok(values)
+    }
+
+    pub(crate) fn stage_goals_from(
+        &self,
+        goals: &[QuotaGoalConfig],
+        observed: Option<&[QuotaGoalConfig]>,
+    ) -> Result<()> {
+        Self::validate_goals(goals)?;
+        if observed == Some(goals) {
+            return Ok(());
+        }
+        let goals_path = self.path.join("goals/nr_goals");
+        if !path_exists(&goals_path)? {
+            return if goals.is_empty() {
+                Ok(())
+            } else {
+                Err(Error::UnsupportedFeature {
+                    feature: "DAMOS quota goals",
+                })
+            };
+        }
+        ensure_count(&goals_path, goals.len())?;
+        let comparable = observed.filter(|values| values.len() == goals.len());
+        for (index, goal) in goals.iter().enumerate() {
+            if comparable.is_none_or(|values| &values[index] != goal) {
+                self.goal(index).stage_configuration(goal)?;
+            }
+        }
+        Ok(())
     }
 
     pub(in crate::sysfs::configuration) fn stage_configuration_from(
@@ -180,22 +219,7 @@ impl SchemeQuotas {
             self.set_weights(config.weights)?;
         }
         if needs_stage(observed.map(|value| &value.goals), &config.goals) {
-            let goals_path = self.path.join("goals/nr_goals");
-            if path_exists(&goals_path)? {
-                ensure_count(&goals_path, config.goals.len())?;
-                let observed_goals = observed
-                    .map(|value| value.goals.as_slice())
-                    .filter(|goals| goals.len() == config.goals.len());
-                for (index, goal) in config.goals.iter().enumerate() {
-                    if observed_goals.is_none_or(|values| &values[index] != goal) {
-                        self.goal(index).stage_configuration(goal)?;
-                    }
-                }
-            } else if !config.goals.is_empty() {
-                return Err(Error::UnsupportedFeature {
-                    feature: "DAMOS quota goals",
-                });
-            }
+            self.stage_goals_from(&config.goals, observed.map(|value| value.goals.as_slice()))?;
         }
         if needs_stage(observed.map(|value| &value.goal_tuner), &config.goal_tuner) {
             stage_optional_default(

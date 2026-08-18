@@ -5,13 +5,14 @@ use std::time::Duration;
 
 use crate::sysfs::{
     AccessCountRange, AccessPattern, Action, AgeRange, CapabilitySupport, ConfigurationFingerprint,
-    ConfigurationSnapshot, ContextConfig, DamonAdmin, DamonConfig, InitialRegionConfig, Kdamond,
-    KdamondCommand, KdamondConfig, KdamondState, Operation, ProbeConfig, RegionSizeRange,
-    SchemeConfig, SchemeStats, SysfsFeature, TargetConfig,
+    ConfigurationSnapshot, ContextConfig, DamonAdmin, DamonConfig, FilterConfig,
+    InitialRegionConfig, Kdamond, KdamondCommand, KdamondConfig, KdamondState, Operation,
+    ProbeConfig, QuotaGoalConfig, RegionSizeRange, SchemeConfig, SchemeStats, SysfsFeature,
+    TargetConfig,
 };
 use crate::{
     AddressUnit, Capabilities, Error, MonitoringIntervals, Pid, RawSnapshot, RegionBounds, Result,
-    Snapshot,
+    ScopedSnapshot, SnapshotScope, TargetIdentity,
 };
 
 /// Conventional advisory lock used by high-level DAMON sessions.
@@ -24,7 +25,7 @@ mod session;
 mod workflow;
 
 pub use hierarchy::ManagedHierarchy;
-pub use runtime::RuntimeBatch;
+pub use runtime::{HierarchyRuntimeBatch, ManagedKdamond, RuntimeBatch};
 pub use session::{Damon, ExclusiveSession};
 pub use workflow::*;
 

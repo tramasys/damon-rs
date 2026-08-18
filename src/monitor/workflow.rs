@@ -3,9 +3,9 @@
 use super::{
     AccessCountRange, AccessPattern, Action, AddressUnit, AgeRange, Capabilities,
     CapabilitySupport, ContextConfig, Damon, DamonConfig, Duration, Error, ExclusiveSession,
-    InitialRegionConfig, KdamondConfig, MonitoringIntervals, Operation, Pid, ProbeConfig,
-    RegionBounds, RegionSizeRange, Result, SchemeConfig, SchemeStats, Snapshot, SysfsFeature,
-    TargetConfig, with_rollback,
+    FilterConfig, InitialRegionConfig, KdamondConfig, MonitoringIntervals, Operation, Pid,
+    ProbeConfig, RegionBounds, RegionSizeRange, Result, SchemeConfig, SchemeStats, ScopedSnapshot,
+    SnapshotScope, SysfsFeature, TargetConfig, TargetIdentity, with_rollback,
 };
 
 #[derive(Clone, Debug)]
@@ -43,7 +43,7 @@ impl<'a> WorkflowOptions<'a> {
 #[derive(Clone, Debug)]
 pub struct VaddrSessionBuilder<'a> {
     pub(super) options: WorkflowOptions<'a>,
-    pub(super) pid: Option<Pid>,
+    pub(super) targets: Vec<ProcessTarget>,
 }
 
 /// Backwards-compatible name for [`VaddrSessionBuilder`].
@@ -53,7 +53,62 @@ pub type MonitorBuilder<'a> = VaddrSessionBuilder<'a>;
 #[derive(Clone, Debug)]
 pub struct FvaddrSessionBuilder<'a> {
     pub(super) options: WorkflowOptions<'a>,
-    pub(super) pid: Option<Pid>,
+    pub(super) targets: Vec<ProcessTarget>,
+}
+
+/// One process target for a vaddr or fvaddr workflow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessTarget {
+    pid: Pid,
+    initial_regions: Option<Vec<InitialRegionConfig>>,
+}
+
+impl ProcessTarget {
+    /// Creates a process target with no explicit initial regions.
+    #[must_use]
+    pub const fn new(pid: Pid) -> Self {
+        Self {
+            pid,
+            initial_regions: None,
+        }
+    }
+
+    /// Returns the target process identifier.
+    #[must_use]
+    pub const fn pid(&self) -> Pid {
+        self.pid
+    }
+
+    /// Returns the target-specific initial-region override.
+    ///
+    /// `None` inherits the builder's regions. `Some(&[])` is an explicit empty
+    /// override.
+    #[must_use]
+    pub fn initial_regions(&self) -> Option<&[InitialRegionConfig]> {
+        self.initial_regions.as_deref()
+    }
+
+    /// Replaces this target's initial regions.
+    #[must_use]
+    pub fn regions(mut self, regions: impl IntoIterator<Item = InitialRegionConfig>) -> Self {
+        self.initial_regions = Some(regions.into_iter().collect());
+        self
+    }
+
+    /// Appends one initial region for this target.
+    #[must_use]
+    pub fn region(mut self, region: InitialRegionConfig) -> Self {
+        self.initial_regions
+            .get_or_insert_with(Vec::new)
+            .push(region);
+        self
+    }
+}
+
+impl From<Pid> for ProcessTarget {
+    fn from(pid: Pid) -> Self {
+        Self::new(pid)
+    }
 }
 
 /// Builder for a physical-address monitoring workflow.
@@ -121,7 +176,7 @@ macro_rules! impl_common_workflow_builder {
             /// Replaces the custom DAMOS schemes.
             ///
             /// The workflow adds a private match-all statistics scheme after
-            /// these schemes so [`Monitor::snapshot`] remains independent of
+            /// these schemes so [`Monitor::materialize_snapshot`] remains independent of
             /// user policy. Address and size values use DAMON core units.
             #[must_use]
             pub fn schemes(mut self, schemes: impl IntoIterator<Item = SchemeConfig>) -> Self {
@@ -144,14 +199,34 @@ impl_common_workflow_builder!(FvaddrSessionBuilder);
 impl_common_workflow_builder!(PaddrSessionBuilder);
 
 impl VaddrSessionBuilder<'_> {
-    /// Selects the single process monitored by this workflow.
+    /// Replaces the workflow targets with one process.
     #[must_use]
     pub fn pid(mut self, pid: Pid) -> Self {
-        self.pid = Some(pid);
+        self.targets = vec![ProcessTarget::new(pid)];
         self
     }
 
-    /// Replaces optional initial regions expressed as byte addresses.
+    /// Replaces all process targets.
+    #[must_use]
+    pub fn targets<T>(mut self, targets: impl IntoIterator<Item = T>) -> Self
+    where
+        T: Into<ProcessTarget>,
+    {
+        self.targets = targets.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Appends one process target.
+    #[must_use]
+    pub fn target(mut self, target: impl Into<ProcessTarget>) -> Self {
+        self.targets.push(target.into());
+        self
+    }
+
+    /// Replaces optional common initial regions expressed as byte addresses.
+    ///
+    /// These regions are used by each target that has no target-specific
+    /// regions.
     #[must_use]
     pub fn regions(mut self, regions: impl IntoIterator<Item = InitialRegionConfig>) -> Self {
         self.options.initial_regions = regions.into_iter().collect();
@@ -170,28 +245,50 @@ impl VaddrSessionBuilder<'_> {
     /// The returned monitor holds the cooperative lock and restores the
     /// preceding stopped configuration when explicitly stopped or dropped.
     pub fn start(self) -> Result<Monitor> {
-        let pid = self.pid.ok_or(Error::InvalidConfiguration {
-            field: "virtual-address PID",
-            reason: "requires exactly one process identifier",
-        })?;
+        if self.targets.is_empty() {
+            return Err(Error::InvalidConfiguration {
+                field: "virtual-address targets",
+                reason: "requires at least one process identifier",
+            });
+        }
         start_workflow(
             self.options,
             Operation::VirtualAddress,
-            Some(pid),
+            self.targets,
             AddressUnit::ONE,
         )
     }
 }
 
 impl FvaddrSessionBuilder<'_> {
-    /// Selects the single process monitored by this workflow.
+    /// Replaces the workflow targets with one process.
     #[must_use]
     pub fn pid(mut self, pid: Pid) -> Self {
-        self.pid = Some(pid);
+        self.targets = vec![ProcessTarget::new(pid)];
         self
     }
 
-    /// Replaces required fixed regions expressed as byte addresses.
+    /// Replaces all process targets.
+    #[must_use]
+    pub fn targets<T>(mut self, targets: impl IntoIterator<Item = T>) -> Self
+    where
+        T: Into<ProcessTarget>,
+    {
+        self.targets = targets.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Appends one process target.
+    #[must_use]
+    pub fn target(mut self, target: impl Into<ProcessTarget>) -> Self {
+        self.targets.push(target.into());
+        self
+    }
+
+    /// Replaces required common fixed regions expressed as byte addresses.
+    ///
+    /// These regions are used by each target that has no target-specific
+    /// regions.
     #[must_use]
     pub fn regions(mut self, regions: impl IntoIterator<Item = InitialRegionConfig>) -> Self {
         self.options.initial_regions = regions.into_iter().collect();
@@ -210,14 +307,16 @@ impl FvaddrSessionBuilder<'_> {
     /// The returned monitor holds the cooperative lock and restores the
     /// preceding stopped configuration when explicitly stopped or dropped.
     pub fn start(self) -> Result<Monitor> {
-        let pid = self.pid.ok_or(Error::InvalidConfiguration {
-            field: "fixed virtual-address PID",
-            reason: "requires exactly one process identifier",
-        })?;
+        if self.targets.is_empty() {
+            return Err(Error::InvalidConfiguration {
+                field: "fixed virtual-address targets",
+                reason: "requires at least one process identifier",
+            });
+        }
         start_workflow(
             self.options,
             Operation::FixedVirtualAddress,
-            Some(pid),
+            self.targets,
             AddressUnit::ONE,
         )
     }
@@ -253,7 +352,7 @@ impl PaddrSessionBuilder<'_> {
         start_workflow(
             self.options,
             Operation::PhysicalAddress,
-            None,
+            Vec::new(),
             self.address_unit,
         )
     }
@@ -263,6 +362,7 @@ struct PreparedWorkflow {
     base_config: DamonConfig,
     capability_config: DamonConfig,
     snapshot_scheme_index: usize,
+    target_identities: Box<[TargetIdentity]>,
     custom_scheme_count: usize,
     capacity_hint: usize,
     sample_interval: Duration,
@@ -271,20 +371,34 @@ struct PreparedWorkflow {
 fn prepare_workflow(
     options: WorkflowOptions<'_>,
     operation: Operation,
-    pid: Option<Pid>,
+    process_targets: Vec<ProcessTarget>,
     address_unit: AddressUnit,
 ) -> Result<PreparedWorkflow> {
     let intervals = MonitoringIntervals::new(options.sample, options.aggregation, options.update)?;
     let region_bounds = RegionBounds::new(options.min_regions, options.max_regions)?;
-    let mut target = pid.map_or_else(TargetConfig::address_space, TargetConfig::for_pid);
-    target.initial_regions = options.initial_regions;
-
     let mut context = ContextConfig::new(operation);
     context.address_unit = address_unit;
     context.intervals = intervals;
     context.region_bounds = region_bounds;
     context.probes = options.probes;
-    context.targets.push(target);
+    let mut target_identities = Vec::new();
+    if process_targets.is_empty() {
+        let mut target = TargetConfig::address_space();
+        target.initial_regions = options.initial_regions;
+        context.targets.push(target);
+        target_identities.push(TargetIdentity::new(0, None));
+    } else {
+        target_identities.reserve(process_targets.len());
+        context.targets.reserve(process_targets.len());
+        for (target_index, process_target) in process_targets.into_iter().enumerate() {
+            let mut target = TargetConfig::for_pid(process_target.pid);
+            target.initial_regions = process_target
+                .initial_regions
+                .unwrap_or_else(|| options.initial_regions.clone());
+            context.targets.push(target);
+            target_identities.push(TargetIdentity::new(target_index, Some(process_target.pid)));
+        }
+    }
     context.schemes = options.schemes;
     let snapshot_scheme_index = context.schemes.len();
 
@@ -303,6 +417,7 @@ fn prepare_workflow(
         base_config,
         capability_config,
         snapshot_scheme_index,
+        target_identities: target_identities.into_boxed_slice(),
         custom_scheme_count: snapshot_scheme_index,
         capacity_hint: usize::try_from(region_bounds.max()).unwrap_or(usize::MAX),
         sample_interval: intervals.sample(),
@@ -312,11 +427,11 @@ fn prepare_workflow(
 fn start_workflow(
     options: WorkflowOptions<'_>,
     operation: Operation,
-    pid: Option<Pid>,
+    process_targets: Vec<ProcessTarget>,
     address_unit: AddressUnit,
 ) -> Result<Monitor> {
     let damon = options.damon;
-    let prepared = prepare_workflow(options, operation.clone(), pid, address_unit)?;
+    let prepared = prepare_workflow(options, operation.clone(), process_targets, address_unit)?;
     let mut session = match damon.exclusive_session(&prepared.capability_config) {
         Ok(session) => session,
         Err(error) => return Err(classify_operation_staging_error(error, &operation)),
@@ -334,40 +449,23 @@ fn start_workflow(
             session.close(),
         ));
     }
-    let snapshot_query = if capabilities.feature_support(SysfsFeature::TriedRegions)
-        != CapabilitySupport::Supported
-    {
-        if let Err(error) = session.replace_staged_configuration(&prepared.base_config) {
-            return Err(with_rollback(error, session.close()));
-        }
-        SnapshotQuery::Unsupported
-    } else if capabilities.feature_support(SysfsFeature::OnlineParametersCommit)
-        == CapabilitySupport::Supported
-    {
-        let mut query_config = prepared.base_config.clone();
-        let apply_interval = if capabilities.feature_support(SysfsFeature::SchemeApplyInterval)
-            == CapabilitySupport::Supported
-        {
-            prepared.sample_interval
-        } else {
-            Duration::ZERO
-        };
-        query_config.kdamonds[0].contexts[0]
-            .schemes
-            .push(snapshot_query_scheme(apply_interval));
-        if let Err(error) = session.replace_staged_configuration(&prepared.base_config) {
-            return Err(with_rollback(error, session.close()));
-        }
-        SnapshotQuery::OnDemand {
-            base_config: Box::new(prepared.base_config),
-            query_config: Box::new(query_config),
-            scheme_index: prepared.snapshot_scheme_index,
-            installed: false,
-        }
-    } else {
-        SnapshotQuery::Permanent {
-            scheme_index: prepared.snapshot_scheme_index,
-        }
+    let PreparedWorkflow {
+        base_config,
+        target_identities,
+        custom_scheme_count,
+        capacity_hint,
+        sample_interval,
+        ..
+    } = prepared;
+    let (snapshot_query, maximum_snapshot_apply_interval) = match prepare_snapshot_query(
+        &mut session,
+        &mut capabilities,
+        base_config,
+        &target_identities,
+        sample_interval,
+    ) {
+        Ok(result) => result,
+        Err(error) => return Err(with_rollback(error, session.close())),
     };
     if let Err(error) = session.start() {
         let start_rollback_failed = matches!(error, Error::Rollback { .. });
@@ -383,12 +481,77 @@ fn start_workflow(
     Ok(Monitor {
         session: Some(session),
         capabilities,
-        capacity_hint: prepared.capacity_hint,
+        capacity_hint,
         operation,
         effective_address_unit: address_unit,
         snapshot_query,
-        custom_scheme_count: prepared.custom_scheme_count,
+        custom_scheme_count,
+        maximum_snapshot_apply_interval,
+        cached_snapshots: Vec::new(),
     })
+}
+
+fn prepare_snapshot_query(
+    session: &mut ExclusiveSession,
+    capabilities: &mut Capabilities,
+    base_config: DamonConfig,
+    target_identities: &[TargetIdentity],
+    sample_interval: Duration,
+) -> Result<(SnapshotQuery, Duration)> {
+    let online_commit_supported = capabilities
+        .feature_support(SysfsFeature::OnlineParametersCommit)
+        == CapabilitySupport::Supported;
+    let apply_interval = if online_commit_supported
+        && capabilities.feature_support(SysfsFeature::SchemeApplyInterval)
+            == CapabilitySupport::Supported
+    {
+        sample_interval
+    } else {
+        Duration::ZERO
+    };
+    let tried_regions_supported =
+        capabilities.feature_support(SysfsFeature::TriedRegions) == CapabilitySupport::Supported;
+    let (query_config, descriptors) = if tried_regions_supported
+        && target_identities.len() > 1
+        && capabilities.feature_support(SysfsFeature::SchemeFilterTarget)
+            != CapabilitySupport::Unsupported
+    {
+        let (filtered, descriptors) =
+            snapshot_query_configuration(&base_config, target_identities, apply_interval, true);
+        match session.replace_staged_configuration(&filtered) {
+            Ok(()) => {
+                let filtered_scheme_indices =
+                    (0..filtered.kdamonds[0].contexts[0].schemes.len()).collect::<Vec<_>>();
+                *capabilities = session.capabilities_for_schemes(0, &filtered_scheme_indices)?;
+                capabilities.confirm_feature(SysfsFeature::SchemeFilterTarget);
+                (filtered, descriptors)
+            }
+            Err(error) if target_filter_is_unsupported(&error) => {
+                capabilities.reject_feature(SysfsFeature::SchemeFilterTarget);
+                snapshot_query_configuration(&base_config, target_identities, apply_interval, false)
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        snapshot_query_configuration(&base_config, target_identities, apply_interval, false)
+    };
+    let maximum_snapshot_apply_interval = maximum_effective_apply_interval(&query_config);
+    let snapshot_query = if !tried_regions_supported {
+        session.replace_staged_configuration(&base_config)?;
+        SnapshotQuery::Unsupported
+    } else if online_commit_supported {
+        session.replace_staged_configuration(&base_config)?;
+        SnapshotQuery::OnDemand {
+            base_config: Box::new(base_config),
+            query_config: Box::new(query_config),
+            descriptors,
+            installed: false,
+        }
+    } else {
+        session.replace_staged_configuration(&query_config)?;
+        SnapshotQuery::Permanent { descriptors }
+    };
+    Ok((snapshot_query, maximum_snapshot_apply_interval))
 }
 
 fn classify_operation_staging_error(error: Error, operation: &Operation) -> Error {
@@ -426,18 +589,139 @@ fn snapshot_query_scheme(apply_interval: Duration) -> SchemeConfig {
     scheme
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SnapshotDescriptor {
+    scheme_index: usize,
+    scope: SnapshotScope,
+}
+
+fn snapshot_query_configuration(
+    base_config: &DamonConfig,
+    target_identities: &[TargetIdentity],
+    apply_interval: Duration,
+    isolate_targets: bool,
+) -> (DamonConfig, Box<[SnapshotDescriptor]>) {
+    let mut config = base_config.clone();
+    let schemes = &mut config.kdamonds[0].contexts[0].schemes;
+    let first_scheme_index = schemes.len();
+    if target_identities.len() == 1 {
+        schemes.push(snapshot_query_scheme(apply_interval));
+        return (
+            config,
+            vec![SnapshotDescriptor {
+                scheme_index: first_scheme_index,
+                scope: SnapshotScope::Target(target_identities[0]),
+            }]
+            .into_boxed_slice(),
+        );
+    }
+    if isolate_targets {
+        let mut descriptors = Vec::with_capacity(target_identities.len());
+        for identity in target_identities.iter().copied() {
+            let mut scheme = snapshot_query_scheme(apply_interval);
+            scheme
+                .filters
+                .push(FilterConfig::target(identity.target_index(), false, false));
+            let scheme_index = schemes.len();
+            schemes.push(scheme);
+            descriptors.push(SnapshotDescriptor {
+                scheme_index,
+                scope: SnapshotScope::Target(identity),
+            });
+        }
+        return (config, descriptors.into_boxed_slice());
+    }
+
+    schemes.push(snapshot_query_scheme(apply_interval));
+    (
+        config,
+        vec![SnapshotDescriptor {
+            scheme_index: first_scheme_index,
+            scope: SnapshotScope::Ungrouped,
+        }]
+        .into_boxed_slice(),
+    )
+}
+
+fn maximum_effective_apply_interval(config: &DamonConfig) -> Duration {
+    config
+        .kdamonds
+        .iter()
+        .flat_map(|kdamond| &kdamond.contexts)
+        .flat_map(|context| {
+            context.schemes.iter().map(move |scheme| {
+                if scheme.apply_interval.is_zero() {
+                    context.intervals.aggregation()
+                } else {
+                    scheme.apply_interval
+                }
+            })
+        })
+        .max()
+        .unwrap_or(Duration::ZERO)
+}
+
+fn target_filter_is_unsupported(error: &Error) -> bool {
+    match error {
+        Error::UnsupportedFeature { .. } => true,
+        Error::Io { path, source, .. } => {
+            source.raw_os_error() == Some(22)
+                && path
+                    .components()
+                    .any(|component| component.as_os_str().to_string_lossy().contains("filter"))
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 enum SnapshotQuery {
     Unsupported,
     Permanent {
-        scheme_index: usize,
+        descriptors: Box<[SnapshotDescriptor]>,
     },
     OnDemand {
         base_config: Box<DamonConfig>,
         query_config: Box<DamonConfig>,
-        scheme_index: usize,
+        descriptors: Box<[SnapshotDescriptor]>,
         installed: bool,
     },
+}
+
+fn materialize_scoped_snapshots(
+    session: &mut ExclusiveSession,
+    descriptors: &[SnapshotDescriptor],
+    capacity_hint: usize,
+    address_unit: AddressUnit,
+) -> Result<Vec<ScopedSnapshot>> {
+    let Some((first, remaining)) = descriptors.split_first() else {
+        return Err(Error::InvalidConfiguration {
+            field: "snapshot query schemes",
+            reason: "requires at least one scheme",
+        });
+    };
+    session.runtime_batch(|batch| {
+        let mut snapshots = Vec::with_capacity(descriptors.len());
+        let raw = batch.tried_regions(0, first.scheme_index, capacity_hint)?;
+        snapshots.push(ScopedSnapshot::new(
+            0,
+            0,
+            first.scheme_index,
+            first.scope,
+            raw.with_effective_address_unit(address_unit),
+        ));
+        for descriptor in remaining {
+            let raw = batch.cached_tried_regions(0, descriptor.scheme_index, capacity_hint)?;
+            snapshots.push(ScopedSnapshot::new(
+                0,
+                0,
+                descriptor.scheme_index,
+                descriptor.scope,
+                raw.with_effective_address_unit(address_unit),
+            ));
+        }
+        Ok(snapshots)
+    })
 }
 
 /// A running high-level DAMON monitor holding a cooperative session lock.
@@ -454,6 +738,8 @@ pub struct Monitor {
     effective_address_unit: AddressUnit,
     snapshot_query: SnapshotQuery,
     custom_scheme_count: usize,
+    maximum_snapshot_apply_interval: Duration,
+    cached_snapshots: Vec<ScopedSnapshot>,
 }
 
 impl Monitor {
@@ -480,10 +766,27 @@ impl Monitor {
 
     /// Returns the number of custom schemes supplied to the workflow builder.
     ///
-    /// Any temporary private scheme used by [`Self::snapshot`] is not included.
+    /// Any temporary private scheme used by [`Self::materialize_snapshot`] is not included.
     #[must_use]
     pub const fn scheme_count(&self) -> usize {
         self.custom_scheme_count
+    }
+
+    /// Returns the largest effective apply interval involved in snapshots.
+    ///
+    /// A scheme with a zero apply interval uses its context's aggregation
+    /// interval. This value is a scheduling hint, not a timeout or hard upper
+    /// bound. Linux performs tried-region materialization synchronously and
+    /// provides no cancellation mechanism for the state write. `None` means
+    /// tried-region queries are unsupported.
+    #[must_use]
+    pub fn maximum_snapshot_apply_interval(&self) -> Option<Duration> {
+        match &self.snapshot_query {
+            SnapshotQuery::Unsupported => None,
+            SnapshotQuery::Permanent { .. } | SnapshotQuery::OnDemand { .. } => {
+                Some(self.maximum_snapshot_apply_interval)
+            }
+        }
     }
 
     /// Refreshes and reads one custom scheme's runtime counters.
@@ -620,41 +923,60 @@ impl Monitor {
         self.session.as_mut().ok_or(Error::NotRunning)?.resume()
     }
 
-    /// Queries the current monitored regions.
+    /// Materializes one scoped snapshot.
     ///
-    /// Every operation-specific builder creates exactly one target, so regions
-    /// are returned in that target's address order. On kernels with online
-    /// parameter commits, a private match-all `stat` scheme is installed only
-    /// for this query. Older supported kernels retain that scheme while the
-    /// monitor runs.
+    /// Use [`Self::materialize_snapshots`] for a multi-target query that the kernel can
+    /// isolate into multiple target-scoped results. Linux's synchronous
+    /// tried-region command can wait until every scheme reaches its next apply
+    /// interval and provides no timeout or cancellation. See
+    /// [`Self::maximum_snapshot_apply_interval`] for a scheduling hint.
+    pub fn materialize_snapshot(&mut self) -> Result<&ScopedSnapshot> {
+        let result_count = match &self.snapshot_query {
+            SnapshotQuery::Unsupported => None,
+            SnapshotQuery::Permanent { descriptors }
+            | SnapshotQuery::OnDemand { descriptors, .. } => Some(descriptors.len()),
+        };
+        if let Some(count) = result_count.filter(|count| *count != 1) {
+            return Err(Error::MultipleSnapshotResults { count });
+        }
+        let snapshots = self.materialize_snapshots()?;
+        Ok(&snapshots[0])
+    }
+
+    /// Materializes all target-scoped or ungrouped snapshot results.
     ///
-    /// Linux's synchronous tried-region command can wait until every configured
-    /// scheme reaches its next apply interval and provides no timeout. Mutable
-    /// access serializes result materialization for this monitor. Kernels before
-    /// tried-region queries were introduced can still run the monitor, but this
-    /// method returns [`Error::UnsupportedFeature`].
-    pub fn snapshot(&mut self) -> Result<Snapshot> {
+    /// One target-filtered private scheme is used per target when the kernel
+    /// accepts target filters. Otherwise one [`SnapshotScope::Ungrouped`]
+    /// result is returned. Target identity is never inferred from addresses.
+    pub fn materialize_snapshots(&mut self) -> Result<&[ScopedSnapshot]> {
+        let capacity_hint = self.capacity_hint;
+        let address_unit = self.effective_address_unit;
         let session = self.session.as_mut().ok_or(Error::NotRunning)?;
-        let raw = match &mut self.snapshot_query {
+        let snapshots = match &mut self.snapshot_query {
             SnapshotQuery::Unsupported => {
                 return Err(Error::UnsupportedFeature {
                     feature: "DAMOS tried-region queries",
                 });
             }
-            SnapshotQuery::Permanent { scheme_index } => {
-                session.tried_regions(0, *scheme_index, self.capacity_hint)?
+            SnapshotQuery::Permanent { descriptors } => {
+                materialize_scoped_snapshots(session, descriptors, capacity_hint, address_unit)?
             }
             SnapshotQuery::OnDemand {
                 base_config,
                 query_config,
-                scheme_index,
+                descriptors,
                 installed,
             } => {
                 if !*installed {
                     session.update_configuration(query_config)?;
                     *installed = true;
                 }
-                let operation = match session.tried_regions(0, *scheme_index, self.capacity_hint) {
+                let operation = match materialize_scoped_snapshots(
+                    session,
+                    descriptors,
+                    capacity_hint,
+                    address_unit,
+                ) {
                     Err(error @ Error::OwnershipLost { .. }) => return Err(error),
                     result => result,
                 };
@@ -663,7 +985,7 @@ impl Monitor {
                     *installed = false;
                 }
                 match (operation, restoration) {
-                    (Ok(snapshot), Ok(())) => snapshot,
+                    (Ok(snapshots), Ok(())) => snapshots,
                     (Err(operation), Ok(())) => return Err(operation),
                     (Ok(_), Err(restoration)) => return Err(restoration),
                     (Err(operation), Err(restoration)) => {
@@ -675,7 +997,26 @@ impl Monitor {
                 }
             }
         };
-        Ok(raw.with_effective_address_unit(self.effective_address_unit))
+        self.cached_snapshots = snapshots;
+        Ok(&self.cached_snapshots)
+    }
+
+    /// Returns snapshots from the last successful materialization.
+    ///
+    /// This performs no sysfs access. The slice is empty before the first
+    /// successful snapshot request.
+    #[must_use]
+    pub fn cached_snapshots(&self) -> &[ScopedSnapshot] {
+        &self.cached_snapshots
+    }
+
+    /// Returns the last singular snapshot without accessing sysfs.
+    pub fn cached_snapshot(&self) -> Result<Option<&ScopedSnapshot>> {
+        match self.cached_snapshots.len() {
+            0 => Ok(None),
+            1 => Ok(self.cached_snapshots.first()),
+            count => Err(Error::MultipleSnapshotResults { count }),
+        }
     }
 
     /// Reads whether the kernel monitoring thread is running.

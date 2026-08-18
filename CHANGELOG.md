@@ -7,7 +7,7 @@ This project follows Semantic Versioning and Keep a Changelog.
 ### Added
 
 - Safe typed access to DAMON admin sysfs
-- High-level single-target `vaddr`, `fvaddr`, and `paddr` workflow builders
+- High-level `vaddr`, `fvaddr`, and `paddr` workflow builders
 - Optional initial regions, probes, and custom DAMOS schemes in high-level
   workflows
 - Runtime custom-scheme statistics and effective quota reads
@@ -23,6 +23,11 @@ This project follows Semantic Versioning and Keep a Changelog.
   restoration of preceding stopped configurations
 - Managed multi-kdamond lifecycle with per-thread identity checks, partial-start
   rollback, selected online updates, and exact hierarchy restoration
+- Indexed ownership-safe runtime access for managed kdamonds
+- Transactional quota-goal-only updates with rollback
+- Multiple-process vaddr and fvaddr workflows with target-scoped or honest
+  ungrouped snapshots
+- Cached tried-region reads and snapshot apply-interval inspection
 - Transactional online configuration updates and checked runtime batches
 - Advisory locking, ownership fingerprints, rollback, and cleanup
 - CI for formatting, linting, tests, docs, packaging, MSRV, architectures, and

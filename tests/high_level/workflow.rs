@@ -80,7 +80,8 @@ fn stages_queries_and_cleans_up_a_monitor() {
         None
     );
 
-    let snapshot = monitor.snapshot().expect("query snapshot");
+    let snapshot = monitor.materialize_snapshot().expect("query snapshot");
+    let snapshot = snapshot.snapshot();
     assert_eq!(snapshot.total_bytes().expect("convert total"), 6_144);
     assert_eq!(snapshot.len(), 2);
     let first = snapshot.region(0).expect("first region");

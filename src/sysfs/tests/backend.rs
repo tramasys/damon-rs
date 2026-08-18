@@ -183,6 +183,37 @@ fn modeled_output_commands_materialize_stats_and_effective_quotas() {
     assert_typed_scheme_output(&first, &second);
 }
 
+#[test]
+fn tried_region_allocation_is_bounded_by_materialized_directories() {
+    let model = test_backend::Model::new("vaddr\n");
+    let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+    admin.set_kdamond_count(1).expect("stage kdamond");
+    let kdamond = admin.kdamond(0);
+    kdamond.set_context_count(1).expect("stage context");
+    let context = kdamond.context(0);
+    context.set_scheme_count(1).expect("stage scheme");
+    model.set_tried_regions(vec![test_backend::ModelRegion {
+        start: 0,
+        end: 4_096,
+        nr_accesses: 1,
+        age: 1,
+        filter_passed_units: None,
+        probe_hits: Vec::new(),
+    }]);
+    kdamond.command(&KdamondCommand::On).expect("start model");
+    kdamond
+        .command(&KdamondCommand::UpdateSchemesTriedRegions)
+        .expect("materialize one region");
+
+    let snapshot = context
+        .scheme(0)
+        .tried_regions(usize::MAX)
+        .expect("read materialized region");
+
+    assert_eq!(snapshot.len(), 1);
+    assert!(snapshot.allocated_region_capacity() < 4_096);
+}
+
 fn assert_typed_scheme_output(first: &Scheme, second: &Scheme) {
     assert_eq!(
         first.stats().expect("read typed scheme stats"),

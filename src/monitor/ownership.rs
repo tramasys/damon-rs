@@ -210,6 +210,14 @@ impl StagedOwnership {
         }
         Ok(())
     }
+
+    pub(super) fn with_configuration(&self, configuration: ConfigurationFingerprint) -> Self {
+        Self {
+            configuration,
+            volatile_paths: self.volatile_paths.clone(),
+            kdamond_count: self.kdamond_count,
+        }
+    }
 }
 
 pub(super) fn running_thread_pid(kdamond: &Kdamond) -> Result<Pid> {

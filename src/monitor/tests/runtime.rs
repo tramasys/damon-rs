@@ -287,6 +287,229 @@ fn runtime_batch_avoids_repeated_full_fingerprint_scans() {
 }
 
 #[test]
+fn quota_goal_updates_stage_values_and_roll_back_a_failed_commit() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut config = transaction_config(42, Action::Stat);
+    let mut initial_goal = QuotaGoalConfig::new(QuotaGoalMetric::UserInput, 100);
+    initial_goal.current_value = 1;
+    config.kdamonds[0].contexts[0].schemes[0]
+        .quota
+        .reset_interval = Duration::from_secs(1);
+    config.kdamonds[0].contexts[0].schemes[0].quota.goals = vec![initial_goal.clone()];
+    let mut session = damon.exclusive_session(&config).expect("stage session");
+    session.start().expect("start session");
+    let current_value = "kdamonds/0/contexts/0/schemes/0/quotas/goals/0/current_value";
+
+    let mut invalid_goal = QuotaGoalConfig::new(QuotaGoalMetric::ActiveMemoryBasisPoints, 10_001);
+    invalid_goal.current_value = 2;
+    let writes = model.write_count();
+    assert!(matches!(
+        session.update_scheme_quota_goals(0, 0, &[invalid_goal]),
+        Err(Error::InvalidConfiguration { .. })
+    ));
+    assert_eq!(model.write_count(), writes);
+
+    let mut updated_goal = initial_goal.clone();
+    updated_goal.current_value = 9;
+    session
+        .update_scheme_quota_goals(0, 0, &[updated_goal])
+        .expect("commit updated quota goal");
+    assert_eq!(model.value(current_value).as_deref(), Some("9"));
+    assert_eq!(model.active_value(current_value).as_deref(), Some("9"));
+
+    let mut unstaged_goal = initial_goal.clone();
+    unstaged_goal.current_value = 13;
+    model.fail_next_write(current_value, 5);
+    let error = session
+        .update_scheme_quota_goals(0, 0, &[unstaged_goal])
+        .expect_err("failed goal staging must roll back");
+    assert!(matches!(error, Error::Io { .. }));
+    assert_eq!(model.value(current_value).as_deref(), Some("9"));
+    assert_eq!(model.active_value(current_value).as_deref(), Some("9"));
+
+    let mut failed_goal = initial_goal.clone();
+    failed_goal.current_value = 17;
+    model.fail_next_write("kdamonds/0/state", 5);
+    let error = session
+        .update_scheme_quota_goals(0, 0, &[failed_goal])
+        .expect_err("failed specialized commit must roll back");
+    assert!(matches!(error, Error::Io { .. }));
+    assert_eq!(model.value(current_value).as_deref(), Some("9"));
+    assert_eq!(model.active_value(current_value).as_deref(), Some("9"));
+    session.close().expect("close session");
+}
+
+#[test]
+fn idempotent_pause_rechecks_ownership_after_reading_pause_state() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut session = damon
+        .exclusive_session(&transaction_config(42, Action::Stat))
+        .expect("stage session");
+    session.start().expect("start session");
+    let action = "kdamonds/0/contexts/0/schemes/0/action";
+    model.after_next_read(
+        "kdamonds/0/contexts/0/pause",
+        vec![Mutation::SetFile {
+            path: action.into(),
+            value: b"pageout\n".to_vec(),
+        }],
+    );
+
+    let error = session
+        .resume()
+        .expect_err("an idempotent resume must retain its exit ownership check");
+
+    assert!(matches!(error, Error::OwnershipLost { .. }));
+    model.set_file(action, b"stat\n");
+    session.close().expect("close repaired session");
+}
+
+#[test]
+fn quota_goal_update_does_not_adopt_an_unrelated_concurrent_change() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut config = transaction_config(42, Action::Stat);
+    let mut initial_goal = QuotaGoalConfig::new(QuotaGoalMetric::UserInput, 100);
+    initial_goal.current_value = 1;
+    config.kdamonds[0].contexts[0].schemes[0]
+        .quota
+        .reset_interval = Duration::from_secs(1);
+    config.kdamonds[0].contexts[0].schemes[0].quota.goals = vec![initial_goal.clone()];
+    let mut session = damon.exclusive_session(&config).expect("stage session");
+    session.start().expect("start session");
+    let current_value = "kdamonds/0/contexts/0/schemes/0/quotas/goals/0/current_value";
+    let action = "kdamonds/0/contexts/0/schemes/0/action";
+    model.after_next_write(
+        current_value,
+        b"9".to_vec(),
+        vec![Mutation::SetFile {
+            path: action.into(),
+            value: b"pageout\n".to_vec(),
+        }],
+    );
+    let mut updated_goal = initial_goal;
+    updated_goal.current_value = 9;
+
+    let error = session
+        .update_scheme_quota_goals(0, 0, &[updated_goal])
+        .expect_err("concurrent non-goal change must not become owned");
+
+    assert!(matches!(error, Error::Rollback { .. }));
+    assert_eq!(model.value(current_value).as_deref(), Some("1"));
+    assert_eq!(model.active_value(current_value).as_deref(), Some("1"));
+    assert_eq!(model.value(action).as_deref(), Some("pageout"));
+    model.set_file(action, b"stat\n");
+    session.close().expect("close repaired session");
+}
+
+#[test]
+fn quota_goal_update_does_not_adopt_unknown_goal_attribute_changes() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut config = transaction_config(42, Action::Stat);
+    let mut initial_goal = QuotaGoalConfig::new(QuotaGoalMetric::UserInput, 100);
+    initial_goal.current_value = 1;
+    config.kdamonds[0].contexts[0].schemes[0]
+        .quota
+        .reset_interval = Duration::from_secs(1);
+    config.kdamonds[0].contexts[0].schemes[0].quota.goals = vec![initial_goal.clone()];
+    damon
+        .stage_configuration(&config)
+        .expect("stage preceding hierarchy");
+    let future_attribute = "kdamonds/0/contexts/0/schemes/0/quotas/goals/0/future_goal_attribute";
+    model.set_file(future_attribute, b"preserve\n");
+    let mut session = damon.exclusive_session(&config).expect("stage session");
+    session.start().expect("start session");
+    let current_value = "kdamonds/0/contexts/0/schemes/0/quotas/goals/0/current_value";
+    model.after_next_write(
+        current_value,
+        b"9".to_vec(),
+        vec![Mutation::SetFile {
+            path: future_attribute.into(),
+            value: b"changed\n".to_vec(),
+        }],
+    );
+    let mut updated_goal = initial_goal;
+    updated_goal.current_value = 9;
+
+    let error = session
+        .update_scheme_quota_goals(0, 0, &[updated_goal])
+        .expect_err("unknown goal attribute change must not become owned");
+
+    assert!(matches!(error, Error::Rollback { .. }));
+    assert_eq!(model.value(current_value).as_deref(), Some("1"));
+    assert_eq!(model.value(future_attribute).as_deref(), Some("changed"));
+    model.set_file(future_attribute, b"preserve\n");
+    session.close().expect("close repaired session");
+}
+
+#[test]
+fn quota_goal_update_handles_count_changes_without_full_configuration_rebuilds() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut config = transaction_config(42, Action::Stat);
+    let initial_goal = QuotaGoalConfig::new(QuotaGoalMetric::UserInput, 100);
+    config.kdamonds[0].contexts[0].schemes[0]
+        .quota
+        .reset_interval = Duration::from_secs(1);
+    config.kdamonds[0].contexts[0].schemes[0].quota.goals = vec![initial_goal.clone()];
+    let mut session = damon.exclusive_session(&config).expect("stage session");
+    session.start().expect("start session");
+    let goal_count = "kdamonds/0/contexts/0/schemes/0/quotas/goals/nr_goals";
+
+    session
+        .update_scheme_quota_goals(0, 0, &[])
+        .expect("remove quota goal");
+    assert_eq!(model.value(goal_count).as_deref(), Some("0"));
+    assert_eq!(model.active_value(goal_count).as_deref(), Some("0"));
+
+    session
+        .update_scheme_quota_goals(0, 0, &[initial_goal])
+        .expect("recreate quota goal");
+    assert_eq!(model.value(goal_count).as_deref(), Some("1"));
+    assert_eq!(model.active_value(goal_count).as_deref(), Some("1"));
+    session.close().expect("close session");
+}
+
+#[test]
+fn cached_tried_results_do_not_issue_refresh_commands() {
+    let model = Model::new("vaddr\n");
+    configure_runtime_results(&model);
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut session = damon
+        .exclusive_session(&transaction_config(42, Action::Stat))
+        .expect("stage session");
+    session.start().expect("start session");
+    session
+        .tried_regions(0, 0, 1)
+        .expect("materialize tried regions");
+    session
+        .tried_bytes_units(0, 0)
+        .expect("materialize tried bytes");
+    let writes = model.write_count();
+
+    let snapshot = session
+        .cached_tried_regions(0, 0, 1)
+        .expect("read cached regions");
+    let bytes = session
+        .cached_tried_bytes_units(0, 0)
+        .expect("read cached bytes");
+
+    assert_eq!(snapshot.total_units(), 4_096);
+    assert_eq!(bytes, 4_096);
+    assert_eq!(model.write_count(), writes);
+    session.close().expect("close session");
+}
+
+#[test]
 fn runtime_updates_work_without_the_optional_refresh_attribute() {
     let model = Model::new("vaddr\n");
     let lock = TestLock::new();

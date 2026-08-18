@@ -61,7 +61,10 @@ fn vaddr_workflow_composes_regions_probes_schemes_and_snapshot_query() {
         Some("1")
     );
 
-    let snapshot = monitor.snapshot().expect("query private snapshot scheme");
+    let snapshot = monitor
+        .materialize_snapshot()
+        .expect("query private snapshot scheme");
+    let snapshot = snapshot.snapshot();
     assert_eq!(snapshot.total_bytes().expect("byte total"), 4_096);
     assert_eq!(snapshot.region(0).expect("region").nr_accesses(), 7);
     assert_eq!(
@@ -86,6 +89,134 @@ fn vaddr_workflow_composes_regions_probes_schemes_and_snapshot_query() {
 }
 
 #[test]
+fn multi_target_snapshots_are_target_scoped_when_filters_are_supported() {
+    let model = Model::new("vaddr\n");
+    model.set_tried_regions(vec![ModelRegion {
+        start: 4_096,
+        end: 8_192,
+        nr_accesses: 3,
+        age: 1,
+        filter_passed_units: Some(4_096),
+        probe_hits: Vec::new(),
+    }]);
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let first_pid = Pid::new(41).expect("valid pid");
+    let second_pid = Pid::new(43).expect("valid pid");
+    let mut slow_scheme = SchemeConfig::new(Action::Stat, match_all_pattern());
+    slow_scheme.apply_interval = Duration::from_millis(250);
+    let mut monitor = damon
+        .vaddr()
+        .targets([first_pid, second_pid])
+        .scheme(slow_scheme)
+        .start()
+        .expect("start multi-target workflow");
+
+    assert_eq!(
+        monitor.maximum_snapshot_apply_interval(),
+        Some(Duration::from_millis(250))
+    );
+    let writes = model.write_count();
+    assert!(matches!(
+        monitor.materialize_snapshot(),
+        Err(Error::MultipleSnapshotResults { count: 2 })
+    ));
+    assert_eq!(model.write_count(), writes);
+    assert!(monitor.cached_snapshots().is_empty());
+    {
+        let snapshots = monitor
+            .materialize_snapshots()
+            .expect("materialize scoped snapshots");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(
+            snapshots[0].scope(),
+            SnapshotScope::Target(TargetIdentity::new(0, Some(first_pid)))
+        );
+        assert_eq!(
+            snapshots[1].scope(),
+            SnapshotScope::Target(TargetIdentity::new(1, Some(second_pid)))
+        );
+        assert_eq!(snapshots[0].snapshot().total_units(), 4_096);
+        assert_eq!(snapshots[1].snapshot().total_units(), 4_096);
+    }
+    let writes = model.write_count();
+    assert_eq!(monitor.cached_snapshots().len(), 2);
+    assert!(matches!(
+        monitor.cached_snapshot(),
+        Err(Error::MultipleSnapshotResults { count: 2 })
+    ));
+    assert_eq!(model.write_count(), writes);
+    assert_eq!(
+        model
+            .value("kdamonds/0/contexts/0/schemes/nr_schemes")
+            .as_deref(),
+        Some("1")
+    );
+    monitor.stop().expect("stop workflow");
+}
+
+#[test]
+fn multi_target_snapshots_fall_back_to_honest_ungrouped_results() {
+    let model = Model::new("vaddr\n");
+    model.set_supported_scheme_filter_types(
+        "anon\nmemcg\nyoung\naddr\nhugepage_size\nunmapped\nactive\n",
+    );
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut monitor = damon
+        .vaddr()
+        .targets([
+            Pid::new(41).expect("valid pid"),
+            Pid::new(43).expect("valid pid"),
+        ])
+        .start()
+        .expect("start fallback workflow");
+
+    assert_eq!(
+        monitor
+            .capabilities()
+            .feature_support(SysfsFeature::SchemeFilterTarget),
+        CapabilitySupport::Unsupported
+    );
+    let snapshot = monitor
+        .materialize_snapshot()
+        .expect("materialize ungrouped snapshot");
+    assert_eq!(snapshot.scope(), SnapshotScope::Ungrouped);
+    assert_eq!(monitor.cached_snapshots().len(), 1);
+    monitor.stop().expect("stop workflow");
+}
+
+#[test]
+fn fvaddr_targets_accept_distinct_fixed_regions() {
+    let model = Model::new("fvaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let first = ProcessTarget::new(Pid::new(41).expect("valid pid"))
+        .region(InitialRegionConfig::new(100, 200).expect("valid region"));
+    let second = ProcessTarget::new(Pid::new(43).expect("valid pid"))
+        .region(InitialRegionConfig::new(300, 400).expect("valid region"));
+    let monitor = damon
+        .fvaddr()
+        .targets([first, second])
+        .start()
+        .expect("start multi-target fvaddr workflow");
+
+    assert_eq!(
+        model
+            .value("kdamonds/0/contexts/0/targets/0/regions/0/start")
+            .as_deref(),
+        Some("100")
+    );
+    assert_eq!(
+        model
+            .value("kdamonds/0/contexts/0/targets/1/regions/0/start")
+            .as_deref(),
+        Some("300")
+    );
+    monitor.stop().expect("stop workflow");
+}
+
+#[test]
 fn fvaddr_workflow_requires_pid_and_fixed_regions_before_writing() {
     let model = Model::new("vaddr\nfvaddr\n");
     let lock = TestLock::new();
@@ -95,7 +226,7 @@ fn fvaddr_workflow_requires_pid_and_fixed_regions_before_writing() {
     assert!(matches!(
         damon.fvaddr().start(),
         Err(Error::InvalidConfiguration {
-            field: "fixed virtual-address PID",
+            field: "fixed virtual-address targets",
             ..
         })
     ));
@@ -161,7 +292,10 @@ fn paddr_workflow_keeps_core_units_and_checked_byte_scale() {
             .as_deref(),
         Some("0")
     );
-    let snapshot = monitor.snapshot().expect("query paddr snapshot");
+    let snapshot = monitor
+        .materialize_snapshot()
+        .expect("query paddr snapshot");
+    let snapshot = snapshot.snapshot();
     let region = snapshot.region(0).expect("physical region");
     assert_eq!(region.start_units(), 2);
     assert_eq!(region.start_bytes().expect("start bytes"), 8_192);
@@ -197,8 +331,9 @@ fn current_kernels_install_snapshot_query_only_on_demand() {
     );
     assert_eq!(
         monitor
-            .snapshot()
+            .materialize_snapshot()
             .expect("query snapshot")
+            .snapshot()
             .raw_regions()
             .len(),
         1
@@ -238,8 +373,9 @@ fn legacy_kernels_retain_the_snapshot_query_scheme() {
     );
     assert_eq!(
         monitor
-            .snapshot()
+            .materialize_snapshot()
             .expect("query legacy snapshot")
+            .snapshot()
             .raw_regions()
             .len(),
         1
@@ -251,6 +387,39 @@ fn legacy_kernels_retain_the_snapshot_query_scheme() {
         Some("1")
     );
     monitor.stop().expect("restore hierarchy");
+}
+
+#[test]
+fn explicit_empty_process_regions_do_not_inherit_builder_regions() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let common = InitialRegionConfig::new(4_096, 8_192).expect("valid common region");
+    let first = ProcessTarget::new(Pid::new(41).expect("valid first pid"));
+    let second = ProcessTarget::new(Pid::new(42).expect("valid second pid"))
+        .regions(Vec::<InitialRegionConfig>::new());
+    assert_eq!(first.initial_regions(), None);
+    assert_eq!(second.initial_regions(), Some(&[][..]));
+    let monitor = damon
+        .vaddr()
+        .regions([common])
+        .targets([first, second])
+        .start()
+        .expect("start workflow");
+
+    assert_eq!(
+        model
+            .value("kdamonds/0/contexts/0/targets/0/regions/nr_regions")
+            .as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        model
+            .value("kdamonds/0/contexts/0/targets/1/regions/nr_regions")
+            .as_deref(),
+        Some("0")
+    );
+    monitor.stop().expect("stop workflow");
 }
 
 #[test]

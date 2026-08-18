@@ -127,9 +127,13 @@ impl Scheme {
             None
         };
         let mut computed_total_units = 0_u64;
-        let mut regions = Vec::with_capacity(capacity_hint.min(MAX_INITIAL_REGION_CAPACITY));
         let mut region_indices = Vec::new();
         numeric_directory_indices_into(&base, &mut region_indices)?;
+        let mut regions = Vec::with_capacity(
+            capacity_hint
+                .min(region_indices.len())
+                .min(MAX_INITIAL_REGION_CAPACITY),
+        );
         let mut probe_indices = Vec::with_capacity(4);
         let mut probe_hits = Vec::with_capacity(4);
 

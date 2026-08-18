@@ -9,7 +9,9 @@ use damon::sysfs::{
     QuotaConfig, QuotaGoalConfig, QuotaGoalMetric, RegionSizeRange, SampleControlConfig,
     SampleFilterConfig, SamplePrimitivesConfig, SchemeConfig, SchemeFilterType, TargetConfig,
 };
-use damon::{AddressUnit, Damon, Error, ManagedHierarchy, Pid, RegionBounds};
+use damon::{
+    AddressUnit, Damon, Error, ManagedHierarchy, ManagedKdamond, Pid, ProcessTarget, RegionBounds,
+};
 
 #[test]
 fn managed_hierarchy_lifecycle_is_exposed_by_the_public_api() {
@@ -22,9 +24,20 @@ fn managed_hierarchy_lifecycle_is_exposed_by_the_public_api() {
         ManagedHierarchy::configuration as fn(&ManagedHierarchy) -> Result<DamonConfig, Error>,
         ManagedHierarchy::update_configuration
             as fn(&mut ManagedHierarchy, &DamonConfig, &[usize]) -> Result<(), Error>,
+        ManagedHierarchy::runtime
+            as for<'a> fn(&'a mut ManagedHierarchy, usize) -> Result<ManagedKdamond<'a>, Error>,
         ManagedHierarchy::close as fn(ManagedHierarchy) -> Result<(), Error>,
     );
     std::hint::black_box(api);
+}
+
+#[test]
+fn process_targets_are_constructible_from_the_public_api() {
+    let pid = Pid::new(42).expect("valid pid");
+    let target =
+        ProcessTarget::new(pid).region(InitialRegionConfig::new(100, 200).expect("valid region"));
+
+    assert_eq!(target.pid(), pid);
 }
 
 #[test]

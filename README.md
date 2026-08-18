@@ -76,7 +76,10 @@ best-effort cleanup.
 initial regions, probes, and custom DAMOS schemes. Physical regions and related
 scheme values remain in explicit DAMON core units, with checked byte conversion
 through the monitor's effective address unit. Initial regions are validated
-against the kernel's operation-specific alignment before staging.
+against the kernel's operation-specific alignment before staging. Vaddr and
+fvaddr builders accept multiple process targets. Scoped snapshot results
+identify targets only when the staged query configuration proves that identity
+and otherwise report `Ungrouped`.
 
 `Damon::exclusive_session()` provides the same lifecycle for any validated
 single-kdamond `DamonConfig`. Explicit `close()` reports restoration failures,
@@ -85,7 +88,9 @@ while `Drop` performs best-effort restoration.
 `Damon::managed_hierarchy()` owns any runnable multi-kdamond `DamonConfig`.
 It starts kdamonds in index order, records each kernel-thread ID, rolls back a
 partial start in reverse order, and supports transactional updates to selected
-kdamonds. It stops only identities that the hierarchy still owns.
+kdamonds. `runtime(index)` provides ownership-safe per-kdamond results,
+commands, and transactional quota-goal updates. It stops only identities that
+the hierarchy still owns.
 
 ## Capability discovery
 
