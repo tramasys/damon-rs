@@ -13,6 +13,19 @@ use crate::config::{AddressUnit, MonitoringIntervals, Pid, RegionBounds};
 use crate::error::io_error;
 use crate::{Error, RawRegion, RawSnapshot, Result};
 
+mod configuration;
+
+pub use configuration::{
+    ContextConfig, DamonConfig, DestinationConfig, FilterConfig, FilterLayer, InitialRegion,
+    InitialRegionConfig, IntervalsGoalConfig, KdamondConfig, MigrationDestination,
+    OperationAttributes, OperationAttributesConfig, ProbeConfig, ProbeFilterConfig,
+    ProbePreparation, ProbePreparationAction, ProbePreparationConfig, QuotaConfig, QuotaGoal,
+    QuotaGoalConfig, QuotaGoalMetric, QuotaGoalTuner, QuotaWeights, SampleControl,
+    SampleControlConfig, SampleFilter, SampleFilterConfig, SampleFilterType,
+    SamplePrimitivesConfig, SchemeConfig, SchemeFilter, SchemeFilterType, SchemeQuotas,
+    SchemeStats, SchemeWatermarks, TargetConfig, WatermarkMetric, WatermarksConfig,
+};
+
 /// Default location of DAMON's privileged admin interface.
 pub const DEFAULT_ADMIN_PATH: &str = "/sys/kernel/mm/damon/admin";
 
@@ -612,6 +625,42 @@ pub struct RegionSizeRange {
     max: u64,
 }
 
+/// An inclusive range of byte sizes.
+///
+/// Unlike [`RegionSizeRange`], this range is not scaled by a context's
+/// [`AddressUnit`]. Linux uses byte sizes for DAMOS `hugepage_size` filters
+/// because those filters compare directly against the underlying folio size.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ByteSizeRange {
+    min: u64,
+    max: u64,
+}
+
+impl ByteSizeRange {
+    /// Creates a validated inclusive byte-size range.
+    pub const fn new(min: u64, max: u64) -> Result<Self> {
+        if min > max {
+            return Err(Error::InvalidConfiguration {
+                field: "byte size range",
+                reason: "minimum must not exceed maximum",
+            });
+        }
+        Ok(Self { min, max })
+    }
+
+    /// Returns the inclusive minimum in bytes.
+    #[must_use]
+    pub const fn min(self) -> u64 {
+        self.min
+    }
+
+    /// Returns the inclusive maximum in bytes.
+    #[must_use]
+    pub const fn max(self) -> u64 {
+        self.max
+    }
+}
+
 impl RegionSizeRange {
     /// Creates a validated inclusive size range in core address units.
     pub const fn new(min: u64, max: u64) -> Result<Self> {
@@ -757,6 +806,8 @@ pub enum ProbeFilterType {
     Anonymous,
     /// Match pages belonging to a memory control group.
     MemoryControlGroup,
+    /// Match pages whose page-idle flag is unset.
+    PageIdleUnset,
     /// A filter type introduced by a newer kernel.
     Unknown(Box<str>),
 }
@@ -768,6 +819,7 @@ impl ProbeFilterType {
         match self {
             Self::Anonymous => "anon",
             Self::MemoryControlGroup => "memcg",
+            Self::PageIdleUnset => "pgidle_unset",
             Self::Unknown(name) => name,
         }
     }
@@ -776,6 +828,7 @@ impl ProbeFilterType {
         match value {
             "anon" => Self::Anonymous,
             "memcg" => Self::MemoryControlGroup,
+            "pgidle_unset" => Self::PageIdleUnset,
             other => Self::Unknown(other.into()),
         }
     }
@@ -829,6 +882,7 @@ impl DamonAdmin {
     /// This is a global kernel interface. Reducing the count can remove
     /// another program's configuration; callers must coordinate ownership.
     pub fn set_kdamond_count(&self, count: usize) -> Result<()> {
+        configuration::validate_count("kdamond count", count)?;
         write_value(&self.root.join("kdamonds/nr_kdamonds"), count)
     }
 
@@ -838,6 +892,13 @@ impl DamonAdmin {
         Kdamond {
             path: self.root.join("kdamonds").join(index.to_string()),
         }
+    }
+
+    pub(crate) fn configuration_snapshot(&self) -> Result<ConfigurationSnapshot> {
+        Ok(ConfigurationSnapshot {
+            fingerprint: capture_configuration(&self.root)?,
+            root: self.root.clone(),
+        })
     }
 }
 
@@ -858,14 +919,55 @@ pub(crate) struct ConfigurationFingerprint {
     entries: Box<[ConfigurationEntry]>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConfigurationSnapshot {
+    root: PathBuf,
+    fingerprint: ConfigurationFingerprint,
+}
+
 impl ConfigurationFingerprint {
     pub(crate) fn matches_current(&self) -> Result<bool> {
         for entry in &self.entries {
-            if !read_trimmed_equals(&entry.path, entry.value.as_bytes())? {
+            if !read_configuration_value_equals(&entry.path, entry.value.as_bytes())? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+}
+
+impl ConfigurationSnapshot {
+    pub(crate) fn matches_current(&self) -> Result<bool> {
+        Ok(capture_configuration(&self.root)? == self.fingerprint)
+    }
+
+    /// Verifies captured values without rewalking the directory hierarchy.
+    ///
+    /// This is sufficient while the caller holds the advisory session lock
+    /// and separately verifies the typed hierarchy shape.  Unknown attributes
+    /// captured for rollback are still checked one by one.
+    pub(crate) fn values_match_current(&self) -> Result<bool> {
+        self.fingerprint.matches_current()
+    }
+
+    pub(crate) fn restore(&self) -> Result<()> {
+        let mut entries = self.fingerprint.entries.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| {
+            restoration_key(&self.root, left).cmp(&restoration_key(&self.root, right))
+        });
+        for entry in entries {
+            if is_reconstruction_count(&entry.path)
+                || !read_configuration_value_equals(&entry.path, entry.value.as_bytes())?
+            {
+                write_bytes(&entry.path, entry.value.as_bytes())?;
+            }
+        }
+        if !self.matches_current()? {
+            return Err(Error::OwnershipLost {
+                reason: "the restored hierarchy does not match its captured configuration",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -940,6 +1042,7 @@ impl Kdamond {
 
     /// Reconstructs the staged monitoring context directories.
     pub fn set_context_count(&self, count: usize) -> Result<()> {
+        configuration::validate_count("context count", count)?;
         write_value(&self.path.join("contexts/nr_contexts"), count)
     }
 
@@ -1331,7 +1434,9 @@ fn scheme_filter_capabilities(scheme: &Scheme) -> Result<Vec<FeatureCapability>>
                 &ops_filters.join("nr_filters"),
                 &ops_filters.join("0/allow"),
             ),
+            (&ops_filters.join("nr_filters"), &ops_filters.join("0/pass")),
             (&filters.join("nr_filters"), &filters.join("0/allow")),
+            (&filters.join("nr_filters"), &filters.join("0/pass")),
         ])?,
     ));
     Ok(capabilities)
@@ -1488,6 +1593,7 @@ impl Context {
 
     /// Selects a monitoring operation.
     pub fn set_operation(&self, operation: &Operation) -> Result<()> {
+        configuration::validate_token("monitoring operation", operation.kernel_name())?;
         write_bytes(
             &self.path.join("operations"),
             operation.kernel_name().as_bytes(),
@@ -1565,8 +1671,10 @@ impl Context {
     /// Reconstructs the staged monitoring data-probe directories.
     ///
     /// The running kernel validates its own supported maximum. The crate does
-    /// not impose a version-specific limit that could reject a future kernel.
+    /// not impose a version-specific limit that could reject a future kernel,
+    /// beyond the sysfs ABI's signed count representation.
     pub fn set_probe_count(&self, count: usize) -> Result<()> {
+        configuration::validate_count("monitoring probe count", count)?;
         write_value(&self.path.join("monitoring_attrs/probes/nr_probes"), count)
     }
 
@@ -1593,6 +1701,7 @@ impl Context {
 
     /// Reconstructs the staged target directories.
     pub fn set_target_count(&self, count: usize) -> Result<()> {
+        configuration::validate_count("target count", count)?;
         write_value(&self.path.join("targets/nr_targets"), count)
     }
 
@@ -1611,6 +1720,7 @@ impl Context {
 
     /// Reconstructs the staged DAMOS scheme directories.
     pub fn set_scheme_count(&self, count: usize) -> Result<()> {
+        configuration::validate_count("scheme count", count)?;
         write_value(&self.path.join("schemes/nr_schemes"), count)
     }
 
@@ -1696,6 +1806,7 @@ impl Target {
 
     /// Reconstructs the staged initial monitoring-region directories.
     pub fn set_initial_region_count(&self, count: usize) -> Result<()> {
+        configuration::validate_count("initial region count", count)?;
         write_value(&self.path.join("regions/nr_regions"), count)
     }
 
@@ -1724,6 +1835,7 @@ impl Probe {
 
     /// Reconstructs the staged probe-filter directories.
     pub fn set_filter_count(&self, count: usize) -> Result<()> {
+        configuration::validate_count("probe filter count", count)?;
         write_value(&self.path.join("filters/nr_filters"), count)
     }
 
@@ -1757,6 +1869,7 @@ impl ProbeFilter {
 
     /// Sets the filter type.
     pub fn set_filter_type(&self, filter_type: &ProbeFilterType) -> Result<()> {
+        configuration::validate_token("probe filter type", filter_type.kernel_name())?;
         write_bytes(
             &self.path.join("type"),
             filter_type.kernel_name().as_bytes(),
@@ -1791,6 +1904,7 @@ impl ProbeFilter {
 
     /// Sets the memory-control-group path used by a `memcg` filter.
     pub fn set_cgroup_path(&self, path: &str) -> Result<()> {
+        configuration::validate_sysfs_string("probe filter cgroup path", path)?;
         write_bytes(&self.path.join("path"), path.as_bytes())
     }
 }
@@ -1816,6 +1930,7 @@ impl Scheme {
 
     /// Selects the scheme action.
     pub fn set_action(&self, action: &Action) -> Result<()> {
+        configuration::validate_token("scheme action", action.kernel_name())?;
         write_bytes(&self.path.join("action"), action.kernel_name().as_bytes())
     }
 
@@ -2207,8 +2322,9 @@ fn writable_configuration_files(root: &Path) -> Result<Vec<PathBuf>> {
 fn capture_configuration(root: &Path) -> Result<ConfigurationFingerprint> {
     let mut entries = Vec::new();
     for path in writable_configuration_files(root)? {
+        let value = read_text(&path)?;
         entries.push(ConfigurationEntry {
-            value: read_text(&path)?.trim().into(),
+            value: value.strip_suffix('\n').unwrap_or(&value).into(),
             path,
         });
     }
@@ -2217,11 +2333,23 @@ fn capture_configuration(root: &Path) -> Result<ConfigurationFingerprint> {
     })
 }
 
+fn restoration_key<'a>(root: &Path, entry: &'a ConfigurationEntry) -> (usize, bool, &'a Path) {
+    let relative = entry.path.strip_prefix(root).unwrap_or(&entry.path);
+    let depth = relative.components().count();
+    let is_count = is_reconstruction_count(relative);
+    (depth, !is_count, &entry.path)
+}
+
+fn is_reconstruction_count(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("nr_") && name != "nr_accesses_permil")
+}
+
 fn is_runtime_attribute(relative: &Path) -> bool {
-    if matches!(relative.to_str(), Some("state" | "pid"))
-        || relative
-            .file_name()
-            .is_some_and(|name| name == "avail_operations")
+    if relative
+        .file_name()
+        .is_some_and(|name| matches!(name.to_str(), Some("state" | "pid" | "avail_operations")))
         || relative
             .components()
             .any(|component| component.as_os_str() == "tried_regions")
@@ -2388,11 +2516,11 @@ fn read_text(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).map_err(|error| io_error("read", path, error))
 }
 
-fn read_trimmed_equals(path: &Path, expected: &[u8]) -> Result<bool> {
+fn read_configuration_value_equals(path: &Path, expected: &[u8]) -> Result<bool> {
     #[cfg(test)]
     if let Some(result) = test_backend::read(path) {
         return match result {
-            Ok(bytes) => Ok(trimmed_bytes_equal(&bytes, expected)),
+            Ok(bytes) => Ok(configuration_bytes_equal(&bytes, expected)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(io_error("read", path, error)),
         };
@@ -2404,7 +2532,7 @@ fn read_trimmed_equals(path: &Path, expected: &[u8]) -> Result<bool> {
         Err(error) => return Err(io_error("open for reading", path, error)),
     };
     let mut matched = 0;
-    let mut started = false;
+    let mut newline_seen = false;
     let mut bytes = [0_u8; 256];
     loop {
         let read = file
@@ -2413,7 +2541,7 @@ fn read_trimmed_equals(path: &Path, expected: &[u8]) -> Result<bool> {
         if read == 0 {
             break;
         }
-        if !match_trimmed_chunk(&bytes[..read], expected, &mut matched, &mut started) {
+        if !match_configuration_chunk(&bytes[..read], expected, &mut matched, &mut newline_seen) {
             return Ok(false);
         }
     }
@@ -2421,30 +2549,30 @@ fn read_trimmed_equals(path: &Path, expected: &[u8]) -> Result<bool> {
 }
 
 #[cfg(test)]
-fn trimmed_bytes_equal(bytes: &[u8], expected: &[u8]) -> bool {
+fn configuration_bytes_equal(bytes: &[u8], expected: &[u8]) -> bool {
     let mut matched = 0;
-    let mut started = false;
-    match_trimmed_chunk(bytes, expected, &mut matched, &mut started) && matched == expected.len()
+    let mut newline_seen = false;
+    match_configuration_chunk(bytes, expected, &mut matched, &mut newline_seen)
+        && matched == expected.len()
 }
 
-fn match_trimmed_chunk(
+fn match_configuration_chunk(
     bytes: &[u8],
     expected: &[u8],
     matched: &mut usize,
-    started: &mut bool,
+    newline_seen: &mut bool,
 ) -> bool {
     for &byte in bytes {
-        if !*started && byte.is_ascii_whitespace() {
-            continue;
-        }
-        *started = true;
         if *matched < expected.len() {
             if byte != expected[*matched] {
                 return false;
             }
             *matched += 1;
-        } else if !byte.is_ascii_whitespace() {
-            return false;
+        } else {
+            if *newline_seen || byte != b'\n' {
+                return false;
+            }
+            *newline_seen = true;
         }
     }
     true
@@ -2679,12 +2807,20 @@ pub(crate) mod test_backend {
         mutations: Vec<Mutation>,
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct WriteFailure {
+        path: PathBuf,
+        raw_os_error: i32,
+    }
+
     #[derive(Debug)]
     struct State {
         nodes: BTreeMap<PathBuf, Node>,
+        extension_files: BTreeMap<PathBuf, Vec<u8>>,
         available_operations: Vec<u8>,
         recognized_operations: Vec<u8>,
         expose_available_operations: bool,
+        expose_current_damo_extensions: bool,
         supported_scheme_filter_types: Vec<u8>,
         supported_probe_filter_types: Vec<u8>,
         active_files: Option<BTreeMap<PathBuf, Vec<u8>>>,
@@ -2693,6 +2829,8 @@ pub(crate) mod test_backend {
         scheme_stats: Vec<ModelSchemeStats>,
         effective_quota_bytes: Vec<u64>,
         hooks: Vec<Hook>,
+        write_failures: Vec<WriteFailure>,
+        write_count: usize,
     }
 
     impl State {
@@ -2703,9 +2841,11 @@ pub(crate) mod test_backend {
         ) -> Self {
             let mut state = Self {
                 nodes: BTreeMap::new(),
+                extension_files: BTreeMap::new(),
                 available_operations: available_operations.as_bytes().to_vec(),
                 recognized_operations: recognized_operations.as_bytes().to_vec(),
                 expose_available_operations,
+                expose_current_damo_extensions: false,
                 supported_scheme_filter_types:
                     b"anon\nmemcg\nyoung\naddr\ntarget\nhugepage_size\nunmapped\nactive\n".to_vec(),
                 supported_probe_filter_types: b"anon\nmemcg\n".to_vec(),
@@ -2715,6 +2855,8 @@ pub(crate) mod test_backend {
                 scheme_stats: Vec::new(),
                 effective_quota_bytes: Vec::new(),
                 hooks: Vec::new(),
+                write_failures: Vec::new(),
+                write_count: 0,
             };
             state.directory("");
             state.directory("kdamonds");
@@ -2748,6 +2890,23 @@ pub(crate) mod test_backend {
                     .to_str()
                     .is_none_or(|component| component.parse::<usize>().is_err())
             });
+        }
+
+        fn restore_extension_files(&mut self) {
+            let files = self.extension_files.clone();
+            for (path, value) in files {
+                if path
+                    .parent()
+                    .is_some_and(|parent| matches!(self.nodes.get(parent), Some(Node::Directory)))
+                {
+                    self.file(path, &value);
+                }
+            }
+        }
+
+        fn finish_reconstruction(&mut self) -> bool {
+            self.restore_extension_files();
+            true
         }
 
         fn create_kdamond(&mut self, index: usize) {
@@ -2791,6 +2950,28 @@ pub(crate) mod test_backend {
             self.file(base.join("monitoring_attrs/nr_regions/max"), b"1000\n");
             self.directory(base.join("monitoring_attrs/probes"));
             self.file(base.join("monitoring_attrs/probes/nr_probes"), b"0\n");
+            if self.expose_current_damo_extensions {
+                self.directory(base.join("operations_attrs"));
+                self.file(base.join("operations_attrs/use_reports"), b"N\n");
+                self.file(base.join("operations_attrs/write_only"), b"N\n");
+                self.file(base.join("operations_attrs/cpus"), b"all\n");
+                self.file(base.join("operations_attrs/tids"), b"\n");
+                self.directory(base.join("monitoring_attrs/sample"));
+                self.directory(base.join("monitoring_attrs/sample/primitives"));
+                self.file(
+                    base.join("monitoring_attrs/sample/primitives/page_table"),
+                    b"Y\n",
+                );
+                self.file(
+                    base.join("monitoring_attrs/sample/primitives/page_fault"),
+                    b"N\n",
+                );
+                self.directory(base.join("monitoring_attrs/sample/filters"));
+                self.file(
+                    base.join("monitoring_attrs/sample/filters/nr_filters"),
+                    b"0\n",
+                );
+            }
             self.directory(base.join("targets"));
             self.file(base.join("targets/nr_targets"), b"0\n");
             self.directory(base.join("schemes"));
@@ -2836,7 +3017,7 @@ pub(crate) mod test_backend {
                 self.file(base.join("quotas").join(name), b"0\n");
             }
             self.file(base.join("quotas/effective_bytes"), b"0\n");
-            self.file(base.join("quotas/goal_tuner"), b"none\n");
+            self.file(base.join("quotas/goal_tuner"), b"consist\n");
             self.directory(base.join("quotas/weights"));
             for name in ["sz_permil", "nr_accesses_permil", "age_permil"] {
                 self.file(base.join("quotas/weights").join(name), b"0\n");
@@ -2876,6 +3057,27 @@ pub(crate) mod test_backend {
             self.directory(&base);
             self.directory(base.join("filters"));
             self.file(base.join("filters/nr_filters"), b"0\n");
+            if self.expose_current_damo_extensions {
+                self.file(base.join("weight"), b"0\n");
+                self.directory(base.join("preps"));
+                self.file(base.join("preps/nr_preps"), b"0\n");
+            }
+        }
+
+        fn create_probe_preparation(&mut self, base: &Path, index: usize) {
+            let base = base.join(index.to_string());
+            self.directory(&base);
+            self.file(base.join("prep_action"), b"set_pgidle\n");
+        }
+
+        fn create_sample_filter(&mut self, base: &Path, index: usize) {
+            let base = base.join(index.to_string());
+            self.directory(&base);
+            self.file(base.join("type"), b"write\n");
+            self.file(base.join("matching"), b"N\n");
+            self.file(base.join("allow"), b"N\n");
+            self.file(base.join("cpumask"), b"\n");
+            self.file(base.join("tid_arr"), b"\n");
         }
 
         fn create_probe_filter(&mut self, base: &Path, index: usize) {
@@ -2931,6 +3133,7 @@ pub(crate) mod test_backend {
             Ok(value)
         }
 
+        #[allow(clippy::too_many_lines)]
         fn reconstruct_count(&mut self, path: &Path, count: usize) -> io::Result<bool> {
             let path_text = path.to_string_lossy();
             if path_text == "kdamonds/nr_kdamonds" {
@@ -2946,7 +3149,7 @@ pub(crate) mod test_backend {
                 for index in 0..count {
                     self.create_kdamond(index);
                 }
-                return Ok(true);
+                return Ok(self.finish_reconstruction());
             }
             if path_text.ends_with("/contexts/nr_contexts") {
                 if count > 1 {
@@ -2960,7 +3163,7 @@ pub(crate) mod test_backend {
                 for index in 0..count {
                     self.create_context(parent, index);
                 }
-                return Ok(true);
+                return Ok(self.finish_reconstruction());
             }
             if path_text.ends_with("/targets/nr_targets") {
                 let parent = path.parent().expect("count path has parent");
@@ -2968,7 +3171,7 @@ pub(crate) mod test_backend {
                 for index in 0..count {
                     self.create_target(parent, index);
                 }
-                return Ok(true);
+                return Ok(self.finish_reconstruction());
             }
             if path_text.ends_with("/schemes/nr_schemes") {
                 let parent = path.parent().expect("count path has parent");
@@ -2976,7 +3179,7 @@ pub(crate) mod test_backend {
                 for index in 0..count {
                     self.create_scheme(parent, index);
                 }
-                return Ok(true);
+                return Ok(self.finish_reconstruction());
             }
             if path_text.ends_with("/monitoring_attrs/probes/nr_probes") {
                 let parent = path.parent().expect("count path has parent");
@@ -2984,7 +3187,15 @@ pub(crate) mod test_backend {
                 for index in 0..count {
                     self.create_probe(parent, index);
                 }
-                return Ok(true);
+                return Ok(self.finish_reconstruction());
+            }
+            if path_text.ends_with("/preps/nr_preps") {
+                let parent = path.parent().expect("count path has parent");
+                self.remove_indexed_children(parent);
+                for index in 0..count {
+                    self.create_probe_preparation(parent, index);
+                }
+                return Ok(self.finish_reconstruction());
             }
             if path_text.ends_with("/filters/nr_filters")
                 || path_text.ends_with("/core_filters/nr_filters")
@@ -2993,13 +3204,15 @@ pub(crate) mod test_backend {
                 let parent = path.parent().expect("count path has parent");
                 self.remove_indexed_children(parent);
                 for index in 0..count {
-                    if path_text.contains("/monitoring_attrs/probes/") {
+                    if path_text.contains("/monitoring_attrs/sample/filters/") {
+                        self.create_sample_filter(parent, index);
+                    } else if path_text.contains("/monitoring_attrs/probes/") {
                         self.create_probe_filter(parent, index);
                     } else {
                         self.create_scheme_filter(parent, index);
                     }
                 }
-                return Ok(true);
+                return Ok(self.finish_reconstruction());
             }
             if path_text.ends_with("/quotas/goals/nr_goals") {
                 let parent = path.parent().expect("count path has parent");
@@ -3007,7 +3220,7 @@ pub(crate) mod test_backend {
                 for index in 0..count {
                     self.create_quota_goal(parent, index);
                 }
-                return Ok(true);
+                return Ok(self.finish_reconstruction());
             }
             if path_text.ends_with("/dests/nr_dests") {
                 let parent = path.parent().expect("count path has parent");
@@ -3015,7 +3228,7 @@ pub(crate) mod test_backend {
                 for index in 0..count {
                     self.create_destination(parent, index);
                 }
-                return Ok(true);
+                return Ok(self.finish_reconstruction());
             }
             if path_text.ends_with("/regions/nr_regions") {
                 let parent = path.parent().expect("count path has parent");
@@ -3023,7 +3236,7 @@ pub(crate) mod test_backend {
                 for index in 0..count {
                     self.create_target_region(parent, index);
                 }
-                return Ok(true);
+                return Ok(self.finish_reconstruction());
             }
             Ok(false)
         }
@@ -3256,6 +3469,15 @@ pub(crate) mod test_backend {
         }
 
         fn write(&mut self, path: &Path, value: &[u8]) -> io::Result<()> {
+            if let Some(index) = self
+                .write_failures
+                .iter()
+                .position(|failure| failure.path == path)
+            {
+                let failure = self.write_failures.remove(index);
+                return Err(io::Error::from_raw_os_error(failure.raw_os_error));
+            }
+
             match self.nodes.get(path) {
                 Some(Node::File(_)) => {}
                 Some(Node::Directory) => return Err(io::Error::from(io::ErrorKind::IsADirectory)),
@@ -3296,10 +3518,19 @@ pub(crate) mod test_backend {
                 }
             }
 
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("nr_"))
+            let path_text = path.to_string_lossy();
+            if path_text == "kdamonds/nr_kdamonds"
+                || path_text.ends_with("/contexts/nr_contexts")
+                || path_text.ends_with("/targets/nr_targets")
+                || path_text.ends_with("/schemes/nr_schemes")
+                || path_text.ends_with("/monitoring_attrs/probes/nr_probes")
+                || path_text.ends_with("/preps/nr_preps")
+                || path_text.ends_with("/filters/nr_filters")
+                || path_text.ends_with("/core_filters/nr_filters")
+                || path_text.ends_with("/ops_filters/nr_filters")
+                || path_text.ends_with("/quotas/goals/nr_goals")
+                || path_text.ends_with("/dests/nr_dests")
+                || path_text.ends_with("/regions/nr_regions")
             {
                 let count = Self::parse_count(value)?;
                 if self.reconstruct_count(path, count)? {
@@ -3398,6 +3629,32 @@ pub(crate) mod test_backend {
             lock(&self.state).supported_probe_filter_types = types.as_bytes().to_vec();
         }
 
+        pub(crate) fn enable_current_damo_extensions(&self) {
+            let mut state = lock(&self.state);
+            state.expose_current_damo_extensions = true;
+            state.supported_probe_filter_types = b"anon\nmemcg\npgidle_unset\n".to_vec();
+        }
+
+        pub(crate) fn remove_tree(&self, path: impl AsRef<Path>) {
+            lock(&self.state).remove_tree(path.as_ref());
+        }
+
+        pub(crate) fn set_file(&self, path: impl Into<PathBuf>, value: &[u8]) {
+            let path = path.into();
+            let mut state = lock(&self.state);
+            if !state.nodes.contains_key(&path) {
+                state.extension_files.insert(path.clone(), value.to_vec());
+            }
+            state.file(path, value);
+        }
+
+        pub(crate) fn value(&self, path: impl AsRef<Path>) -> Option<String> {
+            match lock(&self.state).nodes.get(path.as_ref())? {
+                Node::File(value) => Some(String::from_utf8_lossy(value).trim().to_owned()),
+                Node::Directory => None,
+            }
+        }
+
         pub(crate) fn active_value(&self, path: impl AsRef<Path>) -> Option<String> {
             lock(&self.state)
                 .active_files
@@ -3423,6 +3680,17 @@ pub(crate) mod test_backend {
                 event: HookEvent::Write(path.into(), value.into()),
                 mutations,
             });
+        }
+
+        pub(crate) fn fail_next_write(&self, path: impl Into<PathBuf>, raw_os_error: i32) {
+            lock(&self.state).write_failures.push(WriteFailure {
+                path: path.into(),
+                raw_os_error,
+            });
+        }
+
+        pub(crate) fn write_count(&self) -> usize {
+            lock(&self.state).write_count
         }
     }
 
@@ -3549,6 +3817,7 @@ pub(crate) mod test_backend {
         let mut state = lock(&state);
         let result = state.write(&relative, value);
         if result.is_ok() {
+            state.write_count += 1;
             state.apply_hooks(&HookEvent::Write(relative, value.to_vec()));
         }
         Some(result)
@@ -3789,15 +4058,22 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_comparison_streams_long_trimmed_values() {
-        let expected = "x".repeat(600);
-        let fixture = TempFile::new(&format!("  {expected}\n"));
+    fn fingerprint_comparison_streams_long_values_without_losing_spaces() {
+        let expected = format!("  {}  ", "x".repeat(600));
+        let fixture = TempFile::new(&format!("{expected}\n"));
 
         assert!(
-            read_trimmed_equals(&fixture.path, expected.as_bytes())
+            read_configuration_value_equals(&fixture.path, expected.as_bytes())
                 .expect("compare long unchanged value")
         );
-        assert!(!read_trimmed_equals(&fixture.path, b"different").expect("detect changed value"));
+        assert!(
+            !read_configuration_value_equals(&fixture.path, expected.trim().as_bytes())
+                .expect("preserve surrounding spaces")
+        );
+        assert!(
+            !read_configuration_value_equals(&fixture.path, b"different")
+                .expect("detect changed value")
+        );
     }
 
     #[test]
@@ -4033,6 +4309,30 @@ mod tests {
                 .expect("read second effective quota"),
             8_192
         );
+        assert_typed_scheme_output(&first, &second);
+    }
+
+    fn assert_typed_scheme_output(first: &Scheme, second: &Scheme) {
+        assert_eq!(
+            first.stats().expect("read typed scheme stats"),
+            SchemeStats {
+                regions_tried: 1,
+                size_tried_units: 2,
+                regions_applied: 3,
+                size_applied_units: 4,
+                operations_filter_passed_units: Some(5),
+                quota_exceeds: 6,
+                snapshots: Some(7),
+                maximum_snapshots: Some(19),
+            }
+        );
+        assert_eq!(
+            second
+                .quotas()
+                .effective_size_units()
+                .expect("read typed effective quota"),
+            8_192
+        );
     }
 
     #[test]
@@ -4129,6 +4429,744 @@ mod tests {
             !path_exists(&probe.filter(0).path().join("memcg_path"))
                 .expect("distinguish scheme filter")
         );
+    }
+
+    #[test]
+    fn owned_linux_7_2_configuration_round_trips_every_input() {
+        let model = test_backend::Model::new("vaddr\nfvaddr\npaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+
+        let mut probe = ProbeConfig::default();
+        probe.filters.push(ProbeFilterConfig::new(
+            ProbeFilterType::Anonymous,
+            true,
+            true,
+        ));
+        probe.filters.push(ProbeFilterConfig::memory_control_group(
+            "/workload",
+            false,
+            true,
+        ));
+
+        let pattern = AccessPattern::new(
+            RegionSizeRange::new(4_096, 1 << 30).expect("valid size range"),
+            AccessCountRange::new(1, 200).expect("valid access range"),
+            AgeRange::new(2, 300).expect("valid age range"),
+        );
+        let mut scheme = SchemeConfig::new(Action::MigrateHot, pattern);
+        scheme.apply_interval = Duration::from_millis(250);
+        scheme.target_node = Some(2);
+        scheme.quota = QuotaConfig {
+            time: Duration::from_millis(10),
+            size_units: 1 << 20,
+            reset_interval: Duration::from_secs(1),
+            weights: QuotaWeights {
+                size_per_thousand: 100,
+                accesses_per_thousand: 300,
+                age_per_thousand: 600,
+            },
+            goals: vec![QuotaGoalConfig {
+                metric: QuotaGoalMetric::NodeMemoryControlGroupFreeBasisPoints,
+                target_value: 2_000,
+                current_value: 1_500,
+                node_id: Some(1),
+                cgroup_path: Some("/workload".to_owned()),
+            }],
+            goal_tuner: QuotaGoalTuner::Temporal,
+            failure_charge_numerator: 1,
+            failure_charge_denominator: 4,
+        };
+        scheme.watermarks = WatermarksConfig {
+            metric: WatermarkMetric::FreeMemoryRate,
+            interval: Duration::from_secs(5),
+            high: 800,
+            middle: 500,
+            low: 200,
+        };
+        scheme.filters = vec![
+            FilterConfig::address(0, 65_536, true, true),
+            FilterConfig::target(0, true, false),
+            FilterConfig::huge_page_size(
+                ByteSizeRange::new(2 << 20, 1 << 30).expect("valid huge-page range"),
+                false,
+                true,
+            ),
+        ];
+        scheme.destinations = vec![DestinationConfig {
+            node_id: 3,
+            weight: 17,
+        }];
+        scheme.maximum_snapshots = 64;
+
+        let mut context = ContextConfig::new(Operation::VirtualAddress);
+        context.address_unit = AddressUnit::ONE;
+        context.paused = false;
+        context.intervals = MonitoringIntervals::new(
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        )
+        .expect("valid intervals");
+        context.intervals_goal = IntervalsGoalConfig {
+            access_basis_points: 5_000,
+            aggregation_intervals: 10,
+            minimum_sample: Duration::from_millis(1),
+            maximum_sample: Duration::from_millis(10),
+        };
+        context.region_bounds = RegionBounds::new(10, 10_000).expect("valid bounds");
+        context.probes = vec![probe];
+        context.targets.push(complete_test_target());
+        context.schemes.push(scheme);
+
+        let config = KdamondConfig {
+            refresh_interval: Duration::from_millis(25),
+            contexts: vec![context],
+        };
+        kdamond
+            .stage_configuration(&config)
+            .expect("stage complete configuration");
+        assert_eq!(
+            kdamond
+                .configuration()
+                .expect("read complete configuration"),
+            config
+        );
+    }
+
+    #[test]
+    fn owned_configuration_round_trips_current_damo_probe_and_sample_controls() {
+        let model = test_backend::Model::new("vaddr\n");
+        model.enable_current_damo_extensions();
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+
+        let mut probe = ProbeConfig {
+            filters: vec![ProbeFilterConfig::new(
+                ProbeFilterType::PageIdleUnset,
+                true,
+                true,
+            )],
+            weight: 7,
+            preparations: vec![ProbePreparationConfig::new(
+                ProbePreparationAction::SetPageIdle,
+            )],
+        };
+        probe.filters.push(ProbeFilterConfig::memory_control_group(
+            "/workload",
+            false,
+            true,
+        ));
+
+        let mut context = ContextConfig::new(Operation::VirtualAddress);
+        context.operation_attributes = OperationAttributesConfig {
+            use_reports: true,
+            write_only: true,
+            cpus: "0-3".to_owned(),
+            thread_ids: "41 42".to_owned(),
+        };
+        context.probes.push(probe);
+        context.sample_control = SampleControlConfig {
+            primitives: SamplePrimitivesConfig {
+                page_table: false,
+                page_fault: true,
+            },
+            filters: vec![
+                SampleFilterConfig::cpu_mask("0-3", true, true),
+                SampleFilterConfig::threads("41 42", false, true),
+                SampleFilterConfig::write(true, false),
+            ],
+        };
+        context
+            .targets
+            .push(TargetConfig::for_pid(Pid::new(42).expect("valid pid")));
+
+        let config = KdamondConfig {
+            refresh_interval: Duration::ZERO,
+            contexts: vec![context],
+        };
+        kdamond
+            .stage_configuration(&config)
+            .expect("stage current damo controls");
+
+        assert_eq!(
+            kdamond.configuration().expect("read current damo controls"),
+            config
+        );
+    }
+
+    #[test]
+    fn owned_admin_configuration_round_trips_multiple_kdamonds() {
+        let model = test_backend::Model::new("vaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        let config = DamonConfig {
+            kdamonds: vec![
+                KdamondConfig {
+                    refresh_interval: Duration::from_millis(10),
+                    contexts: Vec::new(),
+                },
+                KdamondConfig {
+                    refresh_interval: Duration::from_millis(20),
+                    contexts: Vec::new(),
+                },
+            ],
+        };
+
+        admin
+            .stage_configuration(&config)
+            .expect("stage complete admin hierarchy");
+
+        assert_eq!(admin.configuration().expect("read admin hierarchy"), config);
+    }
+
+    fn complete_test_target() -> TargetConfig {
+        TargetConfig {
+            pid: Some(Pid::new(42).expect("valid pid")),
+            obsolete: false,
+            initial_regions: vec![
+                InitialRegionConfig::new(0x1_0000, 0x2_0000).expect("valid region"),
+                InitialRegionConfig::new(0x3_0000, 0x4_0000).expect("valid region"),
+            ],
+        }
+    }
+
+    #[test]
+    fn owned_configuration_validation_precedes_every_write() {
+        let model = test_backend::Model::new("vaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        let mut context = ContextConfig::new(Operation::VirtualAddress);
+        context.targets.push(TargetConfig::address_space());
+        let config = KdamondConfig {
+            refresh_interval: Duration::from_millis(99),
+            contexts: vec![context],
+        };
+
+        let error = kdamond
+            .stage_configuration(&config)
+            .expect_err("pid-less vaddr target must be rejected");
+        assert!(matches!(error, Error::InvalidConfiguration { .. }));
+        assert_eq!(
+            kdamond.refresh_interval().expect("refresh stays unchanged"),
+            Duration::ZERO
+        );
+        assert_eq!(
+            kdamond
+                .context_count()
+                .expect("context count stays unchanged"),
+            0
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn physical_address_staging_rejects_invalid_subpage_address_units_before_writing() {
+        let model = test_backend::Model::new("paddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        let writes = model.write_count();
+
+        let mut context = ContextConfig::new(Operation::PhysicalAddress);
+        context.address_unit = AddressUnit::new(3).expect("non-zero unit");
+        context.targets.push(TargetConfig::address_space());
+        let config = KdamondConfig {
+            refresh_interval: Duration::ZERO,
+            contexts: vec![context],
+        };
+
+        let error = kdamond
+            .stage_configuration(&config)
+            .expect_err("subpage units must be powers of two");
+        assert!(matches!(
+            error,
+            Error::InvalidConfiguration {
+                field: "address unit",
+                ..
+            }
+        ));
+        assert_eq!(model.write_count(), writes);
+    }
+
+    #[test]
+    fn indexed_counts_reject_values_wider_than_the_kernel_abi() {
+        let model = test_backend::Model::new("vaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        let error = admin
+            .set_kdamond_count(i32::MAX as usize + 1)
+            .expect_err("kernel count overflow must be rejected");
+        assert!(matches!(error, Error::InvalidConfiguration { .. }));
+        assert_eq!(admin.kdamond_count().expect("count remains unchanged"), 0);
+    }
+
+    #[test]
+    fn owned_configuration_preserves_absent_optional_attributes() {
+        let model = test_backend::Model::new("vaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        kdamond.set_context_count(1).expect("stage context");
+        let context = kdamond.context(0);
+        context.set_target_count(1).expect("stage target");
+        context
+            .target(0)
+            .set_pid(Pid::new(42).expect("valid pid"))
+            .expect("stage pid");
+        context.set_scheme_count(1).expect("stage scheme");
+
+        for path in [
+            "kdamonds/0/refresh_ms",
+            "kdamonds/0/contexts/0/addr_unit",
+            "kdamonds/0/contexts/0/pause",
+            "kdamonds/0/contexts/0/monitoring_attrs/intervals/intervals_goal",
+            "kdamonds/0/contexts/0/monitoring_attrs/probes",
+            "kdamonds/0/contexts/0/targets/0/obsolete_target",
+            "kdamonds/0/contexts/0/targets/0/regions",
+            "kdamonds/0/contexts/0/schemes/0/apply_interval_us",
+            "kdamonds/0/contexts/0/schemes/0/target_nid",
+            "kdamonds/0/contexts/0/schemes/0/quotas/goals",
+            "kdamonds/0/contexts/0/schemes/0/quotas/goal_tuner",
+            "kdamonds/0/contexts/0/schemes/0/quotas/fail_charge_num",
+            "kdamonds/0/contexts/0/schemes/0/quotas/fail_charge_denom",
+            "kdamonds/0/contexts/0/schemes/0/filters",
+            "kdamonds/0/contexts/0/schemes/0/core_filters",
+            "kdamonds/0/contexts/0/schemes/0/ops_filters",
+            "kdamonds/0/contexts/0/schemes/0/dests",
+            "kdamonds/0/contexts/0/schemes/0/stats/sz_ops_filter_passed",
+            "kdamonds/0/contexts/0/schemes/0/stats/nr_snapshots",
+            "kdamonds/0/contexts/0/schemes/0/stats/max_nr_snapshots",
+        ] {
+            model.remove_tree(path);
+        }
+
+        let config = kdamond.configuration().expect("read legacy configuration");
+        assert_eq!(config.refresh_interval, Duration::ZERO);
+        let context_config = &config.contexts[0];
+        assert_eq!(context_config.address_unit, AddressUnit::ONE);
+        assert_eq!(
+            context_config.intervals_goal,
+            IntervalsGoalConfig::default()
+        );
+        assert!(context_config.probes.is_empty());
+        assert!(context_config.targets[0].initial_regions.is_empty());
+        assert!(context_config.schemes[0].destinations.is_empty());
+        let stats = context.scheme(0).stats().expect("read legacy scheme stats");
+        assert_eq!(stats.operations_filter_passed_units, None);
+        assert_eq!(stats.snapshots, None);
+        assert_eq!(stats.maximum_snapshots, None);
+        kdamond
+            .stage_configuration(&config)
+            .expect("restage configuration without unavailable attributes");
+    }
+
+    #[test]
+    fn owned_configuration_supports_damo_legacy_attribute_aliases() {
+        let model = test_backend::Model::new("vaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        kdamond.set_context_count(1).expect("stage context");
+        let context = kdamond.context(0);
+        context.set_target_count(1).expect("stage target");
+        context
+            .target(0)
+            .set_pid(Pid::new(42).expect("valid pid"))
+            .expect("stage pid");
+        context.set_scheme_count(1).expect("stage scheme");
+        let scheme = context.scheme(0);
+        model.remove_tree("kdamonds/0/contexts/0/schemes/0/core_filters");
+        model.remove_tree("kdamonds/0/contexts/0/schemes/0/ops_filters");
+        scheme
+            .set_filter_count(FilterLayer::Unified, 1)
+            .expect("stage filter");
+        scheme.quotas().set_goal_count(1).expect("stage quota goal");
+
+        let filter_path = "kdamonds/0/contexts/0/schemes/0/filters/0";
+        model.remove_tree(format!("{filter_path}/allow"));
+        model.set_file(format!("{filter_path}/pass"), b"Y\n");
+        let goal_metric = "kdamonds/0/contexts/0/schemes/0/quotas/goals/0/target_metric";
+        model.remove_tree(goal_metric);
+
+        assert_eq!(
+            kdamond
+                .capabilities(0, 0)
+                .expect("discover legacy filter control")
+                .feature_support(SysfsFeature::SchemeFilterAllow),
+            CapabilitySupport::Supported
+        );
+        let config = kdamond.configuration().expect("read legacy aliases");
+        assert!(config.contexts[0].schemes[0].filters[0].allow);
+        assert_eq!(
+            config.contexts[0].schemes[0].quota.goals[0].metric,
+            QuotaGoalMetric::UserInput
+        );
+        kdamond
+            .stage_configuration(&config)
+            .expect("restage legacy aliases");
+        assert_eq!(
+            model.value(format!("{filter_path}/pass")),
+            Some("Y".to_owned())
+        );
+        assert_eq!(model.value(goal_metric), None);
+    }
+
+    #[test]
+    fn owned_configuration_rejects_kernel_commit_invariants() {
+        let pattern = AccessPattern::new(
+            RegionSizeRange::new(0, 1).expect("valid size range"),
+            AccessCountRange::new(0, 1).expect("valid access range"),
+            AgeRange::new(0, 1).expect("valid age range"),
+        );
+        let mut context = ContextConfig::new(Operation::PhysicalAddress);
+        context.targets = vec![TargetConfig::address_space(), TargetConfig::address_space()];
+        assert!(context.validate().is_err());
+
+        context.targets.truncate(1);
+        context.targets[0].initial_regions = vec![
+            InitialRegionConfig::new(100, 200).expect("valid region"),
+            InitialRegionConfig::new(150, 250).expect("valid region"),
+        ];
+        assert!(context.validate().is_err());
+
+        context.targets[0].initial_regions.clear();
+        let mut scheme = SchemeConfig::new(Action::Stat, pattern);
+        scheme.filters = vec![FilterConfig::new(SchemeFilterType::Anonymous, true, false)];
+        context.schemes.push(scheme);
+        context
+            .validate()
+            .expect("semantic filters are assigned to the supported ABI layer");
+    }
+
+    #[test]
+    fn owned_configuration_rejects_overflow_prone_ratios_and_weights() {
+        let intervals = MonitoringIntervals::default();
+        let goal = IntervalsGoalConfig {
+            access_basis_points: 10_001,
+            aggregation_intervals: 1,
+            minimum_sample: intervals.sample(),
+            maximum_sample: intervals.sample(),
+        };
+        assert!(goal.validate_for(intervals).is_err());
+
+        let mut quota = QuotaConfig::default();
+        quota.weights.size_per_thousand = 1_001;
+        assert!(quota.validate().is_err());
+        quota.weights.size_per_thousand = 1_000;
+        quota.time = Duration::from_millis(1);
+        assert!(quota.validate().is_err());
+
+        let pattern = AccessPattern::new(
+            RegionSizeRange::new(0, 1).expect("valid size range"),
+            AccessCountRange::new(0, 1).expect("valid access range"),
+            AgeRange::new(0, 1).expect("valid age range"),
+        );
+        let mut scheme = SchemeConfig::new(Action::MigrateCold, pattern);
+        scheme.destinations = vec![
+            DestinationConfig::new(0, u32::MAX),
+            DestinationConfig::new(1, 1),
+        ];
+        assert!(scheme.validate_for(1).is_err());
+    }
+
+    #[test]
+    fn disabled_controls_preserve_kernel_staged_values() {
+        let model = test_backend::Model::new("vaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        kdamond.set_context_count(1).expect("stage context");
+        let context = kdamond.context(0);
+        context
+            .set_intervals_goal(IntervalsGoalConfig {
+                access_basis_points: 10_001,
+                aggregation_intervals: 0,
+                minimum_sample: Duration::from_micros(20),
+                maximum_sample: Duration::from_micros(10),
+            })
+            .expect("disabled interval goal ignores inactive thresholds");
+        context.set_scheme_count(1).expect("stage scheme");
+        let scheme = context.scheme(0);
+        let watermarks = scheme.watermarks();
+        watermarks
+            .set_metric(&WatermarkMetric::None)
+            .expect("disable watermarks");
+        watermarks.set_high(1).expect("stage inactive high");
+        watermarks.set_middle(3).expect("stage inactive middle");
+        watermarks.set_low(2).expect("stage inactive low");
+        let quotas = scheme.quotas();
+        quotas.set_goal_count(1).expect("stage quota goal");
+        let goal = quotas.goal(0);
+        goal.set_metric(&QuotaGoalMetric::NodeMemoryControlGroupUsedBasisPoints)
+            .expect("stage goal metric");
+        goal.set_target_value(0).expect("disable quota goal");
+
+        let config = kdamond.configuration().expect("read staged controls");
+        config
+            .validate()
+            .expect("disabled controls must remain representable");
+        kdamond
+            .stage_configuration(&config)
+            .expect("disabled controls must round-trip");
+    }
+
+    #[test]
+    fn migration_without_an_explicit_node_matches_kernel_and_damo() {
+        let pattern = AccessPattern::new(
+            RegionSizeRange::new(0, u64::MAX).expect("valid size range"),
+            AccessCountRange::new(0, u32::MAX).expect("valid access range"),
+            AgeRange::new(0, u32::MAX).expect("valid age range"),
+        );
+        let scheme = SchemeConfig::new(Action::MigrateCold, pattern);
+        scheme
+            .validate_for(0)
+            .expect("NUMA_NO_NODE is a kernel-representable migration target");
+    }
+
+    #[test]
+    fn owned_validation_does_not_hardcode_the_kernel_context_limit() {
+        let model = test_backend::Model::new("future_ops\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        let config = KdamondConfig {
+            refresh_interval: Duration::ZERO,
+            contexts: vec![
+                ContextConfig::new(Operation::Unknown("future_ops".into())),
+                ContextConfig::new(Operation::Unknown("future_ops".into())),
+            ],
+        };
+
+        config
+            .validate()
+            .expect("future kernels may support multiple contexts");
+        let error = kdamond
+            .stage_configuration(&config)
+            .expect_err("the Linux 7.2 model enforces its own limit");
+        assert!(matches!(error, Error::Io { .. }));
+        assert_eq!(kdamond.context_count().expect("read context count"), 0);
+    }
+
+    #[test]
+    fn owned_configuration_round_trips_unknown_future_tokens() {
+        let model = test_backend::Model::new("future_ops\n");
+        model.set_supported_scheme_filter_types("future_filter\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        kdamond.set_context_count(1).expect("stage context");
+        let context = kdamond.context(0);
+        context
+            .set_operation(&Operation::Unknown("future_ops".into()))
+            .expect("select future operation");
+        context.set_scheme_count(1).expect("stage scheme");
+        let scheme = context.scheme(0);
+        scheme
+            .set_action(&Action::Unknown("future_action".into()))
+            .expect("select future action");
+        scheme
+            .set_filter_count(FilterLayer::Unified, 1)
+            .expect("stage future filter");
+        scheme
+            .filter(FilterLayer::Unified, 0)
+            .set_filter_type(&SchemeFilterType::Unknown("future_filter".into()))
+            .expect("select future filter type");
+        let quotas = scheme.quotas();
+        quotas.set_goal_count(1).expect("stage future quota goal");
+        quotas
+            .goal(0)
+            .set_metric(&QuotaGoalMetric::Unknown("future_metric".into()))
+            .expect("select future goal metric");
+        quotas
+            .set_goal_tuner(&QuotaGoalTuner::Unknown("future_tuner".into()))
+            .expect("select future goal tuner");
+        let watermarks = scheme.watermarks();
+        watermarks
+            .set_metric(&WatermarkMetric::Unknown("future_watermark".into()))
+            .expect("select future watermark metric");
+        watermarks.set_high(1).expect("stage future threshold");
+        watermarks.set_middle(3).expect("stage future threshold");
+        watermarks.set_low(2).expect("stage future threshold");
+
+        let config = kdamond.configuration().expect("read future configuration");
+        config
+            .validate()
+            .expect("unknown future tokens remain representable");
+        kdamond
+            .stage_configuration(&config)
+            .expect("restage future configuration");
+        assert_eq!(
+            kdamond
+                .configuration()
+                .expect("read restaged configuration"),
+            config
+        );
+    }
+
+    #[test]
+    fn typed_string_setters_reject_non_atomic_sysfs_values() {
+        let model = test_backend::Model::new("vaddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        kdamond.set_context_count(1).expect("stage context");
+        let context = kdamond.context(0);
+        let error = context
+            .set_operation(&Operation::Unknown("vaddr\nfuture".into()))
+            .expect_err("operation must be one sysfs token");
+        assert!(matches!(error, Error::InvalidConfiguration { .. }));
+        assert_eq!(
+            context.operation().expect("operation remains intact"),
+            Operation::VirtualAddress
+        );
+
+        context.set_probe_count(1).expect("stage probe");
+        let probe = context.probe(0);
+        probe.set_filter_count(1).expect("stage probe filter");
+        let filter = probe.filter(0);
+        let error = filter
+            .set_cgroup_path("/workload\0replacement")
+            .expect_err("cgroup path must not contain a NUL");
+        assert!(matches!(error, Error::InvalidConfiguration { .. }));
+        assert_eq!(filter.cgroup_path().expect("path remains intact"), "");
+
+        context.set_scheme_count(1).expect("stage scheme");
+        let scheme = context.scheme(0);
+        let error = scheme
+            .set_action(&Action::Unknown("stat future".into()))
+            .expect_err("action must be one sysfs token");
+        assert!(matches!(error, Error::InvalidConfiguration { .. }));
+        assert_eq!(
+            scheme.action().expect("action remains intact"),
+            Action::Stat
+        );
+    }
+
+    #[test]
+    fn huge_page_filter_sizes_are_bytes_independent_of_address_unit() {
+        let model = test_backend::Model::new("paddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        kdamond.set_context_count(1).expect("stage context");
+        let context = kdamond.context(0);
+        context
+            .set_operation(&Operation::PhysicalAddress)
+            .expect("select paddr");
+        context
+            .set_address_unit(AddressUnit::new(4_096).expect("valid unit"))
+            .expect("stage non-one address unit");
+        context.set_scheme_count(1).expect("stage scheme");
+        let scheme = context.scheme(0);
+        scheme
+            .set_filter_count(FilterLayer::Operations, 1)
+            .expect("stage filter");
+        let filter = scheme.filter(FilterLayer::Operations, 0);
+        let config = FilterConfig::huge_page_size(
+            ByteSizeRange::new(2 << 20, 1 << 30).expect("valid byte-size range"),
+            true,
+            true,
+        );
+        filter
+            .set_filter_type(&SchemeFilterType::HugePageSize)
+            .expect("select huge-page-size filter");
+        filter.set_matching(true).expect("stage matching");
+        filter.set_allowed(true).expect("stage allow");
+        filter
+            .set_minimum_size_bytes(2 << 20)
+            .expect("stage minimum");
+        filter
+            .set_maximum_size_bytes(1 << 30)
+            .expect("stage maximum");
+
+        assert_eq!(filter.minimum_size_bytes().expect("read minimum"), 2 << 20);
+        assert_eq!(filter.maximum_size_bytes().expect("read maximum"), 1 << 30);
+        assert_eq!(filter.configuration().expect("read filter"), config);
+    }
+
+    #[test]
+    fn nested_attribute_handles_are_symmetric() {
+        let model = test_backend::Model::new("paddr\n");
+        let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+        admin.set_kdamond_count(1).expect("stage kdamond");
+        let kdamond = admin.kdamond(0);
+        kdamond.set_context_count(1).expect("stage context");
+        let context = kdamond.context(0);
+        context.set_target_count(1).expect("stage target");
+        let target = context.target(0);
+        target
+            .set_initial_region_count(1)
+            .expect("stage initial region");
+        let region = target.initial_region(0);
+        region.set_start(100).expect("write start");
+        region.set_end(200).expect("write end");
+        assert_eq!(region.start().expect("read start"), 100);
+        assert_eq!(region.end().expect("read end"), 200);
+
+        context.set_scheme_count(1).expect("stage scheme");
+        let scheme = context.scheme(0);
+        scheme.set_target_node(3).expect("write target node");
+        assert_eq!(scheme.target_node().expect("read target node"), 3);
+        scheme
+            .set_filter_count(FilterLayer::Core, 1)
+            .expect("stage filter");
+        let filter = scheme.filter(FilterLayer::Core, 0);
+        filter
+            .set_filter_type(&SchemeFilterType::Address)
+            .expect("write filter type");
+        filter.set_matching(true).expect("write matching");
+        filter.set_allowed(false).expect("write allow");
+        filter
+            .set_address_start(1_000)
+            .expect("write address start");
+        filter.set_address_end(2_000).expect("write address end");
+        assert_eq!(
+            filter.filter_type().expect("read filter type"),
+            SchemeFilterType::Address
+        );
+        assert!(filter.matching().expect("read matching"));
+        assert!(!filter.allowed().expect("read allow"));
+        assert_eq!(filter.address_start().expect("read address start"), 1_000);
+        assert_eq!(filter.address_end().expect("read address end"), 2_000);
+
+        let quotas = scheme.quotas();
+        quotas
+            .set_failure_charge_numerator(2)
+            .expect("write numerator");
+        quotas
+            .set_failure_charge_denominator(7)
+            .expect("write denominator");
+        assert_eq!(
+            quotas.failure_charge_numerator().expect("read numerator"),
+            2
+        );
+        assert_eq!(
+            quotas
+                .failure_charge_denominator()
+                .expect("read denominator"),
+            7
+        );
+        quotas.set_goal_count(1).expect("stage quota goal");
+        let goal = quotas.goal(0);
+        goal.set_metric(&QuotaGoalMetric::UserInput)
+            .expect("write metric");
+        goal.set_target_value(12).expect("write target value");
+        goal.set_current_value(9).expect("write current value");
+        assert_eq!(
+            goal.metric().expect("read metric"),
+            QuotaGoalMetric::UserInput
+        );
+        assert_eq!(goal.target_value().expect("read target"), 12);
+        assert_eq!(goal.current_value().expect("read current"), 9);
+
+        scheme.set_destination_count(1).expect("stage destination");
+        let destination = scheme.destination(0);
+        destination.set_node_id(4).expect("write node");
+        destination.set_weight(11).expect("write weight");
+        assert_eq!(destination.node_id().expect("read node"), 4);
+        assert_eq!(destination.weight().expect("read weight"), 11);
     }
 
     #[derive(Default)]

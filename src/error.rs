@@ -41,6 +41,20 @@ pub enum Error {
         /// The number of configured kdamonds.
         kdamonds: usize,
     },
+    /// Transactional staging found a running kdamond that cannot be replaced.
+    KdamondRunning {
+        /// Index of the running kdamond.
+        index: usize,
+    },
+    /// The hierarchy read back after staging did not match the request.
+    ConfigurationMismatch {
+        /// Logical sysfs path of the first difference.
+        path: Box<str>,
+        /// Requested value formatted for diagnostics.
+        expected: Box<str>,
+        /// Value read back from the kernel.
+        observed: Box<str>,
+    },
     /// An operation requires a running monitor.
     NotRunning,
     /// The kernel reported an unknown kdamond state.
@@ -139,6 +153,17 @@ impl fmt::Display for Error {
             Self::InUse { kdamonds } => write!(
                 formatter,
                 "DAMON is already configured with {kdamonds} kdamond(s)"
+            ),
+            Self::KdamondRunning { index } => {
+                write!(formatter, "DAMON kdamond {index} is running")
+            }
+            Self::ConfigurationMismatch {
+                path,
+                expected,
+                observed,
+            } => write!(
+                formatter,
+                "staged DAMON value at {path} is {observed}, expected {expected}"
             ),
             Self::NotRunning => formatter.write_str("the DAMON monitor is not running"),
             Self::UnexpectedKdamondState { state } => {

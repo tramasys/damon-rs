@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::sysfs::{
-    Action, CapabilitySupport, ConfigurationFingerprint, DamonAdmin, Kdamond, KdamondCommand,
-    KdamondState, Operation, SysfsFeature,
+    Action, CapabilitySupport, ConfigurationFingerprint, ConfigurationSnapshot, DamonAdmin,
+    DamonConfig, Kdamond, KdamondCommand, KdamondState, Operation, SysfsFeature,
 };
 use crate::{
     AddressUnit, Capabilities, Error, MonitoringIntervals, Pid, RegionBounds, Result, Snapshot,
@@ -71,6 +71,65 @@ impl Damon {
         }
     }
 
+    /// Transactionally stages a complete owned DAMON configuration.
+    ///
+    /// The complete object graph is validated before the first sysfs access.
+    /// Staging then holds the advisory session lock, requires every existing
+    /// kdamond to be stopped, and verifies the values read back from the
+    /// kernel. If staging fails, the preceding writable hierarchy is restored,
+    /// including unknown future attributes.
+    ///
+    /// The kernel does not provide an atomic replacement or ownership
+    /// primitive. Other controllers must honor [`Self::lock_path`] for these
+    /// guarantees to hold, and readers can observe intermediate sysfs writes.
+    pub fn stage_configuration(&self, config: &DamonConfig) -> Result<()> {
+        config.validate()?;
+        let session_lock = SessionLock::acquire(&self.lock_path)?;
+        self.stage_validated_configuration_locked(&session_lock, config)
+    }
+
+    /// Stages a validated configuration while the caller retains ownership of
+    /// the advisory session lock.
+    ///
+    /// Keeping this boundary explicit lets a future running session stage,
+    /// start, and record its ownership fingerprint under one uninterrupted
+    /// lock acquisition.
+    fn stage_validated_configuration_locked(
+        &self,
+        _session_lock: &SessionLock,
+        config: &DamonConfig,
+    ) -> Result<()> {
+        retry_busy(|| ensure_hierarchy_stopped(&self.admin))?;
+
+        let previous = retry_busy(|| self.admin.configuration_snapshot())?;
+        let observed = match retry_busy(|| self.admin.configuration()) {
+            Ok(observed) => Some(observed),
+            Err(error) if replaceable_configuration_read_error(&error) => None,
+            Err(error) => return Err(error),
+        };
+        if !retry_busy(|| previous.values_match_current())? {
+            return Err(Error::OwnershipLost {
+                reason: "the DAMON hierarchy changed while it was being captured",
+            });
+        }
+        retry_busy(|| ensure_hierarchy_stopped(&self.admin))?;
+        if observed
+            .as_ref()
+            .is_some_and(|observed| config.equivalent_after_kernel_normalization(observed))
+        {
+            return Ok(());
+        }
+
+        let operation = stage_and_verify_configuration(&self.admin, config, observed.as_ref());
+        match operation {
+            Ok(()) => Ok(()),
+            Err(operation) => Err(with_rollback(
+                operation,
+                restore_configuration(&self.admin, &previous),
+            )),
+        }
+    }
+
     /// Exclusively stages representative nodes and discovers this kernel's
     /// concrete and semantic DAMON sysfs capabilities.
     ///
@@ -100,6 +159,69 @@ impl Damon {
             )),
         }
     }
+}
+
+fn replaceable_configuration_read_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::InvalidConfiguration { .. } | Error::InvalidKernelValue { .. }
+    )
+}
+
+fn stage_and_verify_configuration(
+    admin: &DamonAdmin,
+    config: &DamonConfig,
+    observed: Option<&DamonConfig>,
+) -> Result<()> {
+    retry_busy(|| {
+        ensure_hierarchy_stopped(admin)?;
+        admin.stage_validated_configuration_from(config, observed)
+    })?;
+
+    retry_busy(|| ensure_hierarchy_stopped(admin))?;
+    let staged = retry_busy(|| admin.configuration_snapshot())?;
+    let observed = retry_busy(|| admin.configuration())?;
+    if let Some(error) = config.mismatch_error(&observed) {
+        return Err(error);
+    }
+    if !retry_busy(|| staged.values_match_current())? {
+        return Err(Error::OwnershipLost {
+            reason: "the staged DAMON hierarchy changed during verification",
+        });
+    }
+    retry_busy(|| ensure_hierarchy_stopped(admin))
+}
+
+fn restore_configuration(admin: &DamonAdmin, snapshot: &ConfigurationSnapshot) -> Result<()> {
+    retry_busy(|| ensure_hierarchy_stopped(admin))?;
+    retry_busy(|| {
+        ensure_hierarchy_stopped(admin)?;
+        snapshot.restore()
+    })?;
+    retry_busy(|| ensure_hierarchy_stopped(admin))?;
+    if !retry_busy(|| snapshot.matches_current())? {
+        return Err(Error::OwnershipLost {
+            reason: "the restored DAMON hierarchy changed during verification",
+        });
+    }
+    Ok(())
+}
+
+fn ensure_hierarchy_stopped(admin: &DamonAdmin) -> Result<()> {
+    let count = admin.kdamond_count()?;
+    for index in 0..count {
+        match admin.kdamond(index).state()? {
+            KdamondState::Off => {}
+            KdamondState::On => return Err(Error::KdamondRunning { index }),
+            KdamondState::Unknown(state) => return Err(Error::UnexpectedKdamondState { state }),
+        }
+    }
+    if admin.kdamond_count()? != count {
+        return Err(Error::OwnershipLost {
+            reason: "the kdamond count changed while checking transaction safety",
+        });
+    }
+    Ok(())
 }
 
 fn stage_capability_probe(kdamond: &Kdamond) -> Result<(Capabilities, ConfigurationFingerprint)> {
@@ -694,6 +816,11 @@ mod tests {
 
     use super::*;
     use crate::sysfs::test_backend::{Model, ModelRegion, Mutation};
+    use crate::sysfs::{
+        AccessCountRange, AccessPattern, AgeRange, ContextConfig, FilterConfig, KdamondConfig,
+        QuotaGoalConfig, QuotaGoalMetric, RegionSizeRange, SchemeConfig, SchemeFilterType,
+        TargetConfig,
+    };
 
     #[test]
     fn busy_operations_are_retried() {
@@ -736,6 +863,410 @@ mod tests {
 
         assert!(!error.is_resource_busy());
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn transactional_staging_verifies_readback_and_skips_a_matching_hierarchy() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let config = transaction_config(42, Action::Stat);
+
+        damon
+            .stage_configuration(&config)
+            .expect("stage configuration transactionally");
+        assert_eq!(
+            damon
+                .admin
+                .configuration()
+                .expect("read staged configuration"),
+            config
+        );
+
+        let writes = model.write_count();
+        damon
+            .stage_configuration(&config)
+            .expect("matching configuration is a no-op");
+        assert_eq!(model.write_count(), writes);
+    }
+
+    #[test]
+    fn transactional_staging_writes_only_changed_leaf_fields() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let original = transaction_config(42, Action::Stat);
+        damon
+            .stage_configuration(&original)
+            .expect("stage original configuration");
+        let writes = model.write_count();
+
+        let replacement = transaction_config(77, Action::PageOut);
+        damon
+            .stage_configuration(&replacement)
+            .expect("stage two changed leaves");
+
+        assert_eq!(model.write_count() - writes, 2);
+        assert_eq!(
+            damon.admin.configuration().expect("read replacement"),
+            replacement
+        );
+    }
+
+    #[test]
+    fn transactional_staging_accepts_split_filter_order_normalization() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let mut config = transaction_config(42, Action::Stat);
+        config.kdamonds[0].contexts[0].schemes[0].filters = vec![
+            FilterConfig::new(SchemeFilterType::Anonymous, true, true),
+            FilterConfig::address(0, 4096, true, true),
+        ];
+
+        damon
+            .stage_configuration(&config)
+            .expect("split layout may canonicalize filter order");
+        let writes = model.write_count();
+        damon
+            .stage_configuration(&config)
+            .expect("canonicalized readback is a no-op");
+
+        assert_eq!(model.write_count(), writes);
+        let observed = damon.admin.configuration().expect("read canonical filters");
+        assert_eq!(
+            observed.kdamonds[0].contexts[0].schemes[0].filters[0].filter_type,
+            SchemeFilterType::Address
+        );
+    }
+
+    #[test]
+    fn exclusive_capability_probe_observes_current_damo_controls() {
+        let model = Model::new("vaddr\n");
+        model.enable_current_damo_extensions();
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+
+        let capabilities = damon.capabilities().expect("probe current controls");
+
+        for feature in [
+            SysfsFeature::ProbeWeight,
+            SysfsFeature::ProbePreparations,
+            SysfsFeature::ProbePreparationSetPageIdle,
+            SysfsFeature::ProbeTypePageIdleUnset,
+            SysfsFeature::SampleControl,
+            SysfsFeature::OperationAttributes,
+        ] {
+            assert_eq!(
+                capabilities.feature_support(feature),
+                CapabilitySupport::Supported,
+                "unexpected support for {feature:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transactional_staging_repairs_a_malformed_stopped_configuration() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let config = transaction_config(42, Action::Stat);
+        damon
+            .stage_configuration(&config)
+            .expect("stage original configuration");
+        model.set_file(
+            "kdamonds/0/contexts/0/monitoring_attrs/intervals/sample_us",
+            b"malformed\n",
+        );
+
+        damon
+            .stage_configuration(&config)
+            .expect("replace malformed staged input");
+
+        assert_eq!(
+            damon
+                .admin
+                .configuration()
+                .expect("read repaired configuration"),
+            config
+        );
+    }
+
+    #[test]
+    fn transactional_staging_retries_a_transient_kernel_busy_error() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let original = transaction_config(42, Action::Stat);
+        damon
+            .stage_configuration(&original)
+            .expect("stage original configuration");
+        model.fail_next_write("kdamonds/0/contexts/0/schemes/0/watermarks/low", 16);
+        let replacement = transaction_config(77, Action::PageOut);
+
+        damon
+            .stage_configuration(&replacement)
+            .expect("retry transient EBUSY");
+
+        assert_eq!(
+            damon
+                .admin
+                .configuration()
+                .expect("read replacement configuration"),
+            replacement
+        );
+    }
+
+    #[test]
+    fn transactional_staging_validates_before_locking_or_writing() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let _held_lock = SessionLock::acquire(lock.path()).expect("hold session lock");
+        let mut invalid = transaction_config(42, Action::Stat);
+        invalid.kdamonds[0].contexts[0].targets[0] = TargetConfig::address_space();
+        let writes = model.write_count();
+
+        let error = damon
+            .stage_configuration(&invalid)
+            .expect_err("validation must precede lock acquisition");
+
+        assert!(matches!(error, Error::InvalidConfiguration { .. }));
+        assert_eq!(model.write_count(), writes);
+    }
+
+    #[test]
+    fn transactional_staging_uses_the_session_lock() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let _held_lock = SessionLock::acquire(lock.path()).expect("hold session lock");
+
+        let error = damon
+            .stage_configuration(&transaction_config(42, Action::Stat))
+            .expect_err("cooperating transaction must honor the lock");
+
+        assert!(matches!(error, Error::SessionLockBusy { .. }));
+        assert_eq!(damon.admin.kdamond_count().expect("read count"), 0);
+    }
+
+    #[test]
+    fn transactional_staging_restores_typed_and_unknown_values_after_io_failure() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let original = transaction_config(42, Action::Stat);
+        damon
+            .stage_configuration(&original)
+            .expect("stage original configuration");
+        let unknown = "kdamonds/0/contexts/0/schemes/0/future_policy";
+        model.set_file(unknown, b"preserve\n");
+        model.after_next_write(
+            "kdamonds/0/contexts/0/schemes/0/action",
+            b"pageout".to_vec(),
+            vec![Mutation::SetFile {
+                path: unknown.into(),
+                value: b"changed\n".to_vec(),
+            }],
+        );
+        model.fail_next_write("kdamonds/0/contexts/0/schemes/0/watermarks/low", 5);
+
+        let mut replacement = transaction_config(77, Action::PageOut);
+        replacement.kdamonds[0].contexts[0].schemes[0]
+            .watermarks
+            .low = 1;
+        let error = damon
+            .stage_configuration(&replacement)
+            .expect_err("late write failure must roll back");
+
+        assert!(
+            matches!(error, Error::Io { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            damon
+                .admin
+                .configuration()
+                .expect("read restored configuration"),
+            original
+        );
+        assert_eq!(model.value(unknown).as_deref(), Some("preserve"));
+    }
+
+    #[test]
+    fn transactional_staging_restores_after_kernel_readback_mismatch() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let original = transaction_config(42, Action::Stat);
+        damon
+            .stage_configuration(&original)
+            .expect("stage original configuration");
+        model.after_next_write(
+            "kdamonds/0/contexts/0/schemes/0/watermarks/low",
+            b"1".to_vec(),
+            vec![Mutation::SetFile {
+                path: "kdamonds/0/contexts/0/schemes/0/action".into(),
+                value: b"cold\n".to_vec(),
+            }],
+        );
+
+        let mut replacement = transaction_config(77, Action::PageOut);
+        replacement.kdamonds[0].contexts[0].schemes[0]
+            .watermarks
+            .low = 1;
+        let error = damon
+            .stage_configuration(&replacement)
+            .expect_err("mismatched readback must roll back");
+
+        match error {
+            Error::ConfigurationMismatch {
+                path,
+                expected,
+                observed,
+            } => {
+                assert_eq!(path.as_ref(), "kdamonds/0/contexts/0/schemes/0/action");
+                assert_eq!(expected.as_ref(), "PageOut");
+                assert_eq!(observed.as_ref(), "Cold");
+            }
+            error => panic!("unexpected error: {error:?}"),
+        }
+        assert_eq!(
+            damon
+                .admin
+                .configuration()
+                .expect("read restored configuration"),
+            original
+        );
+    }
+
+    #[test]
+    fn transactional_rollback_reconstructs_the_original_indexed_hierarchy() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let original = transaction_config(42, Action::Stat);
+        damon
+            .stage_configuration(&original)
+            .expect("stage original configuration");
+        let mut replacement = transaction_config(77, Action::PageOut);
+        replacement
+            .kdamonds
+            .push(transaction_config(88, Action::Cold).kdamonds.remove(0));
+        model.fail_next_write("kdamonds/1/contexts/0/schemes/0/watermarks/low", 5);
+
+        let error = damon
+            .stage_configuration(&replacement)
+            .expect_err("second kdamond failure must restore the first hierarchy");
+
+        assert!(matches!(error, Error::Io { .. }));
+        assert_eq!(damon.admin.kdamond_count().expect("read count"), 1);
+        assert_eq!(
+            damon
+                .admin
+                .configuration()
+                .expect("read reconstructed configuration"),
+            original
+        );
+    }
+
+    #[test]
+    fn transactional_rollback_restores_an_empty_sysfs_string() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let mut original = transaction_config(42, Action::Stat);
+        original.kdamonds[0].contexts[0].schemes[0].quota.goals =
+            vec![QuotaGoalConfig::new(QuotaGoalMetric::UserInput, 0)];
+        damon
+            .stage_configuration(&original)
+            .expect("stage empty quota-goal path");
+
+        let mut replacement = transaction_config(77, Action::PageOut);
+        replacement.kdamonds[0].contexts[0].schemes[0].quota.goals = vec![QuotaGoalConfig {
+            metric: QuotaGoalMetric::NodeMemoryControlGroupFreeBasisPoints,
+            target_value: 0,
+            current_value: 0,
+            node_id: Some(1),
+            cgroup_path: Some("/workload".to_owned()),
+        }];
+        replacement.kdamonds[0].contexts[0].schemes[0]
+            .watermarks
+            .low = 1;
+        model.fail_next_write("kdamonds/0/contexts/0/schemes/0/watermarks/low", 5);
+
+        let error = damon
+            .stage_configuration(&replacement)
+            .expect_err("late failure must restore an empty path");
+
+        assert!(matches!(error, Error::Io { .. }));
+        assert_eq!(
+            model
+                .value("kdamonds/0/contexts/0/schemes/0/quotas/goals/0/path")
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            damon
+                .admin
+                .configuration()
+                .expect("read restored configuration"),
+            original
+        );
+    }
+
+    #[test]
+    fn transactional_staging_never_replaces_a_running_kdamond() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let original = transaction_config(42, Action::Stat);
+        damon
+            .stage_configuration(&original)
+            .expect("stage original configuration");
+        let kdamond = damon.admin.kdamond(0);
+        kdamond.command(KdamondCommand::On).expect("start kdamond");
+
+        let error = damon
+            .stage_configuration(&transaction_config(77, Action::PageOut))
+            .expect_err("running hierarchy must not be replaced");
+
+        assert!(matches!(error, Error::KdamondRunning { index: 0 }));
+        assert_eq!(kdamond.state().expect("read state"), KdamondState::On);
+        kdamond.command(KdamondCommand::Off).expect("stop fixture");
+    }
+
+    #[test]
+    fn external_start_during_transaction_prevents_destructive_rollback() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        damon
+            .stage_configuration(&transaction_config(42, Action::Stat))
+            .expect("stage original configuration");
+        model.after_next_write(
+            "kdamonds/0/contexts/0/schemes/0/action",
+            b"pageout".to_vec(),
+            vec![Mutation::StartKdamond {
+                path: "kdamonds/0".into(),
+            }],
+        );
+
+        let error = damon
+            .stage_configuration(&transaction_config(77, Action::PageOut))
+            .expect_err("external start must prevent rollback");
+
+        assert!(matches!(
+            error,
+            Error::Rollback {
+                operation,
+                rollback,
+            } if matches!(*operation, Error::KdamondRunning { index: 0 })
+                && matches!(*rollback, Error::KdamondRunning { index: 0 })
+        ));
+        let kdamond = damon.admin.kdamond(0);
+        assert_eq!(kdamond.state().expect("read state"), KdamondState::On);
+        kdamond.command(KdamondCommand::Off).expect("stop fixture");
     }
 
     #[test]
@@ -1123,6 +1654,25 @@ mod tests {
             capabilities.feature_support(SysfsFeature::SchemeFilterYoung),
             CapabilitySupport::Unverified
         );
+    }
+
+    fn transaction_config(pid: u32, action: Action) -> DamonConfig {
+        let pattern = AccessPattern::new(
+            RegionSizeRange::new(0, u64::MAX).expect("valid size range"),
+            AccessCountRange::new(0, u32::MAX).expect("valid access range"),
+            AgeRange::new(0, u32::MAX).expect("valid age range"),
+        );
+        let mut context = ContextConfig::new(Operation::VirtualAddress);
+        context
+            .targets
+            .push(TargetConfig::for_pid(Pid::new(pid).expect("valid pid")));
+        context.schemes.push(SchemeConfig::new(action, pattern));
+
+        let mut kdamond = KdamondConfig::default();
+        kdamond.contexts.push(context);
+        let mut config = DamonConfig::default();
+        config.kdamonds.push(kdamond);
+        config
     }
 
     fn os_error(code: i32) -> Error {

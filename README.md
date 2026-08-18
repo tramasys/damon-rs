@@ -8,13 +8,15 @@ privileged admin sysfs ABI and is not a replacement for the
 
 - High-level virtual-address monitoring for one process
 - Typed low-level access to DAMON admin sysfs
+- Adaptive owned configuration through Linux 7.2 and current `damo` controls
+- Transactional whole-hierarchy staging with verified rollback
 - Runtime discovery for all 57 official `damo` sysfs capabilities
 - Checked address-unit conversion and sparse tried-region parsing
 - Advisory locking, ownership checks, rollback, and cleanup
 - No unsafe code and one direct Linux syscall dependency
 
 High-level physical-address sessions, multiple contexts or targets, policy
-configuration, and async integration are future work.
+builders, and async integration are future work.
 
 ## Requirements
 
@@ -92,6 +94,11 @@ sysfs only.
 The public `damon::sysfs` module maps typed handles directly to sysfs objects.
 Low-level snapshots retain raw DAMON address units until the caller attaches a
 known effective unit.
+
+`Damon::stage_configuration()` coordinates whole-hierarchy replacement with
+the session lock, rejects running kdamonds, verifies kernel read-back, and
+restores the preceding writable hierarchy if staging fails. Changed
+configurations write only differing leaves.
 
 ## Toolchain
 

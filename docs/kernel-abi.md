@@ -4,10 +4,10 @@ This document records the kernel contracts that shape the crate.
 
 ## Audit baseline
 
-- Audit date: 2026-08-17
+- Audit date: 2026-08-18
 - Linux tag: `v7.2`
 - Linux commit: `8d3ae59288f1e7d58d76558a6ee96d533bc5019f`
-- Official `damo` commit: `590207a5e2db8d7dd0911564baff42cce114170c`
+- Official `damo` commit: `80caa75bbac6b8cc6279d296ede0b112a8435d83`
 
 Primary sources:
 
@@ -15,7 +15,7 @@ Primary sources:
 - [Linux `sysfs.c`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/mm/damon/sysfs.c?h=v7.2)
 - [Linux `sysfs-schemes.c`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/mm/damon/sysfs-schemes.c?h=v7.2)
 - [Linux DAMON public header](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/damon.h?h=v7.2)
-- [Official `damo` sysfs backend](https://github.com/damonitor/damo/blob/590207a5e2db8d7dd0911564baff42cce114170c/src/_damon_sysfs.py)
+- [Official `damo` sysfs backend](https://github.com/damonitor/damo/blob/80caa75bbac6b8cc6279d296ede0b112a8435d83/src/_damon_sysfs.py)
 
 ## High-level transaction
 
@@ -31,6 +31,12 @@ kdamonds when ownership is still established.
 
 These checks reduce races but cannot stop an uncooperative privileged process
 from changing the global kernel interface.
+
+Whole-hierarchy configuration staging uses the same lock and refuses running
+kdamonds. It captures every writable input, validates and stages typed values,
+verifies kernel read-back, and reconstructs the captured hierarchy after a
+failure. Unknown future writable attributes are included in restoration.
+Changed configurations are staged as leaf-level differences.
 
 ## Snapshots
 
@@ -54,7 +60,8 @@ tries `u64::MAX`, then falls back to `u32::MAX` only after a kernel range error.
 
 Physical-address results use `addr_unit`. Low-level snapshots therefore expose
 raw units. Byte conversion requires an explicit effective unit and checks
-overflow. High-level virtual-address sessions use an effective unit of one.
+overflow. Physical-address staging also rejects non-power-of-two units below
+the runtime page size. High-level virtual-address sessions use a unit of one.
 
 Access-pattern sizes use the kernel-width range type. Access counts and ages
 use `u32`, matching the active kernel structures and preventing silent
@@ -93,6 +100,6 @@ Linux 7.2 is the source baseline, not a version gate. The adaptive path is also
 live-tested on Linux 7.1. Wider kernel coverage still needs kernel-backed VM
 tests.
 
-Capability parity covers official `damo` admin sysfs discovery. It does not
-mean every discovered feature has a high-level Rust API. The separate legacy
-debugfs backend is out of scope.
+Capability parity covers official `damo` admin sysfs discovery. Probe weights
+and preparations, operation attributes, and sample controls are typed when
+present. The separate legacy debugfs backend is out of scope.
