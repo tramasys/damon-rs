@@ -15,9 +15,13 @@ It provides:
 The crate is sysfs-only. It does not provide the legacy debugfs backend or
 continuous tracepoint recording.
 
+## Requirements
+
 The kernel normally needs `CONFIG_DAMON`, `CONFIG_DAMON_VADDR`, and
 `CONFIG_DAMON_SYSFS`. Access to the admin interface usually requires elevated
 privileges.
+
+## Example
 
 ```rust,no_run
 use std::time::Duration;
@@ -46,6 +50,8 @@ fn main() -> Result<(), damon::Error> {
 }
 ```
 
+## API
+
 `Damon::vaddr()`, `Damon::fvaddr()`, and `Damon::paddr()` build common
 monitoring workflows. `Damon::exclusive_session()` manages one kdamond, while
 `Damon::managed_hierarchy()` manages a complete multi-kdamond configuration.
@@ -61,6 +67,8 @@ Snapshot materialization is a synchronous kernel operation and may wait for a
 scheme apply interval. Cached reads avoid the materialization command.
 `SnapshotRequest` supports deadline-based waiting without claiming to cancel a
 blocked kernel write.
+
+## Compatibility
 
 The public `damon::sysfs` module exposes typed handles for direct ABI access.
 Runtime support is discovered from available paths and accepted values.
