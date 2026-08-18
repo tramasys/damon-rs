@@ -3361,11 +3361,6 @@ pub(crate) mod test_backend {
         }
 
         fn materialize_tried_regions(&mut self, kdamond: &Path) -> io::Result<()> {
-            let base = kdamond.join("contexts/0/schemes/0/tried_regions");
-            if !self.nodes.contains_key(&base) {
-                return Err(not_found(&base));
-            }
-            self.remove_indexed_children(&base);
             let regions = self.tried_regions.clone();
             let total = regions.iter().try_fold(0_u64, |total, region| {
                 let size = region.end.checked_sub(region.start).ok_or_else(|| {
@@ -3375,38 +3370,71 @@ pub(crate) mod test_backend {
                     io::Error::new(io::ErrorKind::InvalidData, "modeled total overflow")
                 })
             })?;
-            self.file(base.join("total_bytes"), format!("{total}\n").as_bytes());
-            for (index, region) in regions.iter().enumerate() {
-                let region_base = base.join(index.to_string());
-                self.directory(&region_base);
-                self.file(
-                    region_base.join("start"),
-                    format!("{}\n", region.start).as_bytes(),
-                );
-                self.file(
-                    region_base.join("end"),
-                    format!("{}\n", region.end).as_bytes(),
-                );
-                self.file(
-                    region_base.join("nr_accesses"),
-                    format!("{}\n", region.nr_accesses).as_bytes(),
-                );
-                self.file(
-                    region_base.join("age"),
-                    format!("{}\n", region.age).as_bytes(),
-                );
-                if let Some(units) = region.filter_passed_units {
+            for scheme_index in 0..self.scheme_count(kdamond)? {
+                let base = kdamond
+                    .join("contexts/0/schemes")
+                    .join(scheme_index.to_string())
+                    .join("tried_regions");
+                if !self.nodes.contains_key(&base) {
+                    return Err(not_found(&base));
+                }
+                self.remove_indexed_children(&base);
+                self.file(base.join("total_bytes"), format!("{total}\n").as_bytes());
+                for (index, region) in regions.iter().enumerate() {
+                    let region_base = base.join(index.to_string());
+                    self.directory(&region_base);
                     self.file(
-                        region_base.join("sz_filter_passed"),
-                        format!("{units}\n").as_bytes(),
+                        region_base.join("start"),
+                        format!("{}\n", region.start).as_bytes(),
                     );
+                    self.file(
+                        region_base.join("end"),
+                        format!("{}\n", region.end).as_bytes(),
+                    );
+                    self.file(
+                        region_base.join("nr_accesses"),
+                        format!("{}\n", region.nr_accesses).as_bytes(),
+                    );
+                    self.file(
+                        region_base.join("age"),
+                        format!("{}\n", region.age).as_bytes(),
+                    );
+                    if let Some(units) = region.filter_passed_units {
+                        self.file(
+                            region_base.join("sz_filter_passed"),
+                            format!("{units}\n").as_bytes(),
+                        );
+                    }
+                    self.directory(region_base.join("probes"));
+                    for (probe_index, hits) in region.probe_hits.iter().enumerate() {
+                        let probe_base = region_base.join("probes").join(probe_index.to_string());
+                        self.directory(&probe_base);
+                        self.file(probe_base.join("hits"), format!("{hits}\n").as_bytes());
+                    }
                 }
-                self.directory(region_base.join("probes"));
-                for (probe_index, hits) in region.probe_hits.iter().enumerate() {
-                    let probe_base = region_base.join("probes").join(probe_index.to_string());
-                    self.directory(&probe_base);
-                    self.file(probe_base.join("hits"), format!("{hits}\n").as_bytes());
+            }
+            Ok(())
+        }
+
+        fn scheme_count(&self, kdamond: &Path) -> io::Result<usize> {
+            let path = kdamond.join("contexts/0/schemes/nr_schemes");
+            match self.nodes.get(&path) {
+                Some(Node::File(value)) => Self::parse_count(value),
+                _ => Err(not_found(&path)),
+            }
+        }
+
+        fn clear_materialized_tried_regions(&mut self, kdamond: &Path) -> io::Result<()> {
+            for scheme_index in 0..self.scheme_count(kdamond)? {
+                let base = kdamond
+                    .join("contexts/0/schemes")
+                    .join(scheme_index.to_string())
+                    .join("tried_regions");
+                if !self.nodes.contains_key(&base) {
+                    return Err(not_found(&base));
                 }
+                self.remove_indexed_children(&base);
+                self.file(base.join("total_bytes"), b"0\n");
             }
             Ok(())
         }
@@ -3517,14 +3545,17 @@ pub(crate) mod test_backend {
                 "update_schemes_tried_bytes" => {
                     self.ensure_running(path)?;
                     self.materialize_tried_regions(kdamond)?;
-                    let base = kdamond.join("contexts/0/schemes/0/tried_regions");
-                    self.remove_indexed_children(&base);
+                    for scheme_index in 0..self.scheme_count(kdamond)? {
+                        let base = kdamond
+                            .join("contexts/0/schemes")
+                            .join(scheme_index.to_string())
+                            .join("tried_regions");
+                        self.remove_indexed_children(&base);
+                    }
                 }
                 "clear_schemes_tried_regions" => {
                     self.ensure_running(path)?;
-                    let base = kdamond.join("contexts/0/schemes/0/tried_regions");
-                    self.remove_indexed_children(&base);
-                    self.file(base.join("total_bytes"), b"0\n");
+                    self.clear_materialized_tried_regions(kdamond)?;
                 }
                 "update_schemes_stats" => {
                     self.ensure_running(path)?;

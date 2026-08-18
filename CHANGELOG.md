@@ -7,7 +7,10 @@ This project follows Semantic Versioning and Keep a Changelog.
 ### Added
 
 - Safe typed access to DAMON admin sysfs
-- High-level single-process virtual-address monitoring
+- High-level single-target `vaddr`, `fvaddr`, and `paddr` workflow builders
+- Optional initial regions, probes, and custom DAMOS schemes in high-level
+  workflows
+- Runtime custom-scheme statistics and effective quota reads
 - Match-all DAMOS snapshot queries with sparse region and probe parsing
 - Raw address-unit results and checked byte-scaled views
 - Four-state discovery for all 57 official `damo` sysfs capabilities
@@ -41,5 +44,5 @@ This project follows Semantic Versioning and Keep a Changelog.
 - Probe semantic scheme and monitoring filter values
 - Serialize cooperating sessions and recheck ownership around lifecycle and
   snapshot operations
-- Route the single-process monitor through the generic session engine
+- Route all high-level workflows through the generic session engine
 - Model kernel reconstruction, active state, errors, and races in tests

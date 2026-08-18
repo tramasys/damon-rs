@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use crate::sysfs::{
     AccessCountRange, AccessPattern, Action, AgeRange, CapabilitySupport, ConfigurationFingerprint,
-    ConfigurationSnapshot, ContextConfig, DamonAdmin, DamonConfig, Kdamond, KdamondCommand,
-    KdamondConfig, KdamondState, Operation, RegionSizeRange, SchemeConfig, SchemeStats,
-    SysfsFeature, TargetConfig,
+    ConfigurationSnapshot, ContextConfig, DamonAdmin, DamonConfig, InitialRegionConfig, Kdamond,
+    KdamondCommand, KdamondConfig, KdamondState, Operation, ProbeConfig, RegionSizeRange,
+    SchemeConfig, SchemeStats, SysfsFeature, TargetConfig,
 };
 use crate::{
     AddressUnit, Capabilities, Error, MonitoringIntervals, Pid, RawSnapshot, RegionBounds, Result,
@@ -63,14 +63,33 @@ impl Damon {
     /// Starts building a virtual-address monitor for a process.
     #[must_use]
     pub fn monitor_pid(&self, pid: Pid) -> MonitorBuilder<'_> {
-        MonitorBuilder {
-            damon: self,
-            pid,
-            sample: MonitoringIntervals::default().sample(),
-            aggregation: MonitoringIntervals::default().aggregation(),
-            update: MonitoringIntervals::default().update(),
-            min_regions: RegionBounds::default().min(),
-            max_regions: RegionBounds::default().max(),
+        self.vaddr().pid(pid)
+    }
+
+    /// Starts building a process virtual-address monitoring workflow.
+    #[must_use]
+    pub fn vaddr(&self) -> VaddrSessionBuilder<'_> {
+        VaddrSessionBuilder {
+            options: WorkflowOptions::new(self),
+            pid: None,
+        }
+    }
+
+    /// Starts building a fixed virtual-address monitoring workflow.
+    #[must_use]
+    pub fn fvaddr(&self) -> FvaddrSessionBuilder<'_> {
+        FvaddrSessionBuilder {
+            options: WorkflowOptions::new(self),
+            pid: None,
+        }
+    }
+
+    /// Starts building a physical-address monitoring workflow.
+    #[must_use]
+    pub fn paddr(&self) -> PaddrSessionBuilder<'_> {
+        PaddrSessionBuilder {
+            options: WorkflowOptions::new(self),
+            address_unit: AddressUnit::ONE,
         }
     }
 
@@ -1113,120 +1132,370 @@ impl Drop for ExclusiveSession {
     }
 }
 
-/// Builder for a process virtual-address monitor.
 #[derive(Clone, Debug)]
-pub struct MonitorBuilder<'a> {
+struct WorkflowOptions<'a> {
     damon: &'a Damon,
-    pid: Pid,
     sample: Duration,
     aggregation: Duration,
     update: Duration,
     min_regions: u64,
     max_regions: u64,
+    initial_regions: Vec<InitialRegionConfig>,
+    probes: Vec<ProbeConfig>,
+    schemes: Vec<SchemeConfig>,
 }
 
-impl MonitorBuilder<'_> {
-    /// Replaces all monitoring intervals.
+impl<'a> WorkflowOptions<'a> {
+    fn new(damon: &'a Damon) -> Self {
+        let intervals = MonitoringIntervals::default();
+        let region_bounds = RegionBounds::default();
+        Self {
+            damon,
+            sample: intervals.sample(),
+            aggregation: intervals.aggregation(),
+            update: intervals.update(),
+            min_regions: region_bounds.min(),
+            max_regions: region_bounds.max(),
+            initial_regions: Vec::new(),
+            probes: Vec::new(),
+            schemes: Vec::new(),
+        }
+    }
+}
+
+/// Builder for a process virtual-address monitoring workflow.
+#[derive(Clone, Debug)]
+pub struct VaddrSessionBuilder<'a> {
+    options: WorkflowOptions<'a>,
+    pid: Option<Pid>,
+}
+
+/// Backwards-compatible name for [`VaddrSessionBuilder`].
+pub type MonitorBuilder<'a> = VaddrSessionBuilder<'a>;
+
+/// Builder for a fixed virtual-address monitoring workflow.
+#[derive(Clone, Debug)]
+pub struct FvaddrSessionBuilder<'a> {
+    options: WorkflowOptions<'a>,
+    pid: Option<Pid>,
+}
+
+/// Builder for a physical-address monitoring workflow.
+#[derive(Clone, Debug)]
+pub struct PaddrSessionBuilder<'a> {
+    options: WorkflowOptions<'a>,
+    address_unit: AddressUnit,
+}
+
+macro_rules! impl_common_workflow_builder {
+    ($builder:ident) => {
+        impl $builder<'_> {
+            /// Replaces all monitoring intervals.
+            #[must_use]
+            pub const fn intervals(mut self, intervals: MonitoringIntervals) -> Self {
+                self.options.sample = intervals.sample();
+                self.options.aggregation = intervals.aggregation();
+                self.options.update = intervals.update();
+                self
+            }
+
+            /// Sets the interval between access samples.
+            #[must_use]
+            pub const fn sample_interval(mut self, interval: Duration) -> Self {
+                self.options.sample = interval;
+                self
+            }
+
+            /// Sets the interval between aggregation snapshots.
+            #[must_use]
+            pub const fn aggregation_interval(mut self, interval: Duration) -> Self {
+                self.options.aggregation = interval;
+                self
+            }
+
+            /// Sets the interval between monitoring-operations updates.
+            #[must_use]
+            pub const fn operations_update_interval(mut self, interval: Duration) -> Self {
+                self.options.update = interval;
+                self
+            }
+
+            /// Sets lower and upper bounds for the number of monitoring regions.
+            #[must_use]
+            pub const fn region_bounds(mut self, min: u64, max: u64) -> Self {
+                self.options.min_regions = min;
+                self.options.max_regions = max;
+                self
+            }
+
+            /// Replaces the monitoring-data probes.
+            #[must_use]
+            pub fn probes(mut self, probes: impl IntoIterator<Item = ProbeConfig>) -> Self {
+                self.options.probes = probes.into_iter().collect();
+                self
+            }
+
+            /// Appends one monitoring-data probe.
+            #[must_use]
+            pub fn probe(mut self, probe: ProbeConfig) -> Self {
+                self.options.probes.push(probe);
+                self
+            }
+
+            /// Replaces the custom DAMOS schemes.
+            ///
+            /// The workflow adds a private match-all statistics scheme after
+            /// these schemes so [`Monitor::snapshot`] remains independent of
+            /// user policy. Address and size values use DAMON core units.
+            #[must_use]
+            pub fn schemes(mut self, schemes: impl IntoIterator<Item = SchemeConfig>) -> Self {
+                self.options.schemes = schemes.into_iter().collect();
+                self
+            }
+
+            /// Appends one custom DAMOS scheme.
+            #[must_use]
+            pub fn scheme(mut self, scheme: SchemeConfig) -> Self {
+                self.options.schemes.push(scheme);
+                self
+            }
+        }
+    };
+}
+
+impl_common_workflow_builder!(VaddrSessionBuilder);
+impl_common_workflow_builder!(FvaddrSessionBuilder);
+impl_common_workflow_builder!(PaddrSessionBuilder);
+
+impl VaddrSessionBuilder<'_> {
+    /// Selects the single process monitored by this workflow.
     #[must_use]
-    pub fn intervals(mut self, intervals: MonitoringIntervals) -> Self {
-        self.sample = intervals.sample();
-        self.aggregation = intervals.aggregation();
-        self.update = intervals.update();
+    pub fn pid(mut self, pid: Pid) -> Self {
+        self.pid = Some(pid);
         self
     }
 
-    /// Sets the interval between access samples.
+    /// Replaces optional initial regions expressed as byte addresses.
     #[must_use]
-    pub const fn sample_interval(mut self, interval: Duration) -> Self {
-        self.sample = interval;
+    pub fn regions(mut self, regions: impl IntoIterator<Item = InitialRegionConfig>) -> Self {
+        self.options.initial_regions = regions.into_iter().collect();
         self
     }
 
-    /// Sets the interval between aggregation snapshots.
+    /// Appends one optional initial region expressed as byte addresses.
     #[must_use]
-    pub const fn aggregation_interval(mut self, interval: Duration) -> Self {
-        self.aggregation = interval;
+    pub fn region(mut self, region: InitialRegionConfig) -> Self {
+        self.options.initial_regions.push(region);
         self
     }
 
-    /// Sets the interval between monitoring-operations updates.
-    #[must_use]
-    pub const fn operations_update_interval(mut self, interval: Duration) -> Self {
-        self.update = interval;
-        self
-    }
-
-    /// Sets lower and upper bounds for the number of monitoring regions.
-    #[must_use]
-    pub const fn region_bounds(mut self, min: u64, max: u64) -> Self {
-        self.min_regions = min;
-        self.max_regions = max;
-        self
-    }
-
-    /// Validates, stages, and starts this monitor.
+    /// Validates, stages, and starts this virtual-address workflow.
     ///
-    /// The method holds an advisory file lock for the monitor's lifetime,
-    /// refuses to replace a running kdamond, restores any preceding stopped
-    /// hierarchy, and rechecks the staged configuration and kernel-thread ID.
-    /// Uncooperative controllers can bypass the file lock because DAMON sysfs
-    /// has no ownership primitive.
+    /// The returned monitor holds the cooperative lock and restores the
+    /// preceding stopped configuration when explicitly stopped or dropped.
     pub fn start(self) -> Result<Monitor> {
-        let intervals = MonitoringIntervals::new(self.sample, self.aggregation, self.update)?;
-        let region_bounds = RegionBounds::new(self.min_regions, self.max_regions)?;
-        let config = monitor_configuration(self.pid, intervals, region_bounds);
-        let mut session = self.damon.exclusive_session(&config)?;
-        let mut capabilities = match session.capabilities(0, 0) {
-            Ok(capabilities) => capabilities,
-            Err(operation) => return Err(with_rollback(operation, session.close())),
-        };
-        if capabilities.operation_support(&Operation::VirtualAddress)
-            == Some(CapabilitySupport::Unsupported)
-        {
-            return Err(with_rollback(
-                Error::UnsupportedOperation {
-                    operation: Operation::VirtualAddress,
-                },
-                session.close(),
-            ));
-        }
-        if let Err(operation) = session.start() {
-            return Err(with_rollback(operation, session.close()));
-        }
-        capabilities.confirm_operation(&Operation::VirtualAddress);
-
-        Ok(Monitor {
-            session: Some(session),
-            capabilities,
-            capacity_hint: usize::try_from(region_bounds.max()).unwrap_or(usize::MAX),
-            operation: Operation::VirtualAddress,
-            effective_address_unit: AddressUnit::ONE,
-        })
+        let pid = self.pid.ok_or(Error::InvalidConfiguration {
+            field: "virtual-address PID",
+            reason: "requires exactly one process identifier",
+        })?;
+        start_workflow(
+            self.options,
+            Operation::VirtualAddress,
+            Some(pid),
+            AddressUnit::ONE,
+        )
     }
 }
 
-fn monitor_configuration(
-    pid: Pid,
-    intervals: MonitoringIntervals,
-    region_bounds: RegionBounds,
-) -> DamonConfig {
+impl FvaddrSessionBuilder<'_> {
+    /// Selects the single process monitored by this workflow.
+    #[must_use]
+    pub fn pid(mut self, pid: Pid) -> Self {
+        self.pid = Some(pid);
+        self
+    }
+
+    /// Replaces required fixed regions expressed as byte addresses.
+    #[must_use]
+    pub fn regions(mut self, regions: impl IntoIterator<Item = InitialRegionConfig>) -> Self {
+        self.options.initial_regions = regions.into_iter().collect();
+        self
+    }
+
+    /// Appends one fixed region expressed as byte addresses.
+    #[must_use]
+    pub fn region(mut self, region: InitialRegionConfig) -> Self {
+        self.options.initial_regions.push(region);
+        self
+    }
+
+    /// Validates, stages, and starts this fixed virtual-address workflow.
+    ///
+    /// The returned monitor holds the cooperative lock and restores the
+    /// preceding stopped configuration when explicitly stopped or dropped.
+    pub fn start(self) -> Result<Monitor> {
+        let pid = self.pid.ok_or(Error::InvalidConfiguration {
+            field: "fixed virtual-address PID",
+            reason: "requires exactly one process identifier",
+        })?;
+        start_workflow(
+            self.options,
+            Operation::FixedVirtualAddress,
+            Some(pid),
+            AddressUnit::ONE,
+        )
+    }
+}
+
+impl PaddrSessionBuilder<'_> {
+    /// Sets the number of bytes represented by one physical-address unit.
+    #[must_use]
+    pub fn address_unit(mut self, address_unit: AddressUnit) -> Self {
+        self.address_unit = address_unit;
+        self
+    }
+
+    /// Replaces required physical regions expressed in core address units.
+    #[must_use]
+    pub fn regions_units(mut self, regions: impl IntoIterator<Item = InitialRegionConfig>) -> Self {
+        self.options.initial_regions = regions.into_iter().collect();
+        self
+    }
+
+    /// Appends one physical region expressed in core address units.
+    #[must_use]
+    pub fn region_units(mut self, region: InitialRegionConfig) -> Self {
+        self.options.initial_regions.push(region);
+        self
+    }
+
+    /// Validates, stages, and starts this physical-address workflow.
+    ///
+    /// The returned monitor holds the cooperative lock and restores the
+    /// preceding stopped configuration when explicitly stopped or dropped.
+    pub fn start(self) -> Result<Monitor> {
+        start_workflow(
+            self.options,
+            Operation::PhysicalAddress,
+            None,
+            self.address_unit,
+        )
+    }
+}
+
+struct PreparedWorkflow {
+    config: DamonConfig,
+    snapshot_scheme_index: usize,
+    custom_scheme_count: usize,
+    capacity_hint: usize,
+}
+
+fn prepare_workflow(
+    options: WorkflowOptions<'_>,
+    operation: Operation,
+    pid: Option<Pid>,
+    address_unit: AddressUnit,
+) -> Result<PreparedWorkflow> {
+    let intervals = MonitoringIntervals::new(options.sample, options.aggregation, options.update)?;
+    let region_bounds = RegionBounds::new(options.min_regions, options.max_regions)?;
+    let mut target = pid.map_or_else(TargetConfig::address_space, TargetConfig::for_pid);
+    target.initial_regions = options.initial_regions;
+
+    let mut context = ContextConfig::new(operation);
+    context.address_unit = address_unit;
+    context.intervals = intervals;
+    context.region_bounds = region_bounds;
+    context.probes = options.probes;
+    context.targets.push(target);
+    context.schemes = options.schemes;
+    let snapshot_scheme_index = context.schemes.len();
+    context.schemes.push(snapshot_query_scheme());
+
+    let mut kdamond = KdamondConfig::default();
+    kdamond.contexts.push(context);
+    let mut config = DamonConfig::default();
+    config.kdamonds.push(kdamond);
+    config.validate_runnable()?;
+
+    Ok(PreparedWorkflow {
+        config,
+        snapshot_scheme_index,
+        custom_scheme_count: snapshot_scheme_index,
+        capacity_hint: usize::try_from(region_bounds.max()).unwrap_or(usize::MAX),
+    })
+}
+
+fn start_workflow(
+    options: WorkflowOptions<'_>,
+    operation: Operation,
+    pid: Option<Pid>,
+    address_unit: AddressUnit,
+) -> Result<Monitor> {
+    let damon = options.damon;
+    let prepared = prepare_workflow(options, operation.clone(), pid, address_unit)?;
+    let mut session = match damon.exclusive_session(&prepared.config) {
+        Ok(session) => session,
+        Err(error) => return Err(classify_operation_staging_error(error, &operation)),
+    };
+    let mut capabilities = match session.capabilities(0, prepared.snapshot_scheme_index) {
+        Ok(capabilities) => capabilities,
+        Err(error) => return Err(with_rollback(error, session.close())),
+    };
+    if capabilities.operation_support(&operation) == Some(CapabilitySupport::Unsupported) {
+        return Err(with_rollback(
+            Error::UnsupportedOperation {
+                operation: operation.clone(),
+            },
+            session.close(),
+        ));
+    }
+    if let Err(error) = session.start() {
+        return Err(with_rollback(error, session.close()));
+    }
+    capabilities.confirm_operation(&operation);
+
+    Ok(Monitor {
+        session: Some(session),
+        capabilities,
+        capacity_hint: prepared.capacity_hint,
+        operation,
+        effective_address_unit: address_unit,
+        snapshot_scheme_index: prepared.snapshot_scheme_index,
+        custom_scheme_count: prepared.custom_scheme_count,
+    })
+}
+
+fn classify_operation_staging_error(error: Error, operation: &Operation) -> Error {
+    match error {
+        Error::Io {
+            ref path,
+            ref source,
+            ..
+        } if path.file_name().is_some_and(|name| name == "operations")
+            && source.raw_os_error() == Some(22) =>
+        {
+            Error::UnsupportedOperation {
+                operation: operation.clone(),
+            }
+        }
+        Error::Rollback {
+            operation: failed,
+            rollback,
+        } => Error::Rollback {
+            operation: Box::new(classify_operation_staging_error(*failed, operation)),
+            rollback,
+        },
+        error => error,
+    }
+}
+
+fn snapshot_query_scheme() -> SchemeConfig {
     let pattern = AccessPattern::new(
         RegionSizeRange::new(0, u64::MAX).expect("match-all size range is valid"),
         AccessCountRange::new(0, u32::MAX).expect("match-all access range is valid"),
         AgeRange::new(0, u32::MAX).expect("match-all age range is valid"),
     );
-    let mut context = ContextConfig::new(Operation::VirtualAddress);
-    context.intervals = intervals;
-    context.region_bounds = region_bounds;
-    context.targets.push(TargetConfig::for_pid(pid));
-    context
-        .schemes
-        .push(SchemeConfig::new(Action::Stat, pattern));
-    let mut kdamond = KdamondConfig::default();
-    kdamond.contexts.push(context);
-    let mut config = DamonConfig::default();
-    config.kdamonds.push(kdamond);
-    config
+    SchemeConfig::new(Action::Stat, pattern)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1369,6 +1638,8 @@ pub struct Monitor {
     capacity_hint: usize,
     operation: Operation,
     effective_address_unit: AddressUnit,
+    snapshot_scheme_index: usize,
+    custom_scheme_count: usize,
 }
 
 impl Monitor {
@@ -1393,13 +1664,72 @@ impl Monitor {
         self.effective_address_unit
     }
 
+    /// Returns the number of custom schemes supplied to the workflow builder.
+    ///
+    /// The private scheme used by [`Self::snapshot`] is not included.
+    #[must_use]
+    pub const fn scheme_count(&self) -> usize {
+        self.custom_scheme_count
+    }
+
+    /// Refreshes and reads one custom scheme's runtime counters.
+    ///
+    /// Size fields remain in DAMON core address units. Use
+    /// [`Self::effective_address_unit`] for checked conversion when needed.
+    pub fn scheme_stats(&mut self, scheme_index: usize) -> Result<SchemeStats> {
+        self.validate_custom_scheme_index(scheme_index)?;
+        self.session
+            .as_mut()
+            .ok_or(Error::NotRunning)?
+            .scheme_stats(0, scheme_index)
+    }
+
+    /// Reads one custom scheme's last materialized runtime counters.
+    pub fn cached_scheme_stats(&self, scheme_index: usize) -> Result<SchemeStats> {
+        self.validate_custom_scheme_index(scheme_index)?;
+        self.session
+            .as_ref()
+            .ok_or(Error::NotRunning)?
+            .cached_scheme_stats(0, scheme_index)
+    }
+
+    /// Refreshes and reads one custom scheme's effective quota in core units.
+    pub fn effective_quota_units(&mut self, scheme_index: usize) -> Result<u64> {
+        self.validate_custom_scheme_index(scheme_index)?;
+        self.session
+            .as_mut()
+            .ok_or(Error::NotRunning)?
+            .effective_quota_units(0, scheme_index)
+    }
+
+    /// Reads one custom scheme's last materialized effective quota in core units.
+    pub fn cached_effective_quota_units(&self, scheme_index: usize) -> Result<u64> {
+        self.validate_custom_scheme_index(scheme_index)?;
+        self.session
+            .as_ref()
+            .ok_or(Error::NotRunning)?
+            .cached_effective_quota_units(0, scheme_index)
+    }
+
+    /// Pauses monitoring while retaining the running workflow and ownership.
+    pub fn pause(&mut self) -> Result<()> {
+        self.session.as_mut().ok_or(Error::NotRunning)?.pause()
+    }
+
+    /// Resumes a workflow previously paused through [`Self::pause`].
+    pub fn resume(&mut self) -> Result<()> {
+        self.session.as_mut().ok_or(Error::NotRunning)?.resume()
+    }
+
     /// Queries the current monitored regions.
     ///
-    /// The kernel fulfills this request through a match-all `stat` DAMOS
-    /// scheme. The call may wait for the scheme's next apply interval. Mutable
-    /// access serializes sysfs result materialization for this monitor. Kernels
-    /// before tried-region queries were introduced can still run the monitor,
-    /// but this method returns [`Error::UnsupportedFeature`].
+    /// Every operation-specific builder creates exactly one target, so regions
+    /// are returned in that target's address order. The kernel fulfills this
+    /// request through a private match-all `stat` DAMOS scheme. The call may
+    /// wait for the scheme's next apply interval. Mutable access serializes
+    /// sysfs result materialization for this monitor. Kernels before tried-region
+    /// queries were introduced can still run the monitor, but this method
+    /// returns [`Error::UnsupportedFeature`].
     pub fn snapshot(&mut self) -> Result<Snapshot> {
         if self
             .capabilities
@@ -1414,7 +1744,7 @@ impl Monitor {
             .session
             .as_mut()
             .ok_or(Error::NotRunning)?
-            .tried_regions(0, 0, self.capacity_hint)?;
+            .tried_regions(0, self.snapshot_scheme_index, self.capacity_hint)?;
         Ok(raw.with_effective_address_unit(self.effective_address_unit))
     }
 
@@ -1428,6 +1758,17 @@ impl Monitor {
     /// Stops monitoring and restores the hierarchy that preceded this monitor.
     pub fn stop(mut self) -> Result<()> {
         self.session.take().ok_or(Error::NotRunning)?.close()
+    }
+
+    fn validate_custom_scheme_index(&self, scheme_index: usize) -> Result<()> {
+        if scheme_index >= self.custom_scheme_count {
+            return Err(Error::IndexOutOfBounds {
+                kind: "custom scheme",
+                index: scheme_index,
+                count: self.custom_scheme_count,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1444,6 +1785,206 @@ mod tests {
         IntervalsGoalConfig, KdamondConfig, QuotaGoalConfig, QuotaGoalMetric, RegionSizeRange,
         SchemeConfig, SchemeFilterType, TargetConfig,
     };
+
+    #[test]
+    fn vaddr_workflow_composes_regions_probes_schemes_and_snapshot_query() {
+        let model = Model::new("vaddr\nfvaddr\npaddr\n");
+        model.set_tried_regions(vec![ModelRegion {
+            start: 4_096,
+            end: 8_192,
+            nr_accesses: 7,
+            age: 3,
+            filter_passed_units: Some(4_096),
+            probe_hits: vec![5],
+        }]);
+        model.set_scheme_stats(vec![ModelSchemeStats {
+            nr_tried: 11,
+            sz_tried: 12,
+            nr_applied: 13,
+            sz_applied: 14,
+            sz_ops_filter_passed: 15,
+            qt_exceeds: 16,
+            nr_snapshots: 17,
+        }]);
+        model.set_effective_quota_bytes(vec![18]);
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let initial = InitialRegionConfig::new(0x1_0000, 0x2_0000).expect("valid region");
+        let mut monitor = damon
+            .vaddr()
+            .pid(Pid::new(42).expect("valid pid"))
+            .region(initial)
+            .probe(ProbeConfig::default())
+            .scheme(SchemeConfig::new(Action::PageOut, match_all_pattern()))
+            .start()
+            .expect("start vaddr workflow");
+
+        assert_eq!(monitor.operation(), &Operation::VirtualAddress);
+        assert_eq!(monitor.effective_address_unit(), AddressUnit::ONE);
+        assert_eq!(monitor.scheme_count(), 1);
+        assert_eq!(
+            model
+                .value("kdamonds/0/contexts/0/monitoring_attrs/probes/nr_probes")
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            model
+                .value("kdamonds/0/contexts/0/targets/0/regions/0/start")
+                .as_deref(),
+            Some("65536")
+        );
+        assert_eq!(
+            model
+                .value("kdamonds/0/contexts/0/schemes/0/action")
+                .as_deref(),
+            Some("pageout")
+        );
+        assert_eq!(
+            model
+                .value("kdamonds/0/contexts/0/schemes/1/action")
+                .as_deref(),
+            Some("stat")
+        );
+
+        let snapshot = monitor.snapshot().expect("query private snapshot scheme");
+        assert_eq!(snapshot.total_bytes().expect("byte total"), 4_096);
+        assert_eq!(snapshot.region(0).expect("region").nr_accesses(), 7);
+        let stats = monitor.scheme_stats(0).expect("custom scheme stats");
+        assert_eq!(stats.size_tried_units, 12);
+        assert_eq!(monitor.effective_quota_units(0).expect("custom quota"), 18);
+        assert!(matches!(
+            monitor.scheme_stats(1),
+            Err(Error::IndexOutOfBounds {
+                kind: "custom scheme",
+                ..
+            })
+        ));
+        monitor.pause().expect("pause workflow");
+        monitor.resume().expect("resume workflow");
+        monitor.stop().expect("restore hierarchy");
+    }
+
+    #[test]
+    fn fvaddr_workflow_requires_pid_and_fixed_regions_before_writing() {
+        let model = Model::new("vaddr\nfvaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let writes = model.write_count();
+
+        assert!(matches!(
+            damon.fvaddr().start(),
+            Err(Error::InvalidConfiguration {
+                field: "fixed virtual-address PID",
+                ..
+            })
+        ));
+        assert!(matches!(
+            damon.fvaddr().pid(Pid::new(42).expect("valid pid")).start(),
+            Err(Error::InvalidConfiguration {
+                field: "fixed virtual-address target regions",
+                ..
+            })
+        ));
+        assert_eq!(model.write_count(), writes);
+
+        let monitor = damon
+            .fvaddr()
+            .pid(Pid::new(42).expect("valid pid"))
+            .regions([InitialRegionConfig::new(100, 200).expect("valid region")])
+            .start()
+            .expect("start fvaddr workflow");
+        assert_eq!(monitor.operation(), &Operation::FixedVirtualAddress);
+        assert_eq!(monitor.effective_address_unit(), AddressUnit::ONE);
+        assert_eq!(
+            model.value("kdamonds/0/contexts/0/operations").as_deref(),
+            Some("fvaddr")
+        );
+        monitor.stop().expect("restore hierarchy");
+    }
+
+    #[test]
+    fn paddr_workflow_keeps_core_units_and_checked_byte_scale() {
+        let model = Model::new("paddr\n");
+        model.set_tried_regions(vec![ModelRegion {
+            start: 2,
+            end: 4,
+            nr_accesses: 1,
+            age: 1,
+            filter_passed_units: Some(2),
+            probe_hits: Vec::new(),
+        }]);
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let writes = model.write_count();
+        assert!(matches!(
+            damon.paddr().start(),
+            Err(Error::InvalidConfiguration {
+                field: "physical-address target regions",
+                ..
+            })
+        ));
+        assert_eq!(model.write_count(), writes);
+
+        let address_unit = AddressUnit::new(4_096).expect("valid page-size unit");
+        let mut monitor = damon
+            .paddr()
+            .address_unit(address_unit)
+            .region_units(InitialRegionConfig::new(2, 4).expect("valid raw region"))
+            .start()
+            .expect("start paddr workflow");
+        assert_eq!(monitor.operation(), &Operation::PhysicalAddress);
+        assert_eq!(monitor.effective_address_unit(), address_unit);
+        assert_eq!(
+            model
+                .value("kdamonds/0/contexts/0/targets/0/pid_target")
+                .as_deref(),
+            Some("0")
+        );
+        let snapshot = monitor.snapshot().expect("query paddr snapshot");
+        let region = snapshot.region(0).expect("physical region");
+        assert_eq!(region.start_units(), 2);
+        assert_eq!(region.start_bytes().expect("start bytes"), 8_192);
+        assert_eq!(region.end_bytes().expect("end bytes"), 16_384);
+        assert_eq!(snapshot.total_units(), 2);
+        assert_eq!(snapshot.total_bytes().expect("total bytes"), 8_192);
+        monitor.stop().expect("restore hierarchy");
+    }
+
+    #[test]
+    fn workflow_operation_support_and_staging_failures_restore_state() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let region = InitialRegionConfig::new(100, 200).expect("valid region");
+
+        let error = damon
+            .fvaddr()
+            .pid(Pid::new(42).expect("valid pid"))
+            .region(region)
+            .start()
+            .expect_err("unsupported operation must be classified");
+        assert!(matches!(
+            error,
+            Error::UnsupportedOperation {
+                operation: Operation::FixedVirtualAddress
+            }
+        ));
+        assert_eq!(model.value("kdamonds/nr_kdamonds").as_deref(), Some("0"));
+
+        let model = Model::new("vaddr\nfvaddr\n");
+        model.fail_next_write("kdamonds/0/contexts/0/targets/0/regions/0/end", 5);
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let error = damon
+            .fvaddr()
+            .pid(Pid::new(42).expect("valid pid"))
+            .region(region)
+            .start()
+            .expect_err("late staging failure must roll back");
+        assert!(matches!(error, Error::Io { .. }));
+        assert_eq!(model.value("kdamonds/nr_kdamonds").as_deref(), Some("0"));
+    }
 
     #[test]
     fn busy_operations_are_retried() {
@@ -2814,17 +3355,22 @@ mod tests {
         );
     }
 
-    fn transaction_config(pid: u32, action: Action) -> DamonConfig {
-        let pattern = AccessPattern::new(
+    fn match_all_pattern() -> AccessPattern {
+        AccessPattern::new(
             RegionSizeRange::new(0, u64::MAX).expect("valid size range"),
             AccessCountRange::new(0, u32::MAX).expect("valid access range"),
             AgeRange::new(0, u32::MAX).expect("valid age range"),
-        );
+        )
+    }
+
+    fn transaction_config(pid: u32, action: Action) -> DamonConfig {
         let mut context = ContextConfig::new(Operation::VirtualAddress);
         context
             .targets
             .push(TargetConfig::for_pid(Pid::new(pid).expect("valid pid")));
-        context.schemes.push(SchemeConfig::new(action, pattern));
+        context
+            .schemes
+            .push(SchemeConfig::new(action, match_all_pattern()));
 
         let mut kdamond = KdamondConfig::default();
         kdamond.contexts.push(context);

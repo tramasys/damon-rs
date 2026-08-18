@@ -6,7 +6,7 @@ privileged admin sysfs ABI and is not a replacement for the
 
 ## Scope
 
-- High-level virtual-address monitoring for one process
+- High-level single-target `vaddr`, `fvaddr`, and `paddr` workflows
 - Typed low-level access to DAMON admin sysfs
 - Adaptive owned configuration through Linux 7.2 and current `damo` controls
 - Transactional whole-hierarchy staging with verified rollback
@@ -16,8 +16,8 @@ privileged admin sysfs ABI and is not a replacement for the
 - Advisory locking, ownership checks, rollback, and cleanup
 - No unsafe code and one direct Linux syscall dependency
 
-High-level physical-address sessions, multiple contexts or targets, policy
-builders, and async integration are future work.
+Multiple contexts or targets, policy presets, and async integration are future
+work.
 
 ## Requirements
 
@@ -70,6 +70,11 @@ fn main() -> Result<(), damon::Error> {
 
 `Monitor::stop()` reports shutdown errors. Dropping a monitor performs
 best-effort cleanup.
+
+`Damon::vaddr()`, `Damon::fvaddr()`, and `Damon::paddr()` expose optional
+initial regions, probes, and custom DAMOS schemes. Physical regions and related
+scheme values remain in explicit DAMON core units, with checked byte conversion
+through the monitor's effective address unit.
 
 `Damon::exclusive_session()` provides the same lifecycle for any validated
 single-kdamond `DamonConfig`. Explicit `close()` reports restoration failures,

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use damon::sysfs::{
     AccessCountRange, AccessPattern, Action, AgeRange, ContextConfig, DamonAdmin, DamonConfig,
-    KdamondConfig, ProbeFilterType, RegionSizeRange,
+    InitialRegionConfig, KdamondConfig, ProbeFilterType, RegionSizeRange,
 };
 use damon::{
     AddressUnit, CapabilitySupport, Damon, Error, MonitoringIntervals, Operation, Pid,
@@ -528,6 +528,55 @@ fn high_level_staging_adapts_to_legacy_optional_attributes() {
     }
 
     monitor.stop().expect("stop legacy-compatible monitor");
+    assert_eq!(fixture.read("kdamonds/nr_kdamonds"), "0");
+}
+
+#[test]
+fn paddr_workflow_uses_unit_one_when_legacy_sysfs_has_no_address_unit() {
+    let fixture = Fixture::new("paddr\n");
+    fixture.remove("kdamonds/0/contexts/0/addr_unit");
+    fixture.write("kdamonds/0/contexts/0/targets/0/regions/0/start", "4096\n");
+    fixture.write("kdamonds/0/contexts/0/targets/0/regions/0/end", "8192\n");
+
+    let monitor = fixture
+        .damon()
+        .paddr()
+        .region_units(InitialRegionConfig::new(4_096, 8_192).expect("valid region"))
+        .start()
+        .expect("legacy paddr workflow with the neutral unit");
+
+    assert_eq!(monitor.operation(), &Operation::PhysicalAddress);
+    assert_eq!(monitor.effective_address_unit(), AddressUnit::ONE);
+    assert_eq!(
+        monitor
+            .capabilities()
+            .feature_support(SysfsFeature::AddressUnit),
+        CapabilitySupport::Unsupported
+    );
+    monitor.stop().expect("restore legacy hierarchy");
+}
+
+#[test]
+fn paddr_workflow_rejects_non_default_unit_when_legacy_attribute_is_absent() {
+    let fixture = Fixture::new("paddr\n");
+    fixture.remove("kdamonds/0/contexts/0/addr_unit");
+    fixture.write("kdamonds/0/contexts/0/targets/0/regions/0/start", "1\n");
+    fixture.write("kdamonds/0/contexts/0/targets/0/regions/0/end", "2\n");
+
+    let error = fixture
+        .damon()
+        .paddr()
+        .address_unit(AddressUnit::new(4_096).expect("valid unit"))
+        .region_units(InitialRegionConfig::new(1, 2).expect("valid region"))
+        .start()
+        .expect_err("missing non-default address-unit control must fail");
+
+    assert!(matches!(
+        error,
+        Error::UnsupportedFeature {
+            feature: "DAMON address units"
+        }
+    ));
     assert_eq!(fixture.read("kdamonds/nr_kdamonds"), "0");
 }
 

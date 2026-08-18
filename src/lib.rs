@@ -3,7 +3,7 @@
 //! `damon` provides two layers:
 //!
 //! - [`Damon`], [`ExclusiveSession`], and [`Monitor`] manage transactional
-//!   monitoring lifecycles.
+//!   `vaddr`, `fvaddr`, and `paddr` monitoring lifecycles.
 //! - [`sysfs`] exposes typed building blocks for callers that need direct
 //!   control over the kernel ABI.
 //!
@@ -44,7 +44,8 @@ pub mod sysfs;
 pub use config::{AddressUnit, MonitoringIntervals, Pid, RegionBounds};
 pub use error::{Error, Result};
 pub use monitor::{
-    DEFAULT_SESSION_LOCK_PATH, Damon, ExclusiveSession, Monitor, MonitorBuilder, RuntimeBatch,
+    DEFAULT_SESSION_LOCK_PATH, Damon, ExclusiveSession, FvaddrSessionBuilder, Monitor,
+    MonitorBuilder, PaddrSessionBuilder, RuntimeBatch, VaddrSessionBuilder,
 };
 pub use region::{
     ProbeHit, RawRegion, RawSnapshot, Region, RegionIter, Snapshot, SnapshotCompleteness,
