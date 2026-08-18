@@ -158,6 +158,19 @@ impl Kdamond {
         Ok(())
     }
 
+    pub(crate) fn stage_optional_probe_capability_children(
+        &self,
+        context_index: usize,
+        probe_index: usize,
+    ) -> Result<()> {
+        let preparations = self
+            .context(context_index)
+            .probe(probe_index)
+            .path()
+            .join("preps/nr_preps");
+        write_value_if_present(&preparations, 1_u8).map(|_| ())
+    }
+
     pub(crate) fn probe_semantic_filter_capabilities(
         &self,
         context_index: usize,
@@ -202,9 +215,54 @@ impl Kdamond {
                     (SysfsFeature::ProbeTypeAnonymous, "anon"),
                     (SysfsFeature::ProbeTypeMemoryControlGroup, "memcg"),
                     (SysfsFeature::ProbeTypePageIdleUnset, "pgidle_unset"),
+                    (SysfsFeature::ProbeTypePageIdleSet, "pgidle_set"),
                 ],
             )?);
         }
+        Ok(capabilities)
+    }
+
+    pub(crate) fn probe_semantic_value_capabilities(
+        &self,
+        context_index: usize,
+        scheme_index: usize,
+    ) -> Result<Vec<FeatureCapability>> {
+        let context = self.context(context_index);
+        let scheme = context.scheme(scheme_index);
+        let mut capabilities = probe_accepted_values_preserving(
+            &scheme.path.join("action"),
+            &[
+                (SysfsFeature::CollapseAction, "collapse"),
+                (SysfsFeature::DamosAllocateAction, "damos_alloc"),
+                (SysfsFeature::DamosFreeAction, "damos_free"),
+            ],
+        )?;
+        capabilities.extend(probe_accepted_values_preserving(
+            &scheme.path.join("quotas/goals/0/target_metric"),
+            &[
+                (SysfsFeature::SchemeQuotaGoalSomePsi, "some_mem_psi_us"),
+                (SysfsFeature::SchemeQuotaGoalNodeMemory, "node_mem_used_bp"),
+                (
+                    SysfsFeature::SchemeQuotaGoalNodeMemoryControlGroup,
+                    "node_memcg_used_bp",
+                ),
+                (SysfsFeature::SchemeQuotaGoalActiveMemory, "active_mem_bp"),
+                (
+                    SysfsFeature::SchemeQuotaGoalNodeEligibleMemory,
+                    "node_eligible_mem_bp",
+                ),
+                (
+                    SysfsFeature::SchemeQuotaGoalHugePageMemory,
+                    "hugepage_mem_bp",
+                ),
+            ],
+        )?);
+        capabilities.extend(probe_accepted_values_preserving(
+            &context
+                .path
+                .join("monitoring_attrs/probes/0/preps/0/prep_action"),
+            &[(SysfsFeature::ProbePreparationSetPageIdle, "set_pgidle")],
+        )?);
         Ok(capabilities)
     }
 }
@@ -419,26 +477,40 @@ fn quota_goal_capabilities(scheme: &Scheme) -> Result<Vec<FeatureCapability>> {
     let goals = quotas.join("goals");
     let goal = goals.join("0");
     let goal_support = indexed_child_support(&goals.join("nr_goals"), &goal)?;
-    let effective_quotas = support_for_path(&quotas.join("effective_bytes"))?;
-    let max_snapshots = support_for_path(&scheme.path.join("stats/max_nr_snapshots"))?;
-    let failure_charge = support_for_path(&quotas.join("fail_charge_denom"))?;
+    let metric_support = child_attribute_support(goal_support, &goal.join("target_metric"))?;
+    let semantic_metric_support = unverified_value_support(metric_support);
+    let node_support = child_attribute_support(goal_support, &goal.join("nid"))?;
+    let cgroup_support = child_attribute_support(goal_support, &goal.join("path"))?;
+    let action_support = unverified_value_support(support_for_path(&scheme.path.join("action"))?);
     Ok(vec![
-        feature_capability(SysfsFeature::SchemeQuotaGoalMetric, effective_quotas),
-        feature_capability(SysfsFeature::SchemeQuotaGoalSomePsi, effective_quotas),
+        feature_capability(SysfsFeature::SchemeQuotaGoalMetric, metric_support),
+        feature_capability(
+            SysfsFeature::SchemeQuotaGoalSomePsi,
+            semantic_metric_support,
+        ),
         feature_capability(
             SysfsFeature::SchemeQuotaGoalNodeMemory,
-            child_attribute_support(goal_support, &goal.join("nid"))?,
+            combine_support(semantic_metric_support, node_support),
         ),
         feature_capability(
             SysfsFeature::SchemeQuotaGoalNodeMemoryControlGroup,
-            child_attribute_support(goal_support, &goal.join("path"))?,
+            combine_support(semantic_metric_support, cgroup_support),
         ),
-        feature_capability(SysfsFeature::SchemeQuotaGoalActiveMemory, max_snapshots),
+        feature_capability(
+            SysfsFeature::SchemeQuotaGoalActiveMemory,
+            semantic_metric_support,
+        ),
         feature_capability(
             SysfsFeature::SchemeQuotaGoalNodeEligibleMemory,
-            failure_charge,
+            combine_support(semantic_metric_support, node_support),
         ),
-        feature_capability(SysfsFeature::CollapseAction, failure_charge),
+        feature_capability(
+            SysfsFeature::SchemeQuotaGoalHugePageMemory,
+            semantic_metric_support,
+        ),
+        feature_capability(SysfsFeature::CollapseAction, action_support),
+        feature_capability(SysfsFeature::DamosAllocateAction, action_support),
+        feature_capability(SysfsFeature::DamosFreeAction, action_support),
     ])
 }
 
@@ -456,16 +528,32 @@ fn probe_semantic_capabilities(context: &Context) -> Result<Vec<FeatureCapabilit
     } else {
         probe_support
     };
+    let prep_child_support = if prep_support == CapabilitySupport::Supported {
+        indexed_child_support(&probe.join("preps/nr_preps"), &probe.join("preps/0"))?
+    } else {
+        prep_support
+    };
+    let filter_value_support = unverified_value_support(filter_support);
     Ok(vec![
-        feature_capability(SysfsFeature::ProbeTypeAnonymous, filter_support),
-        feature_capability(SysfsFeature::ProbeTypeMemoryControlGroup, filter_support),
+        feature_capability(SysfsFeature::ProbeTypeAnonymous, filter_value_support),
+        feature_capability(
+            SysfsFeature::ProbeTypeMemoryControlGroup,
+            filter_value_support,
+        ),
         feature_capability(
             SysfsFeature::ProbeWeight,
             child_attribute_support(probe_support, &probe.join("weight"))?,
         ),
         feature_capability(SysfsFeature::ProbePreparations, prep_support),
-        feature_capability(SysfsFeature::ProbePreparationSetPageIdle, prep_support),
-        feature_capability(SysfsFeature::ProbeTypePageIdleUnset, prep_support),
+        feature_capability(
+            SysfsFeature::ProbePreparationSetPageIdle,
+            unverified_value_support(child_attribute_support(
+                prep_child_support,
+                &probe.join("preps/0/prep_action"),
+            )?),
+        ),
+        feature_capability(SysfsFeature::ProbeTypePageIdleUnset, filter_value_support),
+        feature_capability(SysfsFeature::ProbeTypePageIdleSet, filter_value_support),
     ])
 }
 
@@ -632,6 +720,69 @@ fn probe_accepted_values(
             operation: Box::new(operation),
             rollback: Box::new(rollback),
         }),
+    }
+}
+
+fn probe_accepted_values_preserving(
+    path: &Path,
+    candidates: &[(SysfsFeature, &str)],
+) -> Result<Vec<FeatureCapability>> {
+    if !path_exists(path)? {
+        return Ok(candidates
+            .iter()
+            .map(|(feature, _)| feature_capability(*feature, CapabilitySupport::Unsupported))
+            .collect());
+    }
+    let original = read_text(path)?;
+    let probe_result = (|| {
+        let mut capabilities = Vec::with_capacity(candidates.len());
+        for &(feature, value) in candidates {
+            let support = match write_bytes(path, value.as_bytes()) {
+                Ok(()) if read_text(path)?.trim() == value => CapabilitySupport::Supported,
+                Ok(()) => CapabilitySupport::Unsupported,
+                Err(error) if is_unsupported_value_write(&error) => CapabilitySupport::Unsupported,
+                Err(error) => return Err(error),
+            };
+            capabilities.push(feature_capability(feature, support));
+        }
+        Ok(capabilities)
+    })();
+    let restore_result = write_bytes(path, original.as_bytes());
+    match (probe_result, restore_result) {
+        (Ok(capabilities), Ok(())) => Ok(capabilities),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(restore)) => Err(restore),
+        (Err(operation), Err(rollback)) => Err(Error::Rollback {
+            operation: Box::new(operation),
+            rollback: Box::new(rollback),
+        }),
+    }
+}
+
+const fn unverified_value_support(support: CapabilitySupport) -> CapabilitySupport {
+    match support {
+        CapabilitySupport::Supported => CapabilitySupport::Unverified,
+        other => other,
+    }
+}
+
+const fn combine_support(
+    semantic: CapabilitySupport,
+    structural: CapabilitySupport,
+) -> CapabilitySupport {
+    match (semantic, structural) {
+        (CapabilitySupport::Unsupported, _) | (_, CapabilitySupport::Unsupported) => {
+            CapabilitySupport::Unsupported
+        }
+        (CapabilitySupport::RequiresStaging, _) | (_, CapabilitySupport::RequiresStaging) => {
+            CapabilitySupport::RequiresStaging
+        }
+        (CapabilitySupport::Unverified, _) | (_, CapabilitySupport::Unverified) => {
+            CapabilitySupport::Unverified
+        }
+        (CapabilitySupport::Supported, CapabilitySupport::Supported) => {
+            CapabilitySupport::Supported
+        }
     }
 }
 

@@ -401,7 +401,7 @@ impl ExclusiveSession {
     /// [`Self::update_configuration`] to stage and commit a changed owned
     /// configuration while preserving rollback and ownership checks.
     pub fn commit(&mut self) -> Result<()> {
-        self.command_with_identity_check(&KdamondCommand::Commit)?;
+        self.command_after_ownership_check(&KdamondCommand::Commit)?;
         self.verify_running_identity()
     }
 
@@ -448,7 +448,7 @@ impl ExclusiveSession {
 
     /// Applies staged DAMOS quota-goal changes to the running kdamond.
     pub fn commit_scheme_quota_goals(&mut self) -> Result<()> {
-        self.command_with_identity_check(&KdamondCommand::CommitSchemesQuotaGoals)?;
+        self.command_after_ownership_check(&KdamondCommand::CommitSchemesQuotaGoals)?;
         self.verify_running_identity()
     }
 
@@ -479,7 +479,7 @@ impl ExclusiveSession {
         scheme_index: usize,
     ) -> Result<SchemeStats> {
         let scheme = self.scheme(context_index, scheme_index)?;
-        self.refresh_runtime_output(&KdamondCommand::UpdateSchemesStats)?;
+        self.command_after_ownership_check(&KdamondCommand::UpdateSchemesStats)?;
         let stats = scheme.stats()?;
         self.verify_running_identity()?;
         Ok(stats)
@@ -506,7 +506,7 @@ impl ExclusiveSession {
         capacity_hint: usize,
     ) -> Result<RawSnapshot> {
         let scheme = self.scheme(context_index, scheme_index)?;
-        self.command_with_identity_check(&KdamondCommand::UpdateSchemesTriedRegions)?;
+        self.command_after_ownership_check(&KdamondCommand::UpdateSchemesTriedRegions)?;
         let snapshot = scheme.tried_regions(capacity_hint)?;
         self.verify_running_identity()?;
         Ok(snapshot)
@@ -515,7 +515,7 @@ impl ExclusiveSession {
     /// Refreshes and reads one scheme's total tried size in core address units.
     pub fn tried_bytes_units(&mut self, context_index: usize, scheme_index: usize) -> Result<u64> {
         let scheme = self.scheme(context_index, scheme_index)?;
-        self.command_with_identity_check(&KdamondCommand::UpdateSchemesTriedBytes)?;
+        self.command_after_ownership_check(&KdamondCommand::UpdateSchemesTriedBytes)?;
         let units = scheme.tried_bytes_units()?;
         self.verify_running_identity()?;
         Ok(units)
@@ -528,7 +528,7 @@ impl ExclusiveSession {
         scheme_index: usize,
     ) -> Result<u64> {
         let scheme = self.scheme(context_index, scheme_index)?;
-        self.refresh_runtime_output(&KdamondCommand::UpdateSchemesEffectiveQuotas)?;
+        self.command_after_ownership_check(&KdamondCommand::UpdateSchemesEffectiveQuotas)?;
         let units = scheme.quotas().effective_size_units()?;
         self.verify_running_identity()?;
         Ok(units)
@@ -575,13 +575,13 @@ impl ExclusiveSession {
 
     /// Refreshes auto-tuned interval values for the running kdamond.
     pub fn update_tuned_intervals(&mut self) -> Result<()> {
-        self.refresh_runtime_output(&KdamondCommand::UpdateTunedIntervals)?;
+        self.command_after_ownership_check(&KdamondCommand::UpdateTunedIntervals)?;
         self.verify_running_identity()
     }
 
     /// Clears all materialized tried-region results.
     pub fn clear_tried_regions(&mut self) -> Result<()> {
-        self.command_with_identity_check(&KdamondCommand::ClearSchemesTriedRegions)?;
+        self.command_after_ownership_check(&KdamondCommand::ClearSchemesTriedRegions)?;
         self.verify_running_identity()
     }
 
@@ -709,16 +709,9 @@ impl ExclusiveSession {
         Ok(staged)
     }
 
-    fn command_with_identity_check(&self, command: &KdamondCommand) -> Result<()> {
+    fn command_after_ownership_check(&self, command: &KdamondCommand) -> Result<()> {
         self.verify_running()?;
-        retry_busy(|| self.kdamond.command(command))?;
-        self.verify_running_identity_only()
-    }
-
-    fn refresh_runtime_output(&self, command: &KdamondCommand) -> Result<()> {
-        self.verify_running()?;
-        retry_busy(|| self.kdamond.command(command))?;
-        self.verify_running_identity_only()
+        retry_busy(|| self.kdamond.command(command))
     }
 
     pub(super) fn scheme(

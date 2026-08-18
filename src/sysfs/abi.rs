@@ -128,6 +128,10 @@ pub enum Action {
     MigrateHot,
     /// Migrate cold memory.
     MigrateCold,
+    /// Allocate pages through DAMOS on kernels with ACMA support.
+    DamosAllocate,
+    /// Release pages previously allocated through DAMOS.
+    DamosFree,
     /// Collect statistics without modifying memory.
     Stat,
     /// An action introduced by a newer kernel.
@@ -149,6 +153,8 @@ impl Action {
             Self::LruDeprioritize => "lru_deprio",
             Self::MigrateHot => "migrate_hot",
             Self::MigrateCold => "migrate_cold",
+            Self::DamosAllocate => "damos_alloc",
+            Self::DamosFree => "damos_free",
             Self::Stat => "stat",
             Self::Unknown(name) => name,
         }
@@ -166,6 +172,8 @@ impl Action {
             "lru_deprio" => Self::LruDeprioritize,
             "migrate_hot" => Self::MigrateHot,
             "migrate_cold" => Self::MigrateCold,
+            "damos_alloc" => Self::DamosAllocate,
+            "damos_free" => Self::DamosFree,
             "stat" => Self::Stat,
             other => Self::Unknown(other.into()),
         }
@@ -385,6 +393,8 @@ pub enum ProbeFilterType {
     MemoryControlGroup,
     /// Match pages whose page-idle flag is unset.
     PageIdleUnset,
+    /// Match pages whose page-idle flag is set.
+    PageIdleSet,
     /// A filter type introduced by a newer kernel.
     Unknown(Box<str>),
 }
@@ -397,6 +407,7 @@ impl ProbeFilterType {
             Self::Anonymous => "anon",
             Self::MemoryControlGroup => "memcg",
             Self::PageIdleUnset => "pgidle_unset",
+            Self::PageIdleSet => "pgidle_set",
             Self::Unknown(name) => name,
         }
     }
@@ -406,6 +417,7 @@ impl ProbeFilterType {
             "anon" => Self::Anonymous,
             "memcg" => Self::MemoryControlGroup,
             "pgidle_unset" => Self::PageIdleUnset,
+            "pgidle_set" => Self::PageIdleSet,
             other => Self::Unknown(other.into()),
         }
     }

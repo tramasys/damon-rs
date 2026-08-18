@@ -377,6 +377,60 @@ fn exclusive_capability_probe_checks_semantic_filter_values() {
 }
 
 #[test]
+fn exclusive_capability_probe_checks_actions_and_quota_metrics_directly() {
+    let model = Model::new("vaddr\npaddr\nfvaddr\n");
+    model.enable_current_damo_extensions();
+    model.set_supported_scheme_actions("stat\n");
+    model.set_supported_quota_goal_metrics("user_input\nsome_mem_psi_us\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+
+    let capabilities = damon.capabilities().expect("probe semantic values");
+
+    assert_eq!(
+        capabilities.feature_support(SysfsFeature::CollapseAction),
+        CapabilitySupport::Unsupported
+    );
+    assert_eq!(
+        capabilities.feature_support(SysfsFeature::SchemeQuotaGoalSomePsi),
+        CapabilitySupport::Supported
+    );
+    assert_eq!(
+        capabilities.feature_support(SysfsFeature::SchemeQuotaGoalNodeEligibleMemory),
+        CapabilitySupport::Unsupported
+    );
+    assert_eq!(
+        capabilities.feature_support(SysfsFeature::SchemeQuotaFailureChargeRatio),
+        CapabilitySupport::Supported,
+        "the unrelated structural feature remains independently observable"
+    );
+}
+
+#[test]
+fn exclusive_capability_probe_recognizes_damon_next_values() {
+    let model = Model::new("vaddr\npaddr\nfvaddr\n");
+    model.enable_current_damo_extensions();
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+
+    let capabilities = damon.capabilities().expect("probe damon-next values");
+
+    for feature in [
+        SysfsFeature::DamosAllocateAction,
+        SysfsFeature::DamosFreeAction,
+        SysfsFeature::SchemeQuotaGoalHugePageMemory,
+        SysfsFeature::ProbeTypePageIdleSet,
+        SysfsFeature::ProbePreparationSetPageIdle,
+    ] {
+        assert_eq!(
+            capabilities.feature_support(feature),
+            CapabilitySupport::Supported,
+            "unexpected support for {feature:?}"
+        );
+    }
+}
+
+#[test]
 fn passive_capability_probe_does_not_claim_unchecked_filter_values() {
     let model = Model::new("vaddr\n");
     let lock = TestLock::new();

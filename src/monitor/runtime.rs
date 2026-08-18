@@ -18,7 +18,7 @@ impl RuntimeBatch<'_> {
         scheme_index: usize,
     ) -> Result<SchemeStats> {
         let scheme = self.session.scheme(context_index, scheme_index)?;
-        self.command(&KdamondCommand::UpdateSchemesStats)?;
+        self.issue_command(&KdamondCommand::UpdateSchemesStats)?;
         let stats = scheme.stats()?;
         self.session.verify_running_identity_only()?;
         Ok(stats)
@@ -30,7 +30,6 @@ impl RuntimeBatch<'_> {
         context_index: usize,
         scheme_index: usize,
     ) -> Result<SchemeStats> {
-        self.session.verify_running_identity_only()?;
         let stats = self.session.scheme(context_index, scheme_index)?.stats()?;
         self.session.verify_running_identity_only()?;
         Ok(stats)
@@ -44,7 +43,7 @@ impl RuntimeBatch<'_> {
         capacity_hint: usize,
     ) -> Result<RawSnapshot> {
         let scheme = self.session.scheme(context_index, scheme_index)?;
-        self.command(&KdamondCommand::UpdateSchemesTriedRegions)?;
+        self.issue_command(&KdamondCommand::UpdateSchemesTriedRegions)?;
         let snapshot = scheme.tried_regions(capacity_hint)?;
         self.session.verify_running_identity_only()?;
         Ok(snapshot)
@@ -53,7 +52,7 @@ impl RuntimeBatch<'_> {
     /// Synchronously refreshes and reads total tried units.
     pub fn tried_bytes_units(&mut self, context_index: usize, scheme_index: usize) -> Result<u64> {
         let scheme = self.session.scheme(context_index, scheme_index)?;
-        self.command(&KdamondCommand::UpdateSchemesTriedBytes)?;
+        self.issue_command(&KdamondCommand::UpdateSchemesTriedBytes)?;
         let units = scheme.tried_bytes_units()?;
         self.session.verify_running_identity_only()?;
         Ok(units)
@@ -66,7 +65,7 @@ impl RuntimeBatch<'_> {
         scheme_index: usize,
     ) -> Result<u64> {
         let scheme = self.session.scheme(context_index, scheme_index)?;
-        self.command(&KdamondCommand::UpdateSchemesEffectiveQuotas)?;
+        self.issue_command(&KdamondCommand::UpdateSchemesEffectiveQuotas)?;
         let units = scheme.quotas().effective_size_units()?;
         self.session.verify_running_identity_only()?;
         Ok(units)
@@ -78,7 +77,6 @@ impl RuntimeBatch<'_> {
         context_index: usize,
         scheme_index: usize,
     ) -> Result<u64> {
-        self.session.verify_running_identity_only()?;
         let units = self
             .session
             .scheme(context_index, scheme_index)?
@@ -99,8 +97,12 @@ impl RuntimeBatch<'_> {
     }
 
     fn command(&self, command: &KdamondCommand) -> Result<()> {
-        self.session.verify_running_identity_only()?;
-        retry_busy(|| self.session.kdamond.command(command))?;
+        self.issue_command(command)?;
         self.session.verify_running_identity_only()
+    }
+
+    fn issue_command(&self, command: &KdamondCommand) -> Result<()> {
+        self.session.verify_running_identity_only()?;
+        retry_busy(|| self.session.kdamond.command(command))
     }
 }

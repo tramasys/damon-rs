@@ -101,6 +101,8 @@ pub enum SysfsFeature {
     SchemeQuotaGoalActiveMemory,
     /// Node-eligible-memory DAMOS quota goals.
     SchemeQuotaGoalNodeEligibleMemory,
+    /// Huge-page-memory DAMOS quota goals.
+    SchemeQuotaGoalHugePageMemory,
     /// Automatic DAMOS quota-goal tuning.
     SchemeQuotaGoalTuner,
     /// DAMOS quota failure-charge ratios.
@@ -117,6 +119,10 @@ pub enum SysfsFeature {
     SchemeMaximumSnapshotCount,
     /// DAMOS collapse action (`sysfs/damos_action_collapse`).
     CollapseAction,
+    /// DAMOS page allocation action.
+    DamosAllocateAction,
+    /// DAMOS page release action.
+    DamosFreeAction,
     /// Auto-tuned monitoring interval goals (`sysfs/intervals_goal`).
     MonitoringIntervalsGoal,
     /// Monitoring-data probes (`sysfs/attrs_monitoring`).
@@ -133,6 +139,8 @@ pub enum SysfsFeature {
     ProbePreparationSetPageIdle,
     /// Page-idle-unset monitoring probes (`sysfs/probe_type_pgidle_unset`).
     ProbeTypePageIdleUnset,
+    /// Page-idle-set monitoring probes.
+    ProbeTypePageIdleSet,
     /// DAMON sample controls (`sysfs/damon_sample_control`).
     SampleControl,
     /// Monitoring-operation attributes (`sysfs/ops_attrs`).
@@ -213,7 +221,11 @@ impl SysfsFeature {
             | Self::ProbeFilterType
             | Self::ProbeFilterMatching
             | Self::ProbeFilterAllow
-            | Self::ProbeFilterPath => None,
+            | Self::ProbeFilterPath
+            | Self::SchemeQuotaGoalHugePageMemory
+            | Self::DamosAllocateAction
+            | Self::DamosFreeAction
+            | Self::ProbeTypePageIdleSet => None,
         }
     }
 }

@@ -11,7 +11,6 @@ use std::fmt;
 
 pub(super) const KERNEL_INDEX_MAX: usize = i32::MAX as usize;
 pub(super) const MAX_EAGER_READ_CAPACITY: usize = 4_096;
-const CURRENT_MAX_PROBES: usize = 4;
 
 pub(super) trait KernelName {
     fn kernel_name(&self) -> &str;
@@ -159,6 +158,8 @@ kernel_string_enum! {
         InactiveMemoryBasisPoints => "inactive_mem_bp",
         /// Eligible memory on a NUMA node in basis points.
         NodeEligibleMemoryBasisPoints => "node_eligible_mem_bp",
+        /// Huge-page memory relative to total used memory in basis points.
+        HugePageMemoryBasisPoints => "hugepage_mem_bp",
     }
 }
 
@@ -192,6 +193,7 @@ impl QuotaGoalMetric {
                 | Self::ActiveMemoryBasisPoints
                 | Self::InactiveMemoryBasisPoints
                 | Self::NodeEligibleMemoryBasisPoints
+                | Self::HugePageMemoryBasisPoints
         )
     }
 }

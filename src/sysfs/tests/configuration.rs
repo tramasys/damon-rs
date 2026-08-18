@@ -494,6 +494,49 @@ fn owned_configuration_supports_damo_legacy_attribute_aliases() {
 }
 
 #[test]
+fn owned_configuration_supports_pre_6_14_reject_only_filters() {
+    let model = test_backend::Model::new("vaddr\n");
+    let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
+    admin.set_kdamond_count(1).expect("stage kdamond");
+    let kdamond = admin.kdamond(0);
+    kdamond.set_context_count(1).expect("stage context");
+    let context = kdamond.context(0);
+    context.set_target_count(1).expect("stage target");
+    context.set_scheme_count(1).expect("stage scheme");
+    let scheme = context.scheme(0);
+    model.remove_tree("kdamonds/0/contexts/0/schemes/0/core_filters");
+    model.remove_tree("kdamonds/0/contexts/0/schemes/0/ops_filters");
+    scheme
+        .set_filter_count(FilterLayer::Unified, 1)
+        .expect("stage filter");
+
+    let filter_path = "kdamonds/0/contexts/0/schemes/0/filters/0";
+    model.remove_tree(format!("{filter_path}/allow"));
+    let filter = scheme.filter(FilterLayer::Unified, 0);
+    assert!(!filter.allowed().expect("read reject-only filter"));
+    filter
+        .set_allowed(false)
+        .expect("retain reject-only behavior");
+    assert!(matches!(
+        filter
+            .set_allowed(true)
+            .expect_err("allowing requires a kernel control"),
+        Error::UnsupportedFeature { .. }
+    ));
+
+    let mut config = kdamond
+        .configuration()
+        .expect("read pre-6.14 filter configuration");
+    assert!(!config.contexts[0].schemes[0].filters[0].allow);
+    config.contexts[0].targets[0].pid = Some(Pid::new(42).expect("valid pid"));
+    kdamond
+        .stage_configuration(&config)
+        .expect("restage reject-only filter configuration");
+    assert_eq!(model.value(format!("{filter_path}/allow")), None);
+    assert_eq!(model.value(format!("{filter_path}/pass")), None);
+}
+
+#[test]
 fn owned_configuration_rejects_kernel_commit_invariants() {
     let pattern = AccessPattern::new(
         RegionSizeRange::new(0, 1).expect("valid size range"),
@@ -633,6 +676,8 @@ fn owned_validation_does_not_hardcode_the_kernel_context_limit() {
 fn owned_configuration_round_trips_unknown_future_tokens() {
     let model = test_backend::Model::new("future_ops\n");
     model.set_supported_scheme_filter_types("future_filter\n");
+    model.set_supported_scheme_actions("future_action\n");
+    model.set_supported_quota_goal_metrics("future_metric\n");
     let admin = DamonAdmin::open(model.root()).expect("open modeled hierarchy");
     admin.set_kdamond_count(1).expect("stage kdamond");
     let kdamond = admin.kdamond(0);

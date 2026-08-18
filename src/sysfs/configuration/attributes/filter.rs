@@ -33,13 +33,27 @@ impl SchemeFilter {
     }
 
     /// Reads whether selected memory is allowed through the filter.
+    ///
+    /// Kernels before Linux 6.14 expose no `allow` attribute and always reject
+    /// memory selected by a filter.  Such filters are therefore reported as
+    /// not allowing selected memory.
     pub fn allowed(&self) -> Result<bool> {
-        read_bool(&self.allow_path()?)
+        self.allow_path()?
+            .map_or(Ok(false), |path| read_bool(&path))
     }
 
     /// Sets whether selected memory is allowed through the filter.
+    ///
+    /// Setting `false` is a no-op on kernels whose filters have the original
+    /// reject-only behavior.  Setting `true` requires the newer control.
     pub fn set_allowed(&self, value: bool) -> Result<()> {
-        write_bool(&self.allow_path()?, value)
+        match self.allow_path()? {
+            Some(path) => write_bool(&path, value),
+            None if !value => Ok(()),
+            None => Err(Error::UnsupportedFeature {
+                feature: "DAMOS filter allow control",
+            }),
+        }
     }
 
     /// Reads the memory-control-group path.
@@ -172,16 +186,14 @@ impl SchemeFilter {
         Ok(())
     }
 
-    pub(super) fn allow_path(&self) -> Result<PathBuf> {
+    pub(super) fn allow_path(&self) -> Result<Option<PathBuf>> {
         for name in ["allow", "pass"] {
             let path = self.path.join(name);
             if path_exists(&path)? {
-                return Ok(path);
+                return Ok(Some(path));
             }
         }
-        Err(Error::UnsupportedFeature {
-            feature: "DAMOS filter allow control",
-        })
+        Ok(None)
     }
 }
 

@@ -99,9 +99,14 @@ pub(super) fn stage_capability_probe(
         {
             retry_busy(|| context.probe(0).set_filter_count(1))?;
         }
+        retry_busy(|| kdamond.stage_optional_probe_capability_children(0, 0))?;
     }
 
-    let semantic_capabilities = retry_busy(|| kdamond.probe_semantic_filter_capabilities(0, 0))?;
+    let mut semantic_capabilities =
+        retry_busy(|| kdamond.probe_semantic_filter_capabilities(0, 0))?;
+    semantic_capabilities.extend(retry_busy(|| {
+        kdamond.probe_semantic_value_capabilities(0, 0)
+    })?);
     let mut capabilities = kdamond.capabilities(0, 0)?;
     capabilities.apply_feature_capabilities(semantic_capabilities);
     capabilities.replace_operations(retry_busy(|| kdamond.probe_operations(0))?);

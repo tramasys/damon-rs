@@ -1,5 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::error::io_error;
 use crate::{Error, Result};
@@ -16,7 +17,7 @@ struct ConfigurationEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConfigurationFingerprint {
-    entries: Box<[ConfigurationEntry]>,
+    entries: Arc<[ConfigurationEntry]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,7 +32,7 @@ impl ConfigurationFingerprint {
     }
 
     pub(crate) fn matches_current_except(&self, ignored: &[PathBuf]) -> Result<bool> {
-        for entry in &self.entries {
+        for entry in self.entries.iter() {
             if ignored.binary_search(&entry.path).is_ok() {
                 continue;
             }
@@ -48,16 +49,14 @@ impl ConfigurationFingerprint {
         ignored: &[PathBuf],
     ) -> Result<Self> {
         let mut refreshed = self.clone();
+        let entries = Arc::make_mut(&mut refreshed.entries);
         for path in paths {
-            let entry = refreshed
-                .entries
-                .iter_mut()
-                .find(|entry| &entry.path == path)
-                .ok_or(Error::OwnershipLost {
+            let entry = entries.iter_mut().find(|entry| &entry.path == path).ok_or(
+                Error::OwnershipLost {
                     reason: "a controlled configuration path disappeared",
-                })?;
-            let value = read_text(path)?;
-            entry.value = value.strip_suffix('\n').unwrap_or(&value).into();
+                },
+            )?;
+            entry.value = read_configuration_value(path)?;
         }
         if !refreshed.matches_current_except(ignored)? {
             return Err(Error::OwnershipLost {
@@ -152,15 +151,22 @@ fn writable_configuration_files(root: &Path) -> Result<Vec<PathBuf>> {
 pub(super) fn capture_configuration(root: &Path) -> Result<ConfigurationFingerprint> {
     let mut entries = Vec::new();
     for path in writable_configuration_files(root)? {
-        let value = read_text(&path)?;
         entries.push(ConfigurationEntry {
-            value: value.strip_suffix('\n').unwrap_or(&value).into(),
+            value: read_configuration_value(&path)?,
             path,
         });
     }
     Ok(ConfigurationFingerprint {
-        entries: entries.into_boxed_slice(),
+        entries: entries.into(),
     })
+}
+
+fn read_configuration_value(path: &Path) -> Result<Box<str>> {
+    let mut value = read_text(path)?;
+    if value.ends_with('\n') {
+        value.pop();
+    }
+    Ok(value.into_boxed_str())
 }
 
 fn restoration_key<'a>(root: &Path, entry: &'a ConfigurationEntry) -> (usize, bool, &'a Path) {

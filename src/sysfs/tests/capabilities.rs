@@ -12,9 +12,19 @@ fn operation_parser_preserves_new_kernel_values() {
 #[test]
 fn action_parser_preserves_new_kernel_values() {
     assert_eq!(Action::parse("stat"), Action::Stat);
+    assert_eq!(Action::parse("damos_alloc"), Action::DamosAllocate);
+    assert_eq!(Action::parse("damos_free"), Action::DamosFree);
     assert_eq!(
         Action::parse("future_action"),
         Action::Unknown("future_action".into())
+    );
+    assert_eq!(
+        ProbeFilterType::parse("pgidle_set"),
+        ProbeFilterType::PageIdleSet
+    );
+    assert_eq!(
+        QuotaGoalMetric::HugePageMemoryBasisPoints.kernel_name(),
+        "hugepage_mem_bp"
     );
 }
 

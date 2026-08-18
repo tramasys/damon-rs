@@ -479,6 +479,8 @@ impl SchemeConfig {
                     | Action::LruDeprioritize
                     | Action::MigrateHot
                     | Action::MigrateCold
+                    | Action::DamosAllocate
+                    | Action::DamosFree
                     | Action::Stat
                     | Action::Unknown(_)
             ),

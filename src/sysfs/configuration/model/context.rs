@@ -1,7 +1,7 @@
 //! Monitoring context configuration and operation-specific validation.
 
 use super::{
-    AddressUnit, CURRENT_MAX_PROBES, Error, IntervalsGoalConfig, MonitoringIntervals, Operation,
+    AddressUnit, Error, IntervalsGoalConfig, MonitoringIntervals, Operation,
     OperationAttributesConfig, ProbeConfig, RegionBounds, Result, SampleControlConfig,
     SchemeConfig, TargetConfig, invalid, minimum_region_units, validate_address_unit_for_host,
     validate_count, validate_kernel_aligned_initial_regions, validate_scaled_initial_regions,
@@ -125,12 +125,6 @@ impl ContextConfig {
             return invalid(
                 "monitoring targets",
                 "a running context requires at least one non-obsolete target",
-            );
-        }
-        if self.probes.len() > CURRENT_MAX_PROBES {
-            return invalid(
-                "monitoring probe count",
-                "current DAMON supports at most four probes",
             );
         }
         self.validate_weighted_probes()?;

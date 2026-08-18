@@ -65,6 +65,9 @@ pub(super) struct State {
     pub(super) expose_effective_quota: bool,
     pub(super) supported_scheme_filter_types: Vec<u8>,
     pub(super) supported_probe_filter_types: Vec<u8>,
+    pub(super) supported_scheme_actions: Vec<u8>,
+    pub(super) supported_quota_goal_metrics: Vec<u8>,
+    pub(super) supported_probe_preparation_actions: Vec<u8>,
     pub(super) active_files: Option<BTreeMap<PathBuf, Vec<u8>>>,
     pub(super) next_kdamond_pid: u32,
     pub(super) tried_regions: Vec<ModelRegion>,
@@ -93,6 +96,9 @@ impl State {
             supported_scheme_filter_types:
                 b"anon\nmemcg\nyoung\naddr\ntarget\nhugepage_size\nunmapped\nactive\n".to_vec(),
             supported_probe_filter_types: b"anon\nmemcg\n".to_vec(),
+            supported_scheme_actions: b"willneed\ncold\npageout\nhugepage\nnohugepage\ncollapse\nlru_prio\nlru_deprio\nmigrate_hot\nmigrate_cold\nstat\n".to_vec(),
+            supported_quota_goal_metrics: b"user_input\nsome_mem_psi_us\nnode_mem_used_bp\nnode_mem_free_bp\nnode_memcg_used_bp\nnode_memcg_free_bp\nactive_mem_bp\ninactive_mem_bp\nnode_eligible_mem_bp\n".to_vec(),
+            supported_probe_preparation_actions: b"set_pgidle\n".to_vec(),
             active_files: None,
             next_kdamond_pid: 10_000,
             tried_regions: Vec::new(),
@@ -793,6 +799,35 @@ impl State {
                 .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?
                 .trim();
             if !listed_value_contains(&self.recognized_operations, requested) {
+                return Err(io::Error::from_raw_os_error(22));
+            }
+        }
+
+        if path.file_name().is_some_and(|name| name == "action")
+            && path.to_string_lossy().contains("/schemes/")
+        {
+            let requested = std::str::from_utf8(value)
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?
+                .trim();
+            if !listed_value_contains(&self.supported_scheme_actions, requested) {
+                return Err(io::Error::from_raw_os_error(22));
+            }
+        }
+
+        if path.file_name().is_some_and(|name| name == "target_metric") {
+            let requested = std::str::from_utf8(value)
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?
+                .trim();
+            if !listed_value_contains(&self.supported_quota_goal_metrics, requested) {
+                return Err(io::Error::from_raw_os_error(22));
+            }
+        }
+
+        if path.file_name().is_some_and(|name| name == "prep_action") {
+            let requested = std::str::from_utf8(value)
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?
+                .trim();
+            if !listed_value_contains(&self.supported_probe_preparation_actions, requested) {
                 return Err(io::Error::from_raw_os_error(22));
             }
         }

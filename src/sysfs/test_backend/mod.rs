@@ -78,10 +78,24 @@ impl Model {
         lock(&self.state).supported_probe_filter_types = types.as_bytes().to_vec();
     }
 
+    pub(crate) fn set_supported_scheme_actions(&self, actions: &str) {
+        lock(&self.state).supported_scheme_actions = actions.as_bytes().to_vec();
+    }
+
+    pub(crate) fn set_supported_quota_goal_metrics(&self, metrics: &str) {
+        lock(&self.state).supported_quota_goal_metrics = metrics.as_bytes().to_vec();
+    }
+
     pub(crate) fn enable_current_damo_extensions(&self) {
         let mut state = lock(&self.state);
         state.expose_current_damo_extensions = true;
-        state.supported_probe_filter_types = b"anon\nmemcg\npgidle_unset\n".to_vec();
+        state.supported_probe_filter_types = b"anon\nmemcg\npgidle_unset\npgidle_set\n".to_vec();
+        state
+            .supported_scheme_actions
+            .extend_from_slice(b"damos_alloc\ndamos_free\n");
+        state
+            .supported_quota_goal_metrics
+            .extend_from_slice(b"hugepage_mem_bp\n");
     }
 
     pub(crate) fn disable_effective_quota(&self) {

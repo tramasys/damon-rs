@@ -6,8 +6,8 @@ use damon::sysfs::{
     AccessCountRange, AccessPattern, Action, ByteSizeRange, ContextConfig, DamonConfig,
     FilterConfig, FilterLayer, InitialRegionConfig, KdamondConfig, Operation,
     OperationAttributesConfig, ProbeConfig, ProbePreparationAction, ProbePreparationConfig,
-    QuotaConfig, RegionSizeRange, SampleControlConfig, SampleFilterConfig, SamplePrimitivesConfig,
-    SchemeConfig, SchemeFilterType, TargetConfig,
+    QuotaConfig, QuotaGoalConfig, QuotaGoalMetric, RegionSizeRange, SampleControlConfig,
+    SampleFilterConfig, SamplePrimitivesConfig, SchemeConfig, SchemeFilterType, TargetConfig,
 };
 use damon::{AddressUnit, Error, Pid, RegionBounds};
 
@@ -90,14 +90,16 @@ fn runnable_validation_is_stricter_than_staged_shape_validation() {
 }
 
 #[test]
-fn runnable_validation_enforces_current_weighted_probe_limits() {
+fn runnable_validation_defers_probe_count_and_checks_weighted_overflow() {
     let mut context = ContextConfig::new(damon::sysfs::Operation::VirtualAddress);
     context
         .targets
         .push(TargetConfig::for_pid(Pid::new(42).expect("valid pid")));
     context.probes = vec![ProbeConfig::default(); 5];
     assert!(context.validate().is_ok());
-    assert!(context.validate_runnable().is_err());
+    context
+        .validate_runnable()
+        .expect("the running kernel owns its probe-count limit");
 
     context.probes.truncate(1);
     context.probes[0].weight = 1;
@@ -117,6 +119,40 @@ fn runnable_validation_enforces_current_weighted_probe_limits() {
     .expect("valid intervals");
     context.probes[0].weight = u32::MAX;
     assert!(context.validate_runnable().is_err());
+}
+
+#[test]
+fn damon_next_values_have_typed_operation_and_metric_validation() {
+    let pattern = AccessPattern::new(
+        RegionSizeRange::new(0, u64::MAX).expect("valid size range"),
+        AccessCountRange::new(0, u32::MAX).expect("valid access range"),
+        damon::sysfs::AgeRange::new(0, u32::MAX).expect("valid age range"),
+    );
+    let mut scheme = SchemeConfig::new(Action::DamosAllocate, pattern);
+    scheme.quota.goals.push(QuotaGoalConfig::new(
+        QuotaGoalMetric::HugePageMemoryBasisPoints,
+        10_001,
+    ));
+    scheme.quota.reset_interval = Duration::from_secs(1);
+    assert!(scheme.validate_for(1).is_err());
+
+    scheme.quota.goals[0].target_value = 10_000;
+    let mut physical = ContextConfig::new(Operation::PhysicalAddress);
+    let mut target = TargetConfig::address_space();
+    target.initial_regions =
+        vec![InitialRegionConfig::new(0, 4_096).expect("valid physical region")];
+    physical.targets.push(target);
+    physical.schemes.push(scheme.clone());
+    physical
+        .validate_runnable()
+        .expect("ACMA actions are physical-address operations");
+
+    let mut virtual_context = ContextConfig::new(Operation::VirtualAddress);
+    virtual_context
+        .targets
+        .push(TargetConfig::for_pid(Pid::new(42).expect("valid pid")));
+    virtual_context.schemes.push(scheme);
+    assert!(virtual_context.validate_runnable().is_err());
 }
 
 #[test]
