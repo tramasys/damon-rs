@@ -9,7 +9,7 @@ use damon::sysfs::{
     QuotaConfig, RegionSizeRange, SampleControlConfig, SampleFilterConfig, SamplePrimitivesConfig,
     SchemeConfig, SchemeFilterType, TargetConfig,
 };
-use damon::{Pid, RegionBounds};
+use damon::{AddressUnit, Error, Pid, RegionBounds};
 
 #[test]
 fn owned_configuration_is_constructible_from_the_public_api() {
@@ -177,4 +177,49 @@ fn obsolete_targets_are_not_valid_initial_running_state() {
         .validate()
         .expect("obsolete markers remain representable while stopped");
     assert!(context.validate_runnable().is_err());
+}
+
+#[test]
+fn physical_initial_regions_reject_byte_scaling_overflow() {
+    let mut context = ContextConfig::new(Operation::PhysicalAddress);
+    context.address_unit = AddressUnit::new(u64::MAX).expect("nonzero address unit");
+    let mut target = TargetConfig::address_space();
+    target.initial_regions = vec![InitialRegionConfig::new(1, 2).expect("valid raw region")];
+    context.targets.push(target);
+
+    let error = context.validate().expect_err("scaling must overflow");
+    assert!(
+        matches!(
+            error,
+            Error::AddressConversionOverflow {
+                units: 2,
+                unit_bytes: u64::MAX
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn initial_regions_reject_overlap_after_kernel_alignment() {
+    let page_size = rustix::param::page_size() as u64;
+    let mut context = ContextConfig::new(Operation::FixedVirtualAddress);
+    let mut target = TargetConfig::for_pid(Pid::new(42).expect("valid pid"));
+    target.initial_regions = vec![
+        InitialRegionConfig::new(1, 2).expect("valid raw region"),
+        InitialRegionConfig::new(page_size - 1, page_size).expect("valid raw region"),
+    ];
+    context.targets.push(target);
+
+    let error = context.validate().expect_err("aligned ranges must overlap");
+    assert!(
+        matches!(
+            error,
+            Error::InvalidConfiguration {
+                field: "initial regions",
+                reason: "regions overlap after kernel minimum-region alignment"
+            }
+        ),
+        "{error:?}"
+    );
 }

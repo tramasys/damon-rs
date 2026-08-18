@@ -74,7 +74,8 @@ best-effort cleanup.
 `Damon::vaddr()`, `Damon::fvaddr()`, and `Damon::paddr()` expose optional
 initial regions, probes, and custom DAMOS schemes. Physical regions and related
 scheme values remain in explicit DAMON core units, with checked byte conversion
-through the monitor's effective address unit.
+through the monitor's effective address unit. Initial regions are validated
+against the kernel's operation-specific alignment before staging.
 
 `Damon::exclusive_session()` provides the same lifecycle for any validated
 single-kdamond `DamonConfig`. Explicit `close()` reports restoration failures,
@@ -113,7 +114,8 @@ configurations write only differing leaves.
 
 Exclusive sessions can transactionally commit owned configuration updates.
 Runtime reads support explicit synchronous refreshes, cached reads, and checked
-batches for lower polling overhead.
+batches for lower polling overhead. High-level monitors also provide all-scheme
+statistics and quota reads that share one refresh and ownership scan.
 
 ## Toolchain
 

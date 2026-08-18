@@ -376,6 +376,7 @@ fn access_and_age_ranges_reject_values_the_active_kernel_type_cannot_hold() {
 #[test]
 fn stages_queries_and_cleans_up_a_monitor() {
     let fixture = Fixture::new("vaddr\npaddr\nfuture_ops\n");
+    fixture.disable_online_commits();
     fixture.add_snapshot_regions();
     fixture.write("kdamonds/0/refresh_ms", "250\n");
 
@@ -449,7 +450,7 @@ fn stages_queries_and_cleans_up_a_monitor() {
         monitor
             .capabilities()
             .operation_support(&Operation::Unknown("future_ops".into())),
-        Some(CapabilitySupport::Supported)
+        None
     );
 
     let snapshot = monitor.snapshot().expect("query snapshot");
@@ -583,6 +584,7 @@ fn paddr_workflow_rejects_non_default_unit_when_legacy_attribute_is_absent() {
 #[test]
 fn snapshot_parses_sparse_kernel_indexes_and_reports_partial_materialization() {
     let fixture = Fixture::new("vaddr\n");
+    fixture.disable_online_commits();
     fixture.add_snapshot_regions();
     fixture.remove_dir("kdamonds/0/contexts/0/schemes/0/tried_regions/1");
     let region = "kdamonds/0/contexts/0/schemes/0/tried_regions/4";
@@ -917,6 +919,7 @@ fn validates_before_mutating_the_global_interface() {
 #[test]
 fn supports_tried_regions_without_total_bytes() {
     let fixture = Fixture::new("vaddr\n");
+    fixture.disable_online_commits();
     fixture.add_snapshot_regions();
     fixture.remove("kdamonds/0/contexts/0/schemes/0/tried_regions/total_bytes");
     let damon = fixture.damon();
@@ -1044,6 +1047,7 @@ fn cleanup_preserves_an_externally_changed_configuration() {
 #[test]
 fn rejects_invalid_regions_materialized_by_the_kernel() {
     let fixture = Fixture::new("vaddr\n");
+    fixture.disable_online_commits();
     fixture.add_snapshot_regions();
     fixture.write(
         "kdamonds/0/contexts/0/schemes/0/tried_regions/0/end",
@@ -1073,6 +1077,7 @@ fn rejects_invalid_regions_materialized_by_the_kernel() {
 #[test]
 fn rejects_overflow_in_a_computed_snapshot_total() {
     let fixture = Fixture::new("vaddr\n");
+    fixture.disable_online_commits();
     fixture.add_snapshot_regions();
     fixture.remove("kdamonds/0/contexts/0/schemes/0/tried_regions/total_bytes");
     fixture.write(
@@ -1106,6 +1111,7 @@ fn rejects_overflow_in_a_computed_snapshot_total() {
 #[test]
 fn bounds_eager_snapshot_allocation() {
     let fixture = Fixture::new("vaddr\n");
+    fixture.disable_online_commits();
     let damon = fixture.damon();
     let mut monitor = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
@@ -1244,6 +1250,10 @@ impl Fixture {
         ] {
             self.write(&format!("kdamonds/0/contexts/0/schemes/0/{path}"), value);
         }
+    }
+
+    fn disable_online_commits(&self) {
+        self.remove("kdamonds/0/contexts/0/avail_operations");
     }
 
     fn add_probe_filter_files(&self) {

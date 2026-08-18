@@ -1255,9 +1255,14 @@ impl ContextConfig {
             }
             Operation::PhysicalAddress => {
                 validate_address_unit_for_host(self.address_unit)?;
+                validate_scaled_initial_regions(&self.targets, self.address_unit)?;
             }
             Operation::Unknown(_) => {}
         }
+        validate_kernel_aligned_initial_regions(
+            &self.targets,
+            minimum_region_units(&self.operation, self.address_unit),
+        )?;
         for scheme in &self.schemes {
             scheme.validate_for(self.targets.len())?;
         }
@@ -3779,10 +3784,7 @@ fn exact_refresh_millis(duration: Duration) -> Result<u32> {
 }
 
 fn validate_address_unit_for_host(unit: AddressUnit) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    let page_size = rustix::param::page_size() as u64;
-    #[cfg(not(target_os = "linux"))]
-    let page_size = 4_096_u64;
+    let page_size = host_page_size();
 
     if unit.bytes() < page_size && !unit.bytes().is_power_of_two() {
         return invalid(
@@ -3791,6 +3793,68 @@ fn validate_address_unit_for_host(unit: AddressUnit) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn validate_scaled_initial_regions(targets: &[TargetConfig], unit: AddressUnit) -> Result<()> {
+    for region in targets.iter().flat_map(|target| &target.initial_regions) {
+        unit.to_bytes(region.start)?;
+        unit.to_bytes(region.end)?;
+    }
+    Ok(())
+}
+
+fn minimum_region_units(operation: &Operation, unit: AddressUnit) -> Option<u64> {
+    match operation {
+        Operation::VirtualAddress | Operation::FixedVirtualAddress => Some(host_page_size()),
+        Operation::PhysicalAddress => Some((host_page_size() / unit.bytes()).max(1)),
+        Operation::Unknown(_) => None,
+    }
+}
+
+fn validate_kernel_aligned_initial_regions(
+    targets: &[TargetConfig],
+    minimum_region_units: Option<u64>,
+) -> Result<()> {
+    let Some(alignment) = minimum_region_units else {
+        return Ok(());
+    };
+
+    for target in targets {
+        let mut previous_end = None;
+        for region in &target.initial_regions {
+            let aligned_start = region.start - region.start % alignment;
+            let remainder = region.end % alignment;
+            let aligned_end = if remainder == 0 {
+                region.end
+            } else {
+                region.end.checked_add(alignment - remainder).ok_or(
+                    Error::InvalidConfiguration {
+                        field: "initial region",
+                        reason: "end overflows after kernel minimum-region alignment",
+                    },
+                )?
+            };
+            if previous_end.is_some_and(|end| end > aligned_start) {
+                return invalid(
+                    "initial regions",
+                    "regions overlap after kernel minimum-region alignment",
+                );
+            }
+            previous_end = Some(aligned_end);
+        }
+    }
+    Ok(())
+}
+
+fn host_page_size() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        rustix::param::page_size() as u64
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        4_096_u64
+    }
 }
 
 const fn invalid_const<T>(field: &'static str, reason: &'static str) -> Result<T> {

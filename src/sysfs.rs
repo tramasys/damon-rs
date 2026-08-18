@@ -1123,6 +1123,14 @@ impl Kdamond {
     /// [`CapabilitySupport::Unverified`]. This method never modifies the staged
     /// hierarchy.
     pub fn capabilities(&self, context_index: usize, scheme_index: usize) -> Result<Capabilities> {
+        self.capabilities_for_schemes(context_index, &[scheme_index])
+    }
+
+    pub(crate) fn capabilities_for_schemes(
+        &self,
+        context_index: usize,
+        scheme_indices: &[usize],
+    ) -> Result<Capabilities> {
         let context_count = self.context_count()?;
         if context_index >= context_count {
             return Err(Error::IndexOutOfBounds {
@@ -1133,14 +1141,23 @@ impl Kdamond {
         }
         let context = self.context(context_index);
         let scheme_count = context.scheme_count()?;
-        if scheme_index >= scheme_count {
-            return Err(Error::IndexOutOfBounds {
-                kind: "scheme",
-                index: scheme_index,
-                count: scheme_count,
-            });
+        for &scheme_index in scheme_indices {
+            if scheme_index >= scheme_count {
+                return Err(Error::IndexOutOfBounds {
+                    kind: "scheme",
+                    index: scheme_index,
+                    count: scheme_count,
+                });
+            }
         }
-        let scheme = context.scheme(scheme_index);
+        let Some((&first_scheme_index, remaining_scheme_indices)) = scheme_indices.split_first()
+        else {
+            return Err(Error::InvalidConfiguration {
+                field: "capability scheme indexes",
+                reason: "must contain at least one scheme index",
+            });
+        };
+        let scheme = context.scheme(first_scheme_index);
         let target_count = context.target_count()?;
         let probes = context.path.join("monitoring_attrs/probes");
         let probe_filter = probes.join("0/filters/0");
@@ -1151,6 +1168,12 @@ impl Kdamond {
             &probes,
             &probe_filter,
         )?);
+        for &scheme_index in remaining_scheme_indices {
+            let scheme = context.scheme(scheme_index);
+            merge_feature_capabilities(&mut features, scheme_semantic_capabilities(&scheme)?);
+            merge_feature_capabilities(&mut features, scheme_filter_capabilities(&scheme)?);
+            merge_feature_capabilities(&mut features, quota_goal_capabilities(&scheme)?);
+        }
 
         let operations = if feature_support(&features, SysfsFeature::AvailableOperations)
             == CapabilitySupport::Supported
@@ -2575,6 +2598,34 @@ fn set_feature_support(
     }
 }
 
+fn merge_feature_capabilities(
+    capabilities: &mut Vec<FeatureCapability>,
+    additions: impl IntoIterator<Item = FeatureCapability>,
+) {
+    for addition in additions {
+        if let Some(existing) = capabilities
+            .iter_mut()
+            .find(|capability| capability.feature == addition.feature)
+        {
+            if capability_support_rank(addition.support) > capability_support_rank(existing.support)
+            {
+                existing.support = addition.support;
+            }
+        } else {
+            capabilities.push(addition);
+        }
+    }
+}
+
+const fn capability_support_rank(support: CapabilitySupport) -> u8 {
+    match support {
+        CapabilitySupport::Unsupported => 0,
+        CapabilitySupport::RequiresStaging => 1,
+        CapabilitySupport::Unverified => 2,
+        CapabilitySupport::Supported => 3,
+    }
+}
+
 fn read_text(path: &Path) -> Result<String> {
     #[cfg(test)]
     if let Some(result) = test_backend::read(path) {
@@ -2882,6 +2933,7 @@ pub(crate) mod test_backend {
         recognized_operations: Vec<u8>,
         expose_available_operations: bool,
         expose_current_damo_extensions: bool,
+        expose_effective_quota: bool,
         supported_scheme_filter_types: Vec<u8>,
         supported_probe_filter_types: Vec<u8>,
         active_files: Option<BTreeMap<PathBuf, Vec<u8>>>,
@@ -2908,6 +2960,7 @@ pub(crate) mod test_backend {
                 recognized_operations: recognized_operations.as_bytes().to_vec(),
                 expose_available_operations,
                 expose_current_damo_extensions: false,
+                expose_effective_quota: true,
                 supported_scheme_filter_types:
                     b"anon\nmemcg\nyoung\naddr\ntarget\nhugepage_size\nunmapped\nactive\n".to_vec(),
                 supported_probe_filter_types: b"anon\nmemcg\n".to_vec(),
@@ -3079,7 +3132,9 @@ pub(crate) mod test_backend {
             ] {
                 self.file(base.join("quotas").join(name), b"0\n");
             }
-            self.file(base.join("quotas/effective_bytes"), b"0\n");
+            if self.expose_effective_quota {
+                self.file(base.join("quotas/effective_bytes"), b"0\n");
+            }
             self.file(base.join("quotas/goal_tuner"), b"consist\n");
             self.directory(base.join("quotas/weights"));
             for name in ["sz_permil", "nr_accesses_permil", "age_permil"] {
@@ -3751,6 +3806,10 @@ pub(crate) mod test_backend {
             let mut state = lock(&self.state);
             state.expose_current_damo_extensions = true;
             state.supported_probe_filter_types = b"anon\nmemcg\npgidle_unset\n".to_vec();
+        }
+
+        pub(crate) fn disable_effective_quota(&self) {
+            lock(&self.state).expose_effective_quota = false;
         }
 
         pub(crate) fn remove_tree(&self, path: impl AsRef<Path>) {

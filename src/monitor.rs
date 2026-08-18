@@ -472,6 +472,55 @@ impl ExclusiveSession {
         Ok(capabilities)
     }
 
+    fn capabilities_for_schemes(
+        &self,
+        context_index: usize,
+        scheme_indices: &[usize],
+    ) -> Result<Capabilities> {
+        self.verify_owned_state()?;
+        let capabilities = retry_busy(|| {
+            self.kdamond
+                .capabilities_for_schemes(context_index, scheme_indices)
+        })?;
+        self.verify_owned_state()?;
+        Ok(capabilities)
+    }
+
+    fn replace_staged_configuration(&mut self, config: &DamonConfig) -> Result<()> {
+        config.validate_runnable()?;
+        if config.kdamonds.len() != 1 {
+            return Err(Error::InvalidConfiguration {
+                field: "exclusive session kdamond count",
+                reason: "must contain exactly one kdamond",
+            });
+        }
+        if !matches!(self.state, SessionState::Staged) {
+            return Err(Error::KdamondRunning { index: 0 });
+        }
+        self.staged.verify(&self.admin)?;
+        retry_busy(|| ensure_hierarchy_stopped(&self.admin))?;
+        let previous = retry_busy(|| self.admin.configuration())?;
+        self.staged.verify(&self.admin)?;
+
+        match stage_and_verify_configuration(&self.admin, config, Some(&previous)) {
+            Ok(fingerprint) => {
+                self.staged = StagedOwnership::new(fingerprint, &self.kdamond, &config.kdamonds[0]);
+                Ok(())
+            }
+            Err(operation) => match stage_and_verify_configuration(&self.admin, &previous, None) {
+                Ok(fingerprint) => {
+                    self.staged =
+                        StagedOwnership::new(fingerprint, &self.kdamond, &previous.kdamonds[0]);
+                    Err(operation)
+                }
+                Err(rollback) => Err(Error::Rollback {
+                    operation: Box::new(operation),
+                    rollback: Box::new(rollback),
+                }),
+            },
+        }
+    }
+
     /// Applies the currently staged inputs to the running kdamond.
     ///
     /// The session refuses untracked sysfs changes. Use
@@ -1384,10 +1433,12 @@ impl PaddrSessionBuilder<'_> {
 }
 
 struct PreparedWorkflow {
-    config: DamonConfig,
+    base_config: DamonConfig,
+    capability_config: DamonConfig,
     snapshot_scheme_index: usize,
     custom_scheme_count: usize,
     capacity_hint: usize,
+    sample_interval: Duration,
 }
 
 fn prepare_workflow(
@@ -1409,19 +1460,25 @@ fn prepare_workflow(
     context.targets.push(target);
     context.schemes = options.schemes;
     let snapshot_scheme_index = context.schemes.len();
-    context.schemes.push(snapshot_query_scheme());
 
     let mut kdamond = KdamondConfig::default();
     kdamond.contexts.push(context);
-    let mut config = DamonConfig::default();
-    config.kdamonds.push(kdamond);
-    config.validate_runnable()?;
+    let mut base_config = DamonConfig::default();
+    base_config.kdamonds.push(kdamond);
+    base_config.validate_runnable()?;
+    let mut capability_config = base_config.clone();
+    capability_config.kdamonds[0].contexts[0]
+        .schemes
+        .push(snapshot_query_scheme(Duration::ZERO));
+    capability_config.validate_runnable()?;
 
     Ok(PreparedWorkflow {
-        config,
+        base_config,
+        capability_config,
         snapshot_scheme_index,
         custom_scheme_count: snapshot_scheme_index,
         capacity_hint: usize::try_from(region_bounds.max()).unwrap_or(usize::MAX),
+        sample_interval: intervals.sample(),
     })
 }
 
@@ -1433,11 +1490,12 @@ fn start_workflow(
 ) -> Result<Monitor> {
     let damon = options.damon;
     let prepared = prepare_workflow(options, operation.clone(), pid, address_unit)?;
-    let mut session = match damon.exclusive_session(&prepared.config) {
+    let mut session = match damon.exclusive_session(&prepared.capability_config) {
         Ok(session) => session,
         Err(error) => return Err(classify_operation_staging_error(error, &operation)),
     };
-    let mut capabilities = match session.capabilities(0, prepared.snapshot_scheme_index) {
+    let scheme_indices = (0..=prepared.snapshot_scheme_index).collect::<Vec<_>>();
+    let mut capabilities = match session.capabilities_for_schemes(0, &scheme_indices) {
         Ok(capabilities) => capabilities,
         Err(error) => return Err(with_rollback(error, session.close())),
     };
@@ -1449,6 +1507,41 @@ fn start_workflow(
             session.close(),
         ));
     }
+    let snapshot_query = if capabilities.feature_support(SysfsFeature::TriedRegions)
+        != CapabilitySupport::Supported
+    {
+        if let Err(error) = session.replace_staged_configuration(&prepared.base_config) {
+            return Err(with_rollback(error, session.close()));
+        }
+        SnapshotQuery::Unsupported
+    } else if capabilities.feature_support(SysfsFeature::OnlineParametersCommit)
+        == CapabilitySupport::Supported
+    {
+        let mut query_config = prepared.base_config.clone();
+        let apply_interval = if capabilities.feature_support(SysfsFeature::SchemeApplyInterval)
+            == CapabilitySupport::Supported
+        {
+            prepared.sample_interval
+        } else {
+            Duration::ZERO
+        };
+        query_config.kdamonds[0].contexts[0]
+            .schemes
+            .push(snapshot_query_scheme(apply_interval));
+        if let Err(error) = session.replace_staged_configuration(&prepared.base_config) {
+            return Err(with_rollback(error, session.close()));
+        }
+        SnapshotQuery::OnDemand {
+            base_config: Box::new(prepared.base_config),
+            query_config: Box::new(query_config),
+            scheme_index: prepared.snapshot_scheme_index,
+            installed: false,
+        }
+    } else {
+        SnapshotQuery::Permanent {
+            scheme_index: prepared.snapshot_scheme_index,
+        }
+    };
     if let Err(error) = session.start() {
         return Err(with_rollback(error, session.close()));
     }
@@ -1460,7 +1553,7 @@ fn start_workflow(
         capacity_hint: prepared.capacity_hint,
         operation,
         effective_address_unit: address_unit,
-        snapshot_scheme_index: prepared.snapshot_scheme_index,
+        snapshot_query,
         custom_scheme_count: prepared.custom_scheme_count,
     })
 }
@@ -1489,13 +1582,15 @@ fn classify_operation_staging_error(error: Error, operation: &Operation) -> Erro
     }
 }
 
-fn snapshot_query_scheme() -> SchemeConfig {
+fn snapshot_query_scheme(apply_interval: Duration) -> SchemeConfig {
     let pattern = AccessPattern::new(
         RegionSizeRange::new(0, u64::MAX).expect("match-all size range is valid"),
         AccessCountRange::new(0, u32::MAX).expect("match-all access range is valid"),
         AgeRange::new(0, u32::MAX).expect("match-all age range is valid"),
     );
-    SchemeConfig::new(Action::Stat, pattern)
+    let mut scheme = SchemeConfig::new(Action::Stat, pattern);
+    scheme.apply_interval = apply_interval;
+    scheme
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1626,6 +1721,20 @@ impl SessionLock {
     }
 }
 
+#[derive(Debug)]
+enum SnapshotQuery {
+    Unsupported,
+    Permanent {
+        scheme_index: usize,
+    },
+    OnDemand {
+        base_config: Box<DamonConfig>,
+        query_config: Box<DamonConfig>,
+        scheme_index: usize,
+        installed: bool,
+    },
+}
+
 /// A running high-level DAMON monitor holding a cooperative session lock.
 ///
 /// The monitor verifies its staged configuration and kdamond thread ID before
@@ -1638,7 +1747,7 @@ pub struct Monitor {
     capacity_hint: usize,
     operation: Operation,
     effective_address_unit: AddressUnit,
-    snapshot_scheme_index: usize,
+    snapshot_query: SnapshotQuery,
     custom_scheme_count: usize,
 }
 
@@ -1666,7 +1775,7 @@ impl Monitor {
 
     /// Returns the number of custom schemes supplied to the workflow builder.
     ///
-    /// The private scheme used by [`Self::snapshot`] is not included.
+    /// Any temporary private scheme used by [`Self::snapshot`] is not included.
     #[must_use]
     pub const fn scheme_count(&self) -> usize {
         self.custom_scheme_count
@@ -1693,9 +1802,49 @@ impl Monitor {
             .cached_scheme_stats(0, scheme_index)
     }
 
+    /// Refreshes once and reads every custom scheme's runtime counters.
+    ///
+    /// This performs one complete ownership-check pair and one kernel refresh,
+    /// making it preferable to calling [`Self::scheme_stats`] in a loop.
+    pub fn scheme_stats_all(&mut self) -> Result<Vec<SchemeStats>> {
+        let count = self.custom_scheme_count;
+        self.session
+            .as_mut()
+            .ok_or(Error::NotRunning)?
+            .runtime_batch(|batch| {
+                let mut stats = Vec::with_capacity(count);
+                if count != 0 {
+                    stats.push(batch.scheme_stats(0, 0)?);
+                    for scheme_index in 1..count {
+                        stats.push(batch.cached_scheme_stats(0, scheme_index)?);
+                    }
+                }
+                Ok(stats)
+            })
+    }
+
+    /// Reads every custom scheme's last materialized runtime counters.
+    pub fn cached_scheme_stats_all(&mut self) -> Result<Vec<SchemeStats>> {
+        let count = self.custom_scheme_count;
+        self.session
+            .as_mut()
+            .ok_or(Error::NotRunning)?
+            .runtime_batch(|batch| {
+                let mut stats = Vec::with_capacity(count);
+                for scheme_index in 0..count {
+                    stats.push(batch.cached_scheme_stats(0, scheme_index)?);
+                }
+                Ok(stats)
+            })
+    }
+
     /// Refreshes and reads one custom scheme's effective quota in core units.
     pub fn effective_quota_units(&mut self, scheme_index: usize) -> Result<u64> {
         self.validate_custom_scheme_index(scheme_index)?;
+        self.ensure_feature_supported(
+            SysfsFeature::SchemeQuotaEffectiveBytes,
+            "DAMOS effective quota reporting",
+        )?;
         self.session
             .as_mut()
             .ok_or(Error::NotRunning)?
@@ -1705,10 +1854,55 @@ impl Monitor {
     /// Reads one custom scheme's last materialized effective quota in core units.
     pub fn cached_effective_quota_units(&self, scheme_index: usize) -> Result<u64> {
         self.validate_custom_scheme_index(scheme_index)?;
+        self.ensure_feature_supported(
+            SysfsFeature::SchemeQuotaEffectiveBytes,
+            "DAMOS effective quota reporting",
+        )?;
         self.session
             .as_ref()
             .ok_or(Error::NotRunning)?
             .cached_effective_quota_units(0, scheme_index)
+    }
+
+    /// Refreshes once and reads every custom scheme's effective quota.
+    pub fn effective_quota_units_all(&mut self) -> Result<Vec<u64>> {
+        self.ensure_feature_supported(
+            SysfsFeature::SchemeQuotaEffectiveBytes,
+            "DAMOS effective quota reporting",
+        )?;
+        let count = self.custom_scheme_count;
+        self.session
+            .as_mut()
+            .ok_or(Error::NotRunning)?
+            .runtime_batch(|batch| {
+                let mut quotas = Vec::with_capacity(count);
+                if count != 0 {
+                    quotas.push(batch.effective_quota_units(0, 0)?);
+                    for scheme_index in 1..count {
+                        quotas.push(batch.cached_effective_quota_units(0, scheme_index)?);
+                    }
+                }
+                Ok(quotas)
+            })
+    }
+
+    /// Reads every custom scheme's last materialized effective quota.
+    pub fn cached_effective_quota_units_all(&mut self) -> Result<Vec<u64>> {
+        self.ensure_feature_supported(
+            SysfsFeature::SchemeQuotaEffectiveBytes,
+            "DAMOS effective quota reporting",
+        )?;
+        let count = self.custom_scheme_count;
+        self.session
+            .as_mut()
+            .ok_or(Error::NotRunning)?
+            .runtime_batch(|batch| {
+                let mut quotas = Vec::with_capacity(count);
+                for scheme_index in 0..count {
+                    quotas.push(batch.cached_effective_quota_units(0, scheme_index)?);
+                }
+                Ok(quotas)
+            })
     }
 
     /// Pauses monitoring while retaining the running workflow and ownership.
@@ -1724,27 +1918,58 @@ impl Monitor {
     /// Queries the current monitored regions.
     ///
     /// Every operation-specific builder creates exactly one target, so regions
-    /// are returned in that target's address order. The kernel fulfills this
-    /// request through a private match-all `stat` DAMOS scheme. The call may
-    /// wait for the scheme's next apply interval. Mutable access serializes
-    /// sysfs result materialization for this monitor. Kernels before tried-region
-    /// queries were introduced can still run the monitor, but this method
-    /// returns [`Error::UnsupportedFeature`].
+    /// are returned in that target's address order. On kernels with online
+    /// parameter commits, a private match-all `stat` scheme is installed only
+    /// for this query. Older supported kernels retain that scheme while the
+    /// monitor runs.
+    ///
+    /// Linux's synchronous tried-region command can wait until every configured
+    /// scheme reaches its next apply interval and provides no timeout. Mutable
+    /// access serializes result materialization for this monitor. Kernels before
+    /// tried-region queries were introduced can still run the monitor, but this
+    /// method returns [`Error::UnsupportedFeature`].
     pub fn snapshot(&mut self) -> Result<Snapshot> {
-        if self
-            .capabilities
-            .feature_support(SysfsFeature::TriedRegions)
-            != CapabilitySupport::Supported
-        {
-            return Err(Error::UnsupportedFeature {
-                feature: "DAMOS tried-region queries",
-            });
-        }
-        let raw = self
-            .session
-            .as_mut()
-            .ok_or(Error::NotRunning)?
-            .tried_regions(0, self.snapshot_scheme_index, self.capacity_hint)?;
+        let session = self.session.as_mut().ok_or(Error::NotRunning)?;
+        let raw = match &mut self.snapshot_query {
+            SnapshotQuery::Unsupported => {
+                return Err(Error::UnsupportedFeature {
+                    feature: "DAMOS tried-region queries",
+                });
+            }
+            SnapshotQuery::Permanent { scheme_index } => {
+                session.tried_regions(0, *scheme_index, self.capacity_hint)?
+            }
+            SnapshotQuery::OnDemand {
+                base_config,
+                query_config,
+                scheme_index,
+                installed,
+            } => {
+                if !*installed {
+                    session.update_configuration(query_config)?;
+                    *installed = true;
+                }
+                let operation = match session.tried_regions(0, *scheme_index, self.capacity_hint) {
+                    Err(error @ Error::OwnershipLost { .. }) => return Err(error),
+                    result => result,
+                };
+                let restoration = session.update_configuration(base_config);
+                if restoration.is_ok() {
+                    *installed = false;
+                }
+                match (operation, restoration) {
+                    (Ok(snapshot), Ok(())) => snapshot,
+                    (Err(operation), Ok(())) => return Err(operation),
+                    (Ok(_), Err(restoration)) => return Err(restoration),
+                    (Err(operation), Err(restoration)) => {
+                        return Err(Error::Rollback {
+                            operation: Box::new(operation),
+                            rollback: Box::new(restoration),
+                        });
+                    }
+                }
+            }
+        };
         Ok(raw.with_effective_address_unit(self.effective_address_unit))
     }
 
@@ -1769,6 +1994,14 @@ impl Monitor {
             });
         }
         Ok(())
+    }
+
+    fn ensure_feature_supported(&self, feature: SysfsFeature, name: &'static str) -> Result<()> {
+        if self.capabilities.feature_support(feature) == CapabilitySupport::Supported {
+            Ok(())
+        } else {
+            Err(Error::UnsupportedFeature { feature: name })
+        }
     }
 }
 
@@ -1842,14 +2075,20 @@ mod tests {
         );
         assert_eq!(
             model
-                .value("kdamonds/0/contexts/0/schemes/1/action")
+                .value("kdamonds/0/contexts/0/schemes/nr_schemes")
                 .as_deref(),
-            Some("stat")
+            Some("1")
         );
 
         let snapshot = monitor.snapshot().expect("query private snapshot scheme");
         assert_eq!(snapshot.total_bytes().expect("byte total"), 4_096);
         assert_eq!(snapshot.region(0).expect("region").nr_accesses(), 7);
+        assert_eq!(
+            model
+                .value("kdamonds/0/contexts/0/schemes/nr_schemes")
+                .as_deref(),
+            Some("1")
+        );
         let stats = monitor.scheme_stats(0).expect("custom scheme stats");
         assert_eq!(stats.size_tried_units, 12);
         assert_eq!(monitor.effective_quota_units(0).expect("custom quota"), 18);
@@ -1948,6 +2187,203 @@ mod tests {
         assert_eq!(region.end_bytes().expect("end bytes"), 16_384);
         assert_eq!(snapshot.total_units(), 2);
         assert_eq!(snapshot.total_bytes().expect("total bytes"), 8_192);
+        monitor.stop().expect("restore hierarchy");
+    }
+
+    #[test]
+    fn current_kernels_install_snapshot_query_only_on_demand() {
+        let model = Model::new("vaddr\n");
+        model.set_tried_regions(vec![ModelRegion {
+            start: 4_096,
+            end: 8_192,
+            nr_accesses: 1,
+            age: 1,
+            filter_passed_units: None,
+            probe_hits: Vec::new(),
+        }]);
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let mut monitor = damon
+            .monitor_pid(Pid::new(42).expect("valid pid"))
+            .start()
+            .expect("start monitor");
+
+        assert_eq!(
+            model
+                .value("kdamonds/0/contexts/0/schemes/nr_schemes")
+                .as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            monitor
+                .snapshot()
+                .expect("query snapshot")
+                .raw_regions()
+                .len(),
+            1
+        );
+        assert_eq!(
+            model
+                .value("kdamonds/0/contexts/0/schemes/nr_schemes")
+                .as_deref(),
+            Some("0")
+        );
+        monitor.stop().expect("restore hierarchy");
+    }
+
+    #[test]
+    fn legacy_kernels_retain_the_snapshot_query_scheme() {
+        let model = Model::without_available_operations_file("vaddr\n");
+        model.set_tried_regions(vec![ModelRegion {
+            start: 4_096,
+            end: 8_192,
+            nr_accesses: 1,
+            age: 1,
+            filter_passed_units: None,
+            probe_hits: Vec::new(),
+        }]);
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let mut monitor = damon
+            .monitor_pid(Pid::new(42).expect("valid pid"))
+            .start()
+            .expect("start legacy monitor");
+
+        assert_eq!(
+            model
+                .value("kdamonds/0/contexts/0/schemes/nr_schemes")
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            monitor
+                .snapshot()
+                .expect("query legacy snapshot")
+                .raw_regions()
+                .len(),
+            1
+        );
+        assert_eq!(
+            model
+                .value("kdamonds/0/contexts/0/schemes/nr_schemes")
+                .as_deref(),
+            Some("1")
+        );
+        monitor.stop().expect("restore hierarchy");
+    }
+
+    #[test]
+    fn high_level_capabilities_include_custom_scheme_children() {
+        let model = Model::new("vaddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let mut scheme = SchemeConfig::new(Action::Stat, match_all_pattern());
+        scheme
+            .filters
+            .push(FilterConfig::new(SchemeFilterType::Anonymous, true, true));
+        let monitor = damon
+            .vaddr()
+            .pid(Pid::new(42).expect("valid pid"))
+            .scheme(scheme)
+            .start()
+            .expect("start monitor with filter");
+
+        assert_eq!(
+            monitor
+                .capabilities()
+                .feature_support(SysfsFeature::SchemeFilterAnonymous),
+            CapabilitySupport::Unverified
+        );
+        assert_eq!(
+            monitor
+                .capabilities()
+                .feature_support(SysfsFeature::SchemeFilterAllow),
+            CapabilitySupport::Supported
+        );
+        monitor.stop().expect("restore hierarchy");
+    }
+
+    #[test]
+    fn high_level_effective_quota_reads_are_capability_gated() {
+        let model = Model::new("vaddr\n");
+        model.disable_effective_quota();
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let mut monitor = damon
+            .vaddr()
+            .pid(Pid::new(42).expect("valid pid"))
+            .scheme(SchemeConfig::new(Action::Stat, match_all_pattern()))
+            .start()
+            .expect("start monitor without effective quotas");
+        let writes = model.write_count();
+
+        assert!(matches!(
+            monitor.effective_quota_units(0),
+            Err(Error::UnsupportedFeature {
+                feature: "DAMOS effective quota reporting"
+            })
+        ));
+        assert!(matches!(
+            monitor.cached_effective_quota_units(0),
+            Err(Error::UnsupportedFeature {
+                feature: "DAMOS effective quota reporting"
+            })
+        ));
+        assert_eq!(model.write_count(), writes);
+        monitor.stop().expect("restore hierarchy");
+    }
+
+    #[test]
+    fn high_level_all_scheme_reads_share_refresh_and_ownership_scans() {
+        let model = Model::new("vaddr\n");
+        model.set_scheme_stats(vec![
+            ModelSchemeStats {
+                nr_tried: 1,
+                ..ModelSchemeStats::default()
+            },
+            ModelSchemeStats {
+                nr_tried: 2,
+                ..ModelSchemeStats::default()
+            },
+            ModelSchemeStats {
+                nr_tried: 3,
+                ..ModelSchemeStats::default()
+            },
+        ]);
+        model.set_effective_quota_bytes(vec![4, 5, 6]);
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let mut builder = damon.vaddr().pid(Pid::new(42).expect("valid pid"));
+        for _ in 0..3 {
+            builder = builder.scheme(SchemeConfig::new(Action::Stat, match_all_pattern()));
+        }
+        let mut monitor = builder.start().expect("start three-scheme monitor");
+
+        let ordinary_start = model.read_count();
+        for scheme_index in 0..3 {
+            monitor
+                .scheme_stats(scheme_index)
+                .expect("ordinary scheme read");
+        }
+        let ordinary_reads = model.read_count() - ordinary_start;
+        let batch_start = model.read_count();
+        let stats = monitor.scheme_stats_all().expect("batched scheme reads");
+        let batch_reads = model.read_count() - batch_start;
+
+        assert_eq!(
+            stats
+                .iter()
+                .map(|stats| stats.regions_tried)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(batch_reads < ordinary_reads);
+        assert_eq!(
+            monitor
+                .effective_quota_units_all()
+                .expect("batched effective quotas"),
+            vec![4, 5, 6]
+        );
         monitor.stop().expect("restore hierarchy");
     }
 
@@ -2995,6 +3431,31 @@ mod tests {
             Error::InvalidConfiguration {
                 field: "exclusive session kdamond count",
                 ..
+            }
+        ));
+        assert_eq!(model.write_count(), writes);
+    }
+
+    #[test]
+    fn paddr_scaling_validation_precedes_locking_and_writes() {
+        let model = Model::new("paddr\n");
+        let lock = TestLock::new();
+        let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+        let _held_lock = SessionLock::acquire(lock.path()).expect("hold session lock");
+        let writes = model.write_count();
+
+        let error = damon
+            .paddr()
+            .address_unit(AddressUnit::new(u64::MAX).expect("nonzero unit"))
+            .region_units(InitialRegionConfig::new(1, 2).expect("valid raw region"))
+            .start()
+            .expect_err("scaled end must overflow before locking");
+
+        assert!(matches!(
+            error,
+            Error::AddressConversionOverflow {
+                units: 2,
+                unit_bytes: u64::MAX
             }
         ));
         assert_eq!(model.write_count(), writes);

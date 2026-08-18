@@ -11,6 +11,7 @@ This project follows Semantic Versioning and Keep a Changelog.
 - Optional initial regions, probes, and custom DAMOS schemes in high-level
   workflows
 - Runtime custom-scheme statistics and effective quota reads
+- Batched all-scheme statistics and effective quota reads
 - Match-all DAMOS snapshot queries with sparse region and probe parsing
 - Raw address-unit results and checked byte-scaled views
 - Four-state discovery for all 57 official `damo` sysfs capabilities
@@ -45,4 +46,7 @@ This project follows Semantic Versioning and Keep a Changelog.
 - Serialize cooperating sessions and recheck ownership around lifecycle and
   snapshot operations
 - Route all high-level workflows through the generic session engine
+- Validate scaled and kernel-aligned initial regions before staging
+- Aggregate capabilities across custom schemes and gate optional runtime reads
+- Install snapshot query schemes on demand when online commits are available
 - Model kernel reconstruction, active state, errors, and races in tests

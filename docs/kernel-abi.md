@@ -20,9 +20,9 @@ Primary sources:
 ## High-level transaction
 
 Each high-level builder creates one kdamond, context, and target. It selects
-`vaddr`, `fvaddr`, or `paddr`, stages optional probes and custom schemes, then
-adds a private match-all `stat` scheme for snapshots before starting the
-kdamond.
+`vaddr`, `fvaddr`, or `paddr`, then stages optional probes and custom schemes.
+A private match-all `stat` scheme is installed only during a snapshot when
+online commits are available. Older kernels retain it for compatibility.
 
 Before mutation it takes a cooperative lock and requires all existing
 kdamonds to be stopped. It captures the complete writable hierarchy,
@@ -55,6 +55,9 @@ present, `SnapshotCompleteness` compares the reported and materialized totals.
 Kernels without tried-region queries can still run a monitor, but
 `Monitor::snapshot()` returns `UnsupportedFeature`.
 
+The kernel command is synchronous and can wait for every configured scheme's
+next apply interval. The sysfs ABI provides no timeout.
+
 High-level workflows contain one target and return its regions in address
 order. Results from multiple low-level targets remain in kernel materialization
 order and do not imply global address ordering.
@@ -68,8 +71,10 @@ tries `u64::MAX`, then falls back to `u32::MAX` only after a kernel range error.
 Physical-address results use `addr_unit`. Low-level snapshots therefore expose
 raw units. Byte conversion requires an explicit effective unit and checks
 overflow. Physical-address staging also rejects non-power-of-two units below
-the runtime page size. High-level physical workflows carry the effective unit,
-while virtual workflows use a unit of one.
+the runtime page size and regions whose scaled endpoints overflow. Initial
+regions are checked after the same minimum-region alignment used by the kernel.
+High-level physical workflows carry the effective unit, while virtual workflows
+use a unit of one.
 
 Access-pattern sizes use the kernel-width range type. Access counts and ages
 use `u32`, matching the active kernel structures and preventing silent
