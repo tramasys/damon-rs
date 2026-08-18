@@ -15,11 +15,53 @@ It provides:
 The crate is sysfs-only. It does not provide the legacy debugfs backend or
 continuous tracepoint recording.
 
+## DAMON
+
+DAMON, the Data Access MONitor, is a Linux kernel subsystem for efficient data
+access monitoring and access-aware operations. It samples how memory regions
+are accessed. DAMOS can act on regions selected by access frequency, age, and
+size, with quotas, watermarks, and filters controlling application. This crate
+controls DAMON through its privileged admin sysfs interface.
+
+See the [DAMON project website](https://damonitor.github.io/), the
+[Linux documentation](https://docs.kernel.org/mm/damon/index.html), the
+[mainline kernel source](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/mm/damon),
+and the [DAMON mailing-list archive](https://lore.kernel.org/damon/).
+
 ## Requirements
 
-The kernel normally needs `CONFIG_DAMON`, `CONFIG_DAMON_VADDR`, and
-`CONFIG_DAMON_SYSFS`. Access to the admin interface usually requires elevated
+Building requires Rust 1.85 or newer. The running Linux kernel needs
+`CONFIG_DAMON` and `CONFIG_DAMON_SYSFS`. Virtual-address workflows also need
+`CONFIG_DAMON_VADDR`, while physical-address workflows need
+`CONFIG_DAMON_PADDR`. Access to the admin interface usually requires elevated
 privileges.
+
+This read-only check reports the relevant kernel options, sysfs availability,
+access permissions, and Rust version:
+
+```bash
+damon_kernel_config="/boot/config-$(uname -r)"
+damon_config_pattern='^(CONFIG_DAMON(_(SYSFS|VADDR|PADDR))?=|# CONFIG_DAMON(_(SYSFS|VADDR|PADDR))? is not set)'
+
+if [[ -r "$damon_kernel_config" ]]; then
+    grep -E "$damon_config_pattern" "$damon_kernel_config"
+elif [[ -r /proc/config.gz ]]; then
+    zgrep -E "$damon_config_pattern" /proc/config.gz
+else
+    echo "Kernel configuration is not readable"
+fi
+
+damon_admin=/sys/kernel/mm/damon/admin
+if [[ -d "$damon_admin" ]]; then
+    echo "DAMON sysfs: available"
+    [[ -r "$damon_admin/kdamonds/nr_kdamonds" ]] && echo "DAMON sysfs: readable" || echo "DAMON sysfs: not readable"
+    [[ -w "$damon_admin/kdamonds/nr_kdamonds" ]] && echo "DAMON sysfs: writable" || echo "DAMON sysfs: not writable"
+else
+    echo "DAMON sysfs: unavailable"
+fi
+
+rustc --version
+```
 
 ## Example
 
