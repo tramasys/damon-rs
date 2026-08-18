@@ -1186,9 +1186,16 @@ impl DamonConfig {
             return true;
         }
         let mut canonical = self.clone();
-        for kdamond in &mut canonical.kdamonds {
-            for context in &mut kdamond.contexts {
-                for scheme in &mut context.schemes {
+        for (kdamond, observed_kdamond) in canonical.kdamonds.iter_mut().zip(&observed.kdamonds) {
+            for (context, observed_context) in
+                kdamond.contexts.iter_mut().zip(&observed_kdamond.contexts)
+            {
+                for (scheme, observed_scheme) in
+                    context.schemes.iter_mut().zip(&observed_context.schemes)
+                {
+                    scheme
+                        .access_pattern
+                        .normalize_kernel_width(observed_scheme.access_pattern);
                     scheme.filters.sort_by_key(|filter| {
                         filter.filter_type.handled_by_operations() != Some(false)
                     });
@@ -3010,11 +3017,12 @@ impl Scheme {
         if needs_stage(observed.map(|value| &value.action), &config.action) {
             self.set_action(&config.action)?;
         }
-        if needs_stage(
-            observed.map(|value| &value.access_pattern),
-            &config.access_pattern,
-        ) {
-            self.set_access_pattern(config.access_pattern)?;
+        if observed.is_none_or(|value| {
+            !config
+                .access_pattern
+                .equivalent_after_kernel_normalization(value.access_pattern)
+        }) {
+            self.set_access_pattern_adaptive(config.access_pattern)?;
         }
         if needs_stage(
             observed.map(|value| &value.apply_interval),

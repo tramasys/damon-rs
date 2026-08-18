@@ -15,6 +15,8 @@ This project follows Semantic Versioning and Keep a Changelog.
 - Typed probe weights and preparations, operation attributes, and sample controls
 - Transactional whole-hierarchy staging with read-back verification and exact
   rollback of known and unknown writable attributes
+- Generic exclusive sessions with runtime commands, explicit close, and
+  restoration of preceding stopped configurations
 - Advisory locking, ownership fingerprints, rollback, and cleanup
 - CI for formatting, linting, tests, docs, packaging, MSRV, architectures, and
   dependency policy
@@ -35,4 +37,5 @@ This project follows Semantic Versioning and Keep a Changelog.
 - Probe semantic scheme and monitoring filter values
 - Serialize cooperating sessions and recheck ownership around lifecycle and
   snapshot operations
+- Route the single-process monitor through the generic session engine
 - Model kernel reconstruction, active state, errors, and races in tests

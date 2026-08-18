@@ -2,8 +2,8 @@
 //!
 //! `damon` provides two layers:
 //!
-//! - [`Damon`] and [`Monitor`] manage the common single-process monitoring
-//!   lifecycle.
+//! - [`Damon`], [`ExclusiveSession`], and [`Monitor`] manage transactional
+//!   monitoring lifecycles.
 //! - [`sysfs`] exposes typed building blocks for callers that need direct
 //!   control over the kernel ABI.
 //!
@@ -29,9 +29,9 @@
 //! # }
 //! ```
 //!
-//! The high-level API uses a cooperative advisory lock and refuses to replace
-//! an existing kdamond configuration. The kernel ABI cannot enforce ownership
-//! against controllers that ignore that lock.
+//! The high-level API uses a cooperative advisory lock, refuses to replace a
+//! running kdamond, and restores preceding stopped configurations. The kernel
+//! ABI cannot enforce ownership against controllers that ignore that lock.
 
 #![forbid(unsafe_code)]
 
@@ -43,7 +43,7 @@ pub mod sysfs;
 
 pub use config::{AddressUnit, MonitoringIntervals, Pid, RegionBounds};
 pub use error::{Error, Result};
-pub use monitor::{DEFAULT_SESSION_LOCK_PATH, Damon, Monitor, MonitorBuilder};
+pub use monitor::{DEFAULT_SESSION_LOCK_PATH, Damon, ExclusiveSession, Monitor, MonitorBuilder};
 pub use region::{
     ProbeHit, RawRegion, RawSnapshot, Region, RegionIter, Snapshot, SnapshotCompleteness,
 };

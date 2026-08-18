@@ -796,6 +796,23 @@ impl AccessPattern {
     pub const fn age(self) -> AgeRange {
         self.age
     }
+
+    pub(crate) fn equivalent_after_kernel_normalization(self, observed: Self) -> bool {
+        if self == observed {
+            return true;
+        }
+        self.size.min == observed.size.min
+            && self.size.max == u64::MAX
+            && observed.size.max == u64::from(u32::MAX)
+            && self.accesses == observed.accesses
+            && self.age == observed.age
+    }
+
+    pub(crate) fn normalize_kernel_width(&mut self, observed: Self) {
+        if self.equivalent_after_kernel_normalization(observed) {
+            self.size = observed.size;
+        }
+    }
 }
 
 /// A monitoring data-probe filter type.
@@ -927,16 +944,56 @@ pub(crate) struct ConfigurationSnapshot {
 
 impl ConfigurationFingerprint {
     pub(crate) fn matches_current(&self) -> Result<bool> {
+        self.matches_current_except(&[])
+    }
+
+    pub(crate) fn matches_current_except(&self, ignored: &[PathBuf]) -> Result<bool> {
         for entry in &self.entries {
+            if ignored.binary_search(&entry.path).is_ok() {
+                continue;
+            }
             if !read_configuration_value_equals(&entry.path, entry.value.as_bytes())? {
                 return Ok(false);
             }
         }
         Ok(true)
     }
+
+    pub(crate) fn refreshed_paths_except(
+        &self,
+        paths: &[PathBuf],
+        ignored: &[PathBuf],
+    ) -> Result<Self> {
+        let mut refreshed = self.clone();
+        for path in paths {
+            let entry = refreshed
+                .entries
+                .iter_mut()
+                .find(|entry| &entry.path == path)
+                .ok_or(Error::OwnershipLost {
+                    reason: "a controlled configuration path disappeared",
+                })?;
+            let value = read_text(path)?;
+            entry.value = value.strip_suffix('\n').unwrap_or(&value).into();
+        }
+        if !refreshed.matches_current_except(ignored)? {
+            return Err(Error::OwnershipLost {
+                reason: "the staged writable configuration changed",
+            });
+        }
+        Ok(refreshed)
+    }
 }
 
 impl ConfigurationSnapshot {
+    pub(crate) fn fingerprint(&self) -> ConfigurationFingerprint {
+        self.fingerprint.clone()
+    }
+
+    pub(crate) fn into_fingerprint(self) -> ConfigurationFingerprint {
+        self.fingerprint
+    }
+
     pub(crate) fn matches_current(&self) -> Result<bool> {
         Ok(capture_configuration(&self.root)? == self.fingerprint)
     }
@@ -1020,6 +1077,15 @@ impl Kdamond {
     pub fn refresh_interval(&self) -> Result<Duration> {
         let milliseconds = read_u32(&self.path.join("refresh_ms"))?;
         Ok(Duration::from_millis(u64::from(milliseconds)))
+    }
+
+    pub(crate) fn refresh_interval_if_present(&self) -> Result<Option<Duration>> {
+        let path = self.path.join("refresh_ms");
+        if path_exists(&path)? {
+            self.refresh_interval().map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Sets the periodic sysfs refresh interval.
@@ -1613,10 +1679,6 @@ impl Context {
         write_value(&self.path.join("addr_unit"), address_unit.bytes())
     }
 
-    pub(crate) fn set_default_address_unit_if_present(&self) -> Result<()> {
-        write_value_if_present(&self.path.join("addr_unit"), AddressUnit::ONE.bytes()).map(|_| ())
-    }
-
     /// Reads whether monitoring is paused for this context.
     pub fn is_paused(&self) -> Result<bool> {
         read_bool(&self.path.join("pause"))
@@ -1627,8 +1689,8 @@ impl Context {
         write_bool(&self.path.join("pause"), paused)
     }
 
-    pub(crate) fn set_unpaused_if_present(&self) -> Result<()> {
-        write_bool_if_present(&self.path.join("pause"), false).map(|_| ())
+    pub(crate) fn pause_control_available(&self) -> Result<bool> {
+        path_exists(&self.path.join("pause"))
     }
 
     /// Reads the monitoring intervals.
@@ -1676,11 +1738,6 @@ impl Context {
     pub fn set_probe_count(&self, count: usize) -> Result<()> {
         configuration::validate_count("monitoring probe count", count)?;
         write_value(&self.path.join("monitoring_attrs/probes/nr_probes"), count)
-    }
-
-    pub(crate) fn clear_probes_if_present(&self) -> Result<()> {
-        write_value_if_present(&self.path.join("monitoring_attrs/probes/nr_probes"), 0_u8)
-            .map(|_| ())
     }
 
     /// Returns a typed handle for a staged monitoring data probe.
@@ -1795,10 +1852,6 @@ impl Target {
         write_bool(&self.path.join("obsolete_target"), obsolete)
     }
 
-    pub(crate) fn retain_if_supported(&self) -> Result<()> {
-        write_bool_if_present(&self.path.join("obsolete_target"), false).map(|_| ())
-    }
-
     /// Reads the number of staged initial monitoring regions.
     pub fn initial_region_count(&self) -> Result<usize> {
         read_usize(&self.path.join("regions/nr_regions"))
@@ -1808,10 +1861,6 @@ impl Target {
     pub fn set_initial_region_count(&self, count: usize) -> Result<()> {
         configuration::validate_count("initial region count", count)?;
         write_value(&self.path.join("regions/nr_regions"), count)
-    }
-
-    pub(crate) fn clear_initial_regions_if_present(&self) -> Result<()> {
-        write_value_if_present(&self.path.join("regions/nr_regions"), 0_u8).map(|_| ())
     }
 }
 
@@ -1952,6 +2001,19 @@ impl Scheme {
         write_age_range(&path.join("age"), pattern.age())
     }
 
+    pub(crate) fn set_access_pattern_adaptive(&self, pattern: AccessPattern) -> Result<()> {
+        let path = self.path.join("access_pattern");
+        let size = path.join("sz");
+        write_value(&size.join("min"), pattern.size().min())?;
+        if pattern.size().max() == u64::MAX {
+            write_kernel_ulong_max(&size.join("max"))?;
+        } else {
+            write_value(&size.join("max"), pattern.size().max())?;
+        }
+        write_access_count_range(&path.join("nr_accesses"), pattern.accesses())?;
+        write_age_range(&path.join("age"), pattern.age())
+    }
+
     /// Configures a pattern that matches every kernel-representable region.
     ///
     /// DAMON stores each maximum as the kernel's `unsigned long`. This method
@@ -1988,10 +2050,6 @@ impl Scheme {
             &self.path.join("apply_interval_us"),
             duration_micros(interval)?,
         )
-    }
-
-    pub(crate) fn set_default_apply_interval_if_present(&self) -> Result<()> {
-        write_value_if_present(&self.path.join("apply_interval_us"), 0_u8).map(|_| ())
     }
 
     /// Reads the last materialized tried-region results without inferring a
@@ -2067,6 +2125,14 @@ impl Scheme {
             reported_total_units,
             computed_total_units,
         ))
+    }
+
+    /// Reads the last materialized total tried size in core address units.
+    ///
+    /// Call [`Kdamond::command`] with
+    /// [`KdamondCommand::UpdateSchemesTriedBytes`] first.
+    pub fn tried_bytes_units(&self) -> Result<u64> {
+        read_u64(&self.path.join("tried_regions/total_bytes"))
     }
 }
 
@@ -2701,14 +2767,6 @@ fn write_value_if_present(path: &Path, value: impl fmt::Display) -> Result<bool>
 
 fn write_bool(path: &Path, value: bool) -> Result<()> {
     write_bytes(path, if value { b"Y" } else { b"N" })
-}
-
-fn write_bool_if_present(path: &Path, value: bool) -> Result<bool> {
-    if !path_exists(path)? {
-        return Ok(false);
-    }
-    write_bool(path, value)?;
-    Ok(true)
 }
 
 fn write_bytes(path: &Path, value: &[u8]) -> Result<()> {

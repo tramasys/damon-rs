@@ -10,6 +10,7 @@ privileged admin sysfs ABI and is not a replacement for the
 - Typed low-level access to DAMON admin sysfs
 - Adaptive owned configuration through Linux 7.2 and current `damo` controls
 - Transactional whole-hierarchy staging with verified rollback
+- Generic exclusive sessions with runtime commands and exact restoration
 - Runtime discovery for all 57 official `damo` sysfs capabilities
 - Checked address-unit conversion and sparse tried-region parsing
 - Advisory locking, ownership checks, rollback, and cleanup
@@ -29,9 +30,10 @@ CONFIG_DAMON_SYSFS=y
 ```
 
 Admin sysfs usually requires elevated privileges. High-level sessions use
-`/run/lock/damon-rs.lock` and require an empty DAMON hierarchy. The lock is
-advisory because the kernel exposes no ownership primitive. Other controllers
-must use the same lock or equivalent system-wide coordination.
+`/run/lock/damon-rs.lock`, refuse running kdamonds, and restore preceding
+stopped configurations. The lock is advisory because the kernel exposes no
+ownership primitive. Other controllers must use the same lock or equivalent
+system-wide coordination.
 
 The ABI is source-audited against Linux 7.2 and live-tested on Linux 7.1.
 Runtime behavior is selected from available sysfs paths and accepted values,
@@ -68,6 +70,10 @@ fn main() -> Result<(), damon::Error> {
 
 `Monitor::stop()` reports shutdown errors. Dropping a monitor performs
 best-effort cleanup.
+
+`Damon::exclusive_session()` provides the same lifecycle for any validated
+single-kdamond `DamonConfig`. Explicit `close()` reports restoration failures,
+while `Drop` performs best-effort restoration.
 
 ## Capability discovery
 

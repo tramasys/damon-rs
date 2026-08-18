@@ -23,11 +23,16 @@ The high-level API creates one kdamond, context, target, and match-all `stat`
 scheme. It selects `vaddr`, configures the process and intervals, then starts
 the kdamond.
 
-Before mutation it takes a cooperative lock and requires `nr_kdamonds` to be
-zero. It fingerprints all materialized writable inputs, including unknown
-future attributes, and records the kdamond thread ID. Identity is rechecked
-around result materialization and cleanup. Failed setup rolls back to zero
-kdamonds when ownership is still established.
+Before mutation it takes a cooperative lock and requires all existing
+kdamonds to be stopped. It captures the complete writable hierarchy,
+including unknown future attributes, then records the staged fingerprint and
+kdamond thread ID. Identity is rechecked around runtime commands and cleanup.
+Explicit close restores the preceding hierarchy. Drop attempts the same
+restoration without reporting errors.
+
+Auto-tuned `sample_us` and `aggr_us` values are kernel-volatile while interval
+tuning is enabled, so ownership checks ignore those two leaves. All other
+captured writable values remain fingerprinted.
 
 These checks reduce races but cannot stop an uncooperative privileged process
 from changing the global kernel interface.

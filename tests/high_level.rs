@@ -393,7 +393,9 @@ fn stages_queries_and_cleans_up_a_monitor() {
     assert_eq!(fixture.read("kdamonds/0/contexts/0/operations"), "vaddr");
     assert_eq!(fixture.read("kdamonds/0/contexts/0/pause"), "N");
     assert_eq!(
-        fixture.read("kdamonds/0/contexts/0/monitoring_attrs/probes/nr_probes"),
+        fixture
+            .read("kdamonds/0/contexts/0/monitoring_attrs/probes/nr_probes")
+            .trim(),
         "0"
     );
     assert_eq!(
@@ -405,7 +407,9 @@ fn stages_queries_and_cleans_up_a_monitor() {
         "N"
     );
     assert_eq!(
-        fixture.read("kdamonds/0/contexts/0/targets/0/regions/nr_regions"),
+        fixture
+            .read("kdamonds/0/contexts/0/targets/0/regions/nr_regions")
+            .trim(),
         "0"
     );
     assert_eq!(
@@ -583,18 +587,32 @@ fn snapshot_parses_sparse_kernel_indexes_and_reports_partial_materialization() {
 }
 
 #[test]
-fn refuses_to_replace_an_existing_configuration() {
+fn restores_an_existing_stopped_configuration() {
     let fixture = Fixture::new("vaddr\n");
-    fixture.write("kdamonds/nr_kdamonds", "2\n");
+    fixture.write("kdamonds/nr_kdamonds", "1\n");
+    fixture.write("kdamonds/0/contexts/nr_contexts", "1\n");
+    fixture.write("kdamonds/0/contexts/0/operations", "vaddr\n");
+    fixture.write("kdamonds/0/contexts/0/targets/nr_targets", "1\n");
+    fixture.write("kdamonds/0/contexts/0/targets/0/pid_target", "77\n");
+    fixture.write("kdamonds/0/contexts/0/schemes/nr_schemes", "0\n");
     let damon = fixture.damon();
 
-    let error = damon
+    let monitor = damon
         .monitor_pid(Pid::new(42).expect("valid pid"))
         .start()
-        .expect_err("existing configuration must be preserved");
+        .expect("replace a stopped configuration transactionally");
+    monitor.stop().expect("restore preceding configuration");
 
-    assert!(matches!(error, Error::InUse { kdamonds: 2 }));
-    assert_eq!(fixture.read("kdamonds/nr_kdamonds"), "2\n");
+    assert_eq!(fixture.read("kdamonds/nr_kdamonds"), "1");
+    assert_eq!(fixture.read("kdamonds/0/contexts/nr_contexts"), "1");
+    assert_eq!(
+        fixture.read("kdamonds/0/contexts/0/targets/0/pid_target"),
+        "77"
+    );
+    assert_eq!(
+        fixture.read("kdamonds/0/contexts/0/schemes/nr_schemes"),
+        "0"
+    );
 }
 
 #[test]
@@ -800,17 +818,8 @@ fn setup_rollback_preserves_a_concurrently_started_slot() {
             Error::Rollback {
                 ref operation,
                 ref rollback,
-            } if matches!(
-                **operation,
-                Error::UnsupportedOperation {
-                    operation: Operation::VirtualAddress
-                }
-            ) && matches!(
-                **rollback,
-                Error::OwnershipLost {
-                    reason: "a kdamond started during setup rollback"
-                }
-            )
+            } if matches!(**operation, Error::KdamondRunning { index: 0 })
+                && matches!(**rollback, Error::KdamondRunning { index: 0 })
         ),
         "unexpected error: {error:?}, state: {:?}, count: {:?}",
         fixture.read("kdamonds/0/state"),
@@ -974,7 +983,12 @@ fn cleanup_preserves_an_externally_changed_configuration() {
         .stop()
         .expect_err("externally changed configuration must be preserved");
 
-    assert!(matches!(error, Error::InUse { kdamonds: 2 }));
+    assert!(matches!(
+        error,
+        Error::OwnershipLost {
+            reason: "the staged kdamond count changed"
+        }
+    ));
     assert_eq!(fixture.read("kdamonds/nr_kdamonds"), "2\n");
 }
 
@@ -1153,8 +1167,34 @@ impl Fixture {
                 "0\n",
             );
         }
+        fixture.add_scheme_defaults();
 
         fixture
+    }
+
+    fn add_scheme_defaults(&self) {
+        for (path, value) in [
+            ("quotas/ms", "0\n"),
+            ("quotas/bytes", "0\n"),
+            ("quotas/reset_interval_ms", "0\n"),
+            ("quotas/effective_bytes", "0\n"),
+            ("quotas/weights/sz_permil", "0\n"),
+            ("quotas/weights/nr_accesses_permil", "0\n"),
+            ("quotas/weights/age_permil", "0\n"),
+            ("watermarks/metric", "none\n"),
+            ("watermarks/interval_us", "0\n"),
+            ("watermarks/high", "0\n"),
+            ("watermarks/mid", "0\n"),
+            ("watermarks/low", "0\n"),
+            ("filters/nr_filters", "0\n"),
+            ("stats/nr_tried", "0\n"),
+            ("stats/sz_tried", "0\n"),
+            ("stats/nr_applied", "0\n"),
+            ("stats/sz_applied", "0\n"),
+            ("stats/qt_exceeds", "0\n"),
+        ] {
+            self.write(&format!("kdamonds/0/contexts/0/schemes/0/{path}"), value);
+        }
     }
 
     fn add_probe_filter_files(&self) {
