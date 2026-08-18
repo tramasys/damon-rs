@@ -23,12 +23,19 @@ This project follows Semantic Versioning and Keep a Changelog.
   restoration of preceding stopped configurations
 - Managed multi-kdamond lifecycle with per-thread identity checks, partial-start
   rollback, selected online updates, and exact hierarchy restoration
+- Persistent start, receipt serialization, verified attach, online update, and
+  partial-stop recovery
 - Indexed ownership-safe runtime access for managed kdamonds
 - Transactional quota-goal-only updates with rollback
 - Multiple-process vaddr and fvaddr workflows with target-scoped or honest
-  ungrouped snapshots
-- Cached tried-region reads and snapshot apply-interval inspection
-- Transactional online configuration updates and checked runtime batches
+  scheme-scoped snapshots
+- Lossless configuration observations that include unknown writable attributes
+- Cached and owned snapshot results with completion timing
+- Deadline-aware snapshot requests that preserve the monitor on worker failure
+- Snapshot apply-interval inspection and periodic result refresh configuration
+- Transactional online configuration updates and checked read and runtime batches
+- Public string parsing for typed and future ABI values
+- Exact, floor, ceiling, and covering byte-to-address-unit conversions
 - Advisory locking, ownership fingerprints, rollback, and cleanup
 - CI for formatting, linting, tests, docs, packaging, MSRV, architectures, and
   dependency policy
@@ -37,6 +44,8 @@ This project follows Semantic Versioning and Keep a Changelog.
 
 - Preserve unknown kernel operations, actions, and configuration paths
 - Match kernel numeric widths for sizes, access counts, and ages
+- Model `max_nr_snapshots` as a scheme application limit rather than retained
+  result storage
 - Distinguish core-unit region sizes from byte-sized huge-page filters
 - Adapt staging to attributes present on the running kernel
 - Normalize split filter layouts and write only changed configuration leaves

@@ -37,6 +37,7 @@ impl PersistentKdamondIdentity {
 /// A receipt is evidence of an observed configuration and set of kernel-thread
 /// IDs. It is not an ownership token. A controller that ignores the advisory
 /// lock can replace a hierarchy between persistent operations.
+#[must_use = "persistent receipts are required for later verified lifecycle operations"]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistentReceipt {
     admin_path: PathBuf,
@@ -304,13 +305,11 @@ pub struct AttachedHierarchy {
 
 impl AttachedHierarchy {
     /// Returns the receipt currently verified by this handle.
-    #[must_use]
     pub const fn receipt(&self) -> &PersistentReceipt {
         &self.receipt
     }
 
     /// Consumes the handle and returns its current receipt.
-    #[must_use]
     pub fn into_receipt(self) -> PersistentReceipt {
         self.receipt
     }
