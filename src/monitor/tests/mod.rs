@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::*;
 use crate::sysfs::test_backend::{Model, ModelRegion, ModelSchemeStats, Mutation};
 use crate::sysfs::{
-    AccessCountRange, AccessPattern, AgeRange, ContextConfig, FilterConfig, IntervalsGoalConfig,
-    KdamondConfig, QuotaGoalConfig, QuotaGoalMetric, RegionSizeRange, SchemeConfig,
-    SchemeFilterType, TargetConfig,
+    AccessCountRange, AccessPattern, AgeRange, ContextConfig, FilterConfig, FilterPlacement,
+    IntervalsGoalConfig, KdamondConfig, QuotaGoalConfig, QuotaGoalMetric, RegionSizeRange,
+    SchemeConfig, SchemeFilterType, TargetConfig,
 };
 
 mod hierarchy;

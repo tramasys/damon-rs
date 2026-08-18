@@ -638,3 +638,87 @@ fn exclusive_session_does_not_adopt_concurrent_changes_during_pause() {
         .close()
         .expect("restore after repairing external change");
 }
+
+#[test]
+fn no_op_running_update_preserves_operations_filters() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut config = transaction_config(42, Action::Stat);
+    let mut filter = FilterConfig::new(SchemeFilterType::Anonymous, true, true);
+    filter.placement = FilterPlacement::Operations;
+    config.kdamonds[0].contexts[0].schemes[0]
+        .filters
+        .push(filter);
+    let mut session = damon.exclusive_session(&config).expect("stage session");
+    session.start().expect("start session");
+
+    session
+        .update_configuration(&config)
+        .expect("commit unchanged running configuration");
+
+    for (path, expected) in [
+        (
+            "kdamonds/0/contexts/0/schemes/0/ops_filters/nr_filters",
+            "1",
+        ),
+        ("kdamonds/0/contexts/0/schemes/0/ops_filters/0/type", "anon"),
+        (
+            "kdamonds/0/contexts/0/schemes/0/ops_filters/0/matching",
+            "Y",
+        ),
+        ("kdamonds/0/contexts/0/schemes/0/ops_filters/0/allow", "Y"),
+    ] {
+        assert_eq!(model.active_value(path).as_deref(), Some(expected));
+    }
+    assert_eq!(
+        session.configuration().expect("read unchanged hierarchy"),
+        config
+    );
+    session.close().expect("close session");
+}
+
+#[test]
+fn runtime_refresh_rejects_an_externally_removed_scheme_before_command() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut session = damon
+        .exclusive_session(&transaction_config(42, Action::Stat))
+        .expect("stage session");
+    session.start().expect("start session");
+    model.set_file("kdamonds/0/contexts/0/schemes/nr_schemes", b"0\n");
+    model.remove_tree("kdamonds/0/contexts/0/schemes/0");
+    let writes = model.write_count();
+
+    let error = session
+        .scheme_stats(0, 0)
+        .expect_err("removed scheme must invalidate ownership");
+
+    assert!(matches!(
+        error,
+        Error::OwnershipLost {
+            reason: "the staged writable configuration changed"
+        }
+    ));
+    assert_eq!(
+        model.write_count(),
+        writes,
+        "ownership loss must be detected before a state command"
+    );
+    assert!(matches!(session.close(), Err(Error::OwnershipLost { .. })));
+    assert_eq!(
+        damon
+            .admin
+            .kdamond(0)
+            .state()
+            .expect("read replacement state"),
+        KdamondState::On
+    );
+    damon
+        .admin
+        .kdamond(0)
+        .command(&KdamondCommand::Off)
+        .expect("stop replacement fixture");
+    damon.admin.set_kdamond_count(0).expect("remove fixture");
+}
