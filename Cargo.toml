@@ -11,6 +11,7 @@ license = "MIT"
 readme = "README.md"
 keywords = ["damon", "linux", "memory", "monitoring", "sysfs"]
 categories = ["api-bindings", "os::linux-apis"]
+publish = ["crates-io"]
 include = [
     "src/**/*.rs",
     "tests/**/*.rs",
