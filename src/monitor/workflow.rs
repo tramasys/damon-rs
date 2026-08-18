@@ -1,6 +1,8 @@
 //! High-level vaddr, fvaddr, and paddr workflow builders.
 
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::fmt;
+use std::io;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -722,6 +724,7 @@ pub enum SnapshotWait {
 }
 
 /// A completed asynchronous snapshot request and its owned monitor.
+#[must_use = "the outcome contains the monitor recovered from the snapshot worker"]
 #[derive(Debug)]
 pub struct SnapshotOutcome {
     monitor: Monitor,
@@ -749,12 +752,60 @@ impl SnapshotOutcome {
     }
 }
 
+/// A failure to start a snapshot worker and the monitor it did not consume.
+#[must_use = "the error contains the monitor that remains available to the caller"]
+#[derive(Debug)]
+pub struct SnapshotStartError {
+    error: Error,
+    monitor: Box<Monitor>,
+}
+
+impl SnapshotStartError {
+    fn new(error: Error, monitor: Monitor) -> Self {
+        Self {
+            error,
+            monitor: Box::new(monitor),
+        }
+    }
+
+    /// Returns the worker-start error.
+    #[must_use]
+    pub const fn error(&self) -> &Error {
+        &self.error
+    }
+
+    /// Returns the monitor that was not transferred to a worker.
+    #[must_use]
+    pub const fn monitor(&self) -> &Monitor {
+        &self.monitor
+    }
+
+    /// Splits the failure into its error and recoverable monitor.
+    #[must_use]
+    pub fn into_parts(self) -> (Error, Monitor) {
+        (self.error, *self.monitor)
+    }
+}
+
+impl fmt::Display for SnapshotStartError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for SnapshotStartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 /// A snapshot command running on a dedicated worker thread.
 ///
 /// Linux exposes the command as a synchronous sysfs write with no
 /// cancellation. A pending request therefore owns its [`Monitor`] until the
 /// write returns. Dropping a pending request waits for the worker so no hidden
 /// thread can continue mutating the session after the request disappears.
+#[must_use = "dropping a pending snapshot request waits for its blocking kernel operation"]
 #[derive(Debug)]
 pub struct SnapshotRequest {
     receiver: Receiver<(Monitor, Result<Vec<ScopedSnapshot>>)>,
@@ -1199,21 +1250,52 @@ impl Monitor {
     /// The request can be polled with a deadline, but the kernel write cannot
     /// be cancelled. Use [`SnapshotRequest::finish`] to recover the monitor and
     /// inspect the snapshot result.
-    pub fn request_snapshot(self) -> Result<SnapshotRequest> {
+    pub fn request_snapshot(self) -> std::result::Result<SnapshotRequest, SnapshotStartError> {
+        self.request_snapshot_with(|monitor_receiver, sender| {
+            std::thread::Builder::new()
+                .name("damon-snapshot".into())
+                .spawn(move || run_snapshot_worker(&monitor_receiver, &sender))
+        })
+    }
+
+    fn request_snapshot_with(
+        self,
+        spawn_worker: impl FnOnce(
+            Receiver<Monitor>,
+            SyncSender<(Monitor, Result<Vec<ScopedSnapshot>>)>,
+        ) -> io::Result<JoinHandle<()>>,
+    ) -> std::result::Result<SnapshotRequest, SnapshotStartError> {
+        let (monitor_sender, monitor_receiver) = mpsc::sync_channel(1);
         let (sender, receiver) = mpsc::sync_channel(1);
-        let worker = std::thread::Builder::new()
-            .name("damon-snapshot".into())
-            .spawn(move || {
-                let mut monitor = self;
-                let snapshots = monitor.materialize_snapshots_owned();
-                let _ = sender.send((monitor, snapshots));
-            })
-            .map_err(|source| Error::SnapshotWorkerSpawn { source })?;
+        let worker = match spawn_worker(monitor_receiver, sender) {
+            Ok(worker) => worker,
+            Err(source) => {
+                return Err(SnapshotStartError::new(
+                    Error::SnapshotWorkerSpawn { source },
+                    self,
+                ));
+            }
+        };
+        if let Err(mpsc::SendError(monitor)) = monitor_sender.send(self) {
+            let _ = worker.join();
+            return Err(SnapshotStartError::new(
+                Error::SnapshotWorkerDisconnected,
+                monitor,
+            ));
+        }
         Ok(SnapshotRequest {
             receiver,
             worker: Some(worker),
             outcome: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn request_snapshot_with_spawn_error(
+        self,
+        source: io::Error,
+    ) -> std::result::Result<SnapshotRequest, SnapshotStartError> {
+        self.request_snapshot_with(|_, _| Err(source))
     }
 
     /// Returns snapshots from the last successful materialization.
@@ -1270,4 +1352,15 @@ impl Monitor {
             Err(Error::UnsupportedFeature { feature: name })
         }
     }
+}
+
+fn run_snapshot_worker(
+    monitor_receiver: &Receiver<Monitor>,
+    sender: &SyncSender<(Monitor, Result<Vec<ScopedSnapshot>>)>,
+) {
+    let Ok(mut monitor) = monitor_receiver.recv() else {
+        return;
+    };
+    let snapshots = monitor.materialize_snapshots_owned();
+    let _ = sender.send((monitor, snapshots));
 }

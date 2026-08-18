@@ -129,6 +129,29 @@ fn owned_snapshot_request_returns_monitor_and_completion_timing() {
 }
 
 #[test]
+fn snapshot_worker_start_failure_returns_the_running_monitor() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let monitor = damon
+        .monitor_pid(Pid::new(42).expect("valid pid"))
+        .start()
+        .expect("start monitor");
+
+    let failure = monitor
+        .request_snapshot_with_spawn_error(io::Error::from_raw_os_error(11))
+        .expect_err("worker creation must fail");
+
+    assert!(matches!(
+        failure.error(),
+        Error::SnapshotWorkerSpawn { source } if source.raw_os_error() == Some(11)
+    ));
+    let (_, monitor) = failure.into_parts();
+    assert!(monitor.is_running().expect("monitor remains running"));
+    monitor.stop().expect("stop recovered monitor");
+}
+
+#[test]
 fn owned_snapshot_extraction_reuses_the_cached_allocation() {
     let model = Model::new("vaddr\n");
     let lock = TestLock::new();

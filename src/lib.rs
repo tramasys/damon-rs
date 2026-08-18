@@ -47,8 +47,8 @@ pub use monitor::{
     AttachedHierarchy, DEFAULT_SESSION_LOCK_PATH, Damon, ExclusiveSession, FvaddrSessionBuilder,
     HierarchyReadBatch, HierarchyRuntimeBatch, ManagedHierarchy, ManagedKdamond, Monitor,
     MonitorBuilder, PaddrSessionBuilder, PersistentKdamondIdentity, PersistentReceipt,
-    ProcessTarget, RuntimeBatch, RuntimeReadBatch, SnapshotOutcome, SnapshotRequest, SnapshotWait,
-    VaddrSessionBuilder,
+    ProcessTarget, RuntimeBatch, RuntimeReadBatch, SnapshotOutcome, SnapshotRequest,
+    SnapshotStartError, SnapshotWait, VaddrSessionBuilder,
 };
 pub use region::{
     ProbeHit, RawRegion, RawSnapshot, Region, RegionIter, ScopedSnapshot, Snapshot,
