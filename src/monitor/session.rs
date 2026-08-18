@@ -1,14 +1,12 @@
 //! Exclusive ownership, staging, rollback, and session lifecycle.
 
 use super::{
-    AddressUnit, Capabilities, ConfigurationSnapshot, DEFAULT_SESSION_LOCK_PATH, DamonAdmin,
-    DamonConfig, Error, FvaddrSessionBuilder, Kdamond, KdamondCommand, KdamondState,
-    MonitorBuilder, MonitoringIntervals, PaddrSessionBuilder, Path, PathBuf, Pid, RawSnapshot,
-    Result, RuntimeBatch, SchemeStats, SessionLock, StagedConfiguration, StagedOwnership,
-    VaddrSessionBuilder, WorkflowOptions, ensure_hierarchy_stopped,
+    AddressUnit, Capabilities, DEFAULT_SESSION_LOCK_PATH, DamonAdmin, DamonConfig, Error,
+    FvaddrSessionBuilder, KdamondCommand, ManagedHierarchy, MonitorBuilder, PaddrSessionBuilder,
+    Path, PathBuf, Pid, RawSnapshot, Result, RuntimeBatch, SchemeStats, SessionLock,
+    StagedConfiguration, VaddrSessionBuilder, WorkflowOptions, ensure_hierarchy_stopped,
     replaceable_configuration_read_error, restore_after_capability_probe, restore_configuration,
-    retry_busy, running_thread_pid, stage_and_verify_configuration, stage_capability_probe,
-    with_rollback,
+    retry_busy, stage_and_verify_configuration, stage_capability_probe, with_rollback,
 };
 
 /// Entry point for high-level DAMON monitoring.
@@ -105,6 +103,24 @@ impl Damon {
             .map(drop)
     }
 
+    /// Stages and cooperatively owns a complete runnable DAMON hierarchy.
+    ///
+    /// Every kdamond is initially stopped. The returned hierarchy retains the
+    /// advisory lock and restores the preceding stopped configuration when
+    /// explicitly closed or dropped.
+    pub fn managed_hierarchy(&self, config: &DamonConfig) -> Result<ManagedHierarchy> {
+        config.validate_runnable()?;
+        let session_lock = SessionLock::acquire(&self.lock_path)?;
+        let staged_configuration =
+            self.stage_validated_configuration_locked(&session_lock, config)?;
+        ManagedHierarchy::new(
+            self.admin.clone(),
+            staged_configuration,
+            config,
+            session_lock,
+        )
+    }
+
     /// Stages a complete configuration and retains exclusive cooperative
     /// ownership until the returned session is closed or dropped.
     ///
@@ -118,31 +134,8 @@ impl Damon {
                 reason: "must contain exactly one kdamond",
             });
         }
-        config.validate_runnable()?;
-        let session_lock = SessionLock::acquire(&self.lock_path)?;
-        let staged_configuration =
-            self.stage_validated_configuration_locked(&session_lock, config)?;
-        let kdamond = self.admin.kdamond(0);
-        let staged = StagedOwnership::new(
-            staged_configuration.fingerprint,
-            &kdamond,
-            &config.kdamonds[0],
-        );
-        if let Err(operation) = staged.verify(&self.admin) {
-            return Err(with_rollback(
-                operation,
-                restore_configuration(&self.admin, &staged_configuration.previous),
-            ));
-        }
-
         Ok(ExclusiveSession {
-            admin: self.admin.clone(),
-            kdamond,
-            previous: staged_configuration.previous,
-            staged,
-            state: SessionState::Staged,
-            _session_lock: session_lock,
-            owns_hierarchy: true,
+            managed: self.managed_hierarchy(config)?,
         })
     }
 
@@ -230,14 +223,6 @@ impl Damon {
     }
 }
 
-#[derive(Debug)]
-enum SessionState {
-    Staged,
-    Running(Pid),
-    UnidentifiedRunning,
-    Closed,
-}
-
 /// A cooperatively exclusive, transactionally staged DAMON session.
 ///
 /// The session holds the advisory lock for its entire lifetime. It verifies
@@ -251,97 +236,42 @@ enum SessionState {
 /// the kernel provides no ownership primitive.
 #[derive(Debug)]
 pub struct ExclusiveSession {
-    pub(super) admin: DamonAdmin,
-    pub(super) kdamond: Kdamond,
-    previous: ConfigurationSnapshot,
-    staged: StagedOwnership,
-    state: SessionState,
-    _session_lock: SessionLock,
-    owns_hierarchy: bool,
+    managed: ManagedHierarchy,
 }
 
 impl ExclusiveSession {
     /// Starts the staged kdamond and records its kernel-thread identity.
     pub fn start(&mut self) -> Result<()> {
-        match self.state {
-            SessionState::Staged => {}
-            SessionState::Running(_) => return Err(Error::KdamondRunning { index: 0 }),
-            SessionState::UnidentifiedRunning => {
-                return Err(Error::OwnershipLost {
-                    reason: "the kdamond started but its identity was not captured",
-                });
-            }
-            SessionState::Closed => return Err(Error::NotRunning),
-        }
-        self.staged.verify(&self.admin)?;
-        match retry_busy(|| self.kdamond.state())? {
-            KdamondState::Off => {}
-            KdamondState::On => {
-                return Err(Error::OwnershipLost {
-                    reason: "the staged kdamond was started by another controller",
-                });
-            }
-            KdamondState::Unknown(state) => {
-                return Err(Error::UnexpectedKdamondState { state });
-            }
-        }
-
-        retry_busy(|| self.kdamond.command(&KdamondCommand::On))?;
-        self.state = SessionState::UnidentifiedRunning;
-        let pid = running_thread_pid(&self.kdamond)?;
-        self.state = SessionState::Running(pid);
-        self.verify_running()
+        self.managed.start_all()
     }
 
     /// Stops the kdamond while retaining the staged configuration and lock.
     pub fn stop(&mut self) -> Result<()> {
-        self.stop_inner()
+        self.managed.stop_all()
     }
 
     /// Stops the kdamond and restores the hierarchy that preceded the session.
     ///
     /// Unlike [`Drop`], this method reports restoration failures.
     pub fn close(mut self) -> Result<()> {
-        self.close_inner()
+        self.managed.close_inner()
     }
 
     /// Returns whether this session's identified kdamond is still running.
     pub fn is_running(&self) -> Result<bool> {
-        match self.state {
-            SessionState::Staged => {
-                self.staged.verify(&self.admin)?;
-                match retry_busy(|| self.kdamond.state())? {
-                    KdamondState::Off => Ok(false),
-                    KdamondState::On => Err(Error::OwnershipLost {
-                        reason: "the staged kdamond was started by another controller",
-                    }),
-                    KdamondState::Unknown(state) => Err(Error::UnexpectedKdamondState { state }),
-                }
-            }
-            SessionState::Running(_) => match self.verify_running() {
-                Ok(()) => Ok(true),
-                Err(Error::NotRunning) => Ok(false),
-                Err(error) => Err(error),
-            },
-            SessionState::UnidentifiedRunning => Err(Error::OwnershipLost {
-                reason: "the kdamond started but its identity was not captured",
-            }),
-            SessionState::Closed => Ok(false),
-        }
+        self.managed.is_running(0)
     }
 
     /// Reads the complete staged configuration after verifying ownership.
     pub fn configuration(&self) -> Result<DamonConfig> {
-        self.verify_owned_state()?;
-        let configuration = retry_busy(|| self.admin.configuration())?;
-        self.verify_owned_state()?;
-        Ok(configuration)
+        self.managed.configuration()
     }
 
     /// Discovers capabilities for a staged context and scheme without mutation.
     pub fn capabilities(&self, context_index: usize, scheme_index: usize) -> Result<Capabilities> {
         self.verify_owned_state()?;
-        let capabilities = retry_busy(|| self.kdamond.capabilities(context_index, scheme_index))?;
+        let kdamond = self.managed.kdamond(0);
+        let capabilities = retry_busy(|| kdamond.capabilities(context_index, scheme_index))?;
         self.verify_owned_state()?;
         Ok(capabilities)
     }
@@ -352,47 +282,21 @@ impl ExclusiveSession {
         scheme_indices: &[usize],
     ) -> Result<Capabilities> {
         self.verify_owned_state()?;
-        let capabilities = retry_busy(|| {
-            self.kdamond
-                .capabilities_for_schemes(context_index, scheme_indices)
-        })?;
+        let kdamond = self.managed.kdamond(0);
+        let capabilities =
+            retry_busy(|| kdamond.capabilities_for_schemes(context_index, scheme_indices))?;
         self.verify_owned_state()?;
         Ok(capabilities)
     }
 
     pub(super) fn replace_staged_configuration(&mut self, config: &DamonConfig) -> Result<()> {
-        config.validate_runnable()?;
         if config.kdamonds.len() != 1 {
             return Err(Error::InvalidConfiguration {
                 field: "exclusive session kdamond count",
                 reason: "must contain exactly one kdamond",
             });
         }
-        if !matches!(self.state, SessionState::Staged) {
-            return Err(Error::KdamondRunning { index: 0 });
-        }
-        self.staged.verify(&self.admin)?;
-        retry_busy(|| ensure_hierarchy_stopped(&self.admin))?;
-        let previous = retry_busy(|| self.admin.configuration())?;
-        self.staged.verify(&self.admin)?;
-
-        match stage_and_verify_configuration(&self.admin, config, Some(&previous)) {
-            Ok(fingerprint) => {
-                self.staged = StagedOwnership::new(fingerprint, &self.kdamond, &config.kdamonds[0]);
-                Ok(())
-            }
-            Err(operation) => match stage_and_verify_configuration(&self.admin, &previous, None) {
-                Ok(fingerprint) => {
-                    self.staged =
-                        StagedOwnership::new(fingerprint, &self.kdamond, &previous.kdamonds[0]);
-                    Err(operation)
-                }
-                Err(rollback) => Err(Error::Rollback {
-                    operation: Box::new(operation),
-                    rollback: Box::new(rollback),
-                }),
-            },
-        }
+        self.managed.replace_staged_configuration(config)
     }
 
     /// Applies the currently staged inputs to the running kdamond.
@@ -416,34 +320,13 @@ impl ExclusiveSession {
     /// Controllers that ignore the advisory lock can still interfere because
     /// sysfs has no ownership or atomic-commit primitive.
     pub fn update_configuration(&mut self, config: &DamonConfig) -> Result<()> {
-        config.validate_running_update()?;
         if config.kdamonds.len() != 1 {
             return Err(Error::InvalidConfiguration {
                 field: "exclusive session kdamond count",
                 reason: "must contain exactly one kdamond",
             });
         }
-        self.verify_running()?;
-        let previous = retry_busy(|| self.admin.configuration())?;
-        self.verify_running()?;
-        validate_obsolete_target_updates(&previous, config)?;
-
-        match self.stage_and_commit_running(config, Some(&previous)) {
-            Ok(staged) => {
-                self.staged = staged;
-                Ok(())
-            }
-            Err(operation) => match self.stage_and_commit_running(&previous, None) {
-                Ok(staged) => {
-                    self.staged = staged;
-                    Err(operation)
-                }
-                Err(rollback) => Err(Error::Rollback {
-                    operation: Box::new(operation),
-                    rollback: Box::new(rollback),
-                }),
-            },
-        }
+        self.managed.update_configuration(config, &[0])
     }
 
     /// Applies staged DAMOS quota-goal changes to the running kdamond.
@@ -587,7 +470,8 @@ impl ExclusiveSession {
 
     fn set_context_paused(&mut self, context_index: usize, paused: bool) -> Result<()> {
         self.verify_running()?;
-        let context_count = self.kdamond.context_count()?;
+        let kdamond = self.managed.kdamond(0);
+        let context_count = kdamond.context_count()?;
         if context_index >= context_count {
             return Err(Error::IndexOutOfBounds {
                 kind: "context",
@@ -595,7 +479,7 @@ impl ExclusiveSession {
                 count: context_count,
             });
         }
-        let context = self.kdamond.context(context_index);
+        let context = kdamond.context(context_index);
         if !context.pause_control_available()? {
             return Err(Error::UnsupportedFeature {
                 feature: "DAMON context pause",
@@ -605,11 +489,11 @@ impl ExclusiveSession {
         if previous == paused {
             return Ok(());
         }
-        let previous_fingerprint = self.staged.configuration.clone();
+        let previous_fingerprint = self.managed.staged.configuration.clone();
         let pause_path = context.path().join("pause");
         context.set_paused(paused)?;
         let operation = (|| {
-            retry_busy(|| self.kdamond.command(&KdamondCommand::Commit))?;
+            retry_busy(|| kdamond.command(&KdamondCommand::Commit))?;
             self.verify_running_identity_only()?;
             let observed = context.is_paused()?;
             if observed != paused {
@@ -619,24 +503,24 @@ impl ExclusiveSession {
                     observed: observed.to_string().into(),
                 });
             }
-            let refreshed = self.staged.configuration.refreshed_paths_except(
+            let refreshed = self.managed.staged.configuration.refreshed_paths_except(
                 std::slice::from_ref(&pause_path),
-                &self.staged.volatile_paths,
+                &self.managed.staged.volatile_paths,
             )?;
             self.verify_running_identity_only()?;
-            self.staged.configuration = refreshed;
+            self.managed.staged.configuration = refreshed;
             Ok(())
         })();
         if let Err(operation) = operation {
             let rollback = (|| {
                 context.set_paused(previous)?;
-                retry_busy(|| self.kdamond.command(&KdamondCommand::Commit))?;
+                retry_busy(|| kdamond.command(&KdamondCommand::Commit))?;
                 let restored = previous_fingerprint.refreshed_paths_except(
                     std::slice::from_ref(&pause_path),
-                    &self.staged.volatile_paths,
+                    &self.managed.staged.volatile_paths,
                 )?;
                 self.verify_running_identity_only()?;
-                self.staged.configuration = restored;
+                self.managed.staged.configuration = restored;
                 Ok(())
             })();
             return Err(with_rollback(operation, rollback));
@@ -644,74 +528,8 @@ impl ExclusiveSession {
         Ok(())
     }
 
-    fn stage_and_commit_running(
-        &self,
-        config: &DamonConfig,
-        observed: Option<&DamonConfig>,
-    ) -> Result<StagedOwnership> {
-        self.verify_running_identity_only()?;
-        retry_busy(|| {
-            self.verify_running_identity_only()?;
-            self.admin
-                .stage_validated_configuration_from(config, observed)
-        })?;
-        self.verify_running_identity_only()?;
-        let snapshot = retry_busy(|| self.admin.configuration_snapshot())?;
-        let mut staged_config = retry_busy(|| self.admin.configuration())?;
-        normalize_running_tuned_intervals(config, observed, &mut staged_config)?;
-        if let Some(error) = config.mismatch_error(&staged_config) {
-            return Err(error);
-        }
-        if !retry_busy(|| snapshot.values_match_current())? {
-            return Err(Error::OwnershipLost {
-                reason: "the running DAMON hierarchy changed during staging",
-            });
-        }
-        self.verify_running_identity_only()?;
-        retry_busy(|| self.kdamond.command(&KdamondCommand::Commit))?;
-        self.verify_running_identity_only()?;
-
-        if contains_obsolete_targets(config) {
-            let cleaned = without_obsolete_targets(config);
-            retry_busy(|| {
-                self.verify_running_identity_only()?;
-                self.admin
-                    .stage_validated_configuration_from(&cleaned, Some(config))
-            })?;
-            self.verify_running_identity_only()?;
-            let cleaned_snapshot = retry_busy(|| self.admin.configuration_snapshot())?;
-            let mut cleaned_staged_config = retry_busy(|| self.admin.configuration())?;
-            normalize_running_tuned_intervals(&cleaned, Some(config), &mut cleaned_staged_config)?;
-            if let Some(error) = cleaned.mismatch_error(&cleaned_staged_config) {
-                return Err(error);
-            }
-            if !retry_busy(|| cleaned_snapshot.values_match_current())? {
-                return Err(Error::OwnershipLost {
-                    reason: "the running DAMON hierarchy changed during obsolete-target cleanup",
-                });
-            }
-            self.verify_running_identity_only()?;
-            let staged = StagedOwnership::new(
-                cleaned_snapshot.into_fingerprint(),
-                &self.kdamond,
-                &cleaned.kdamonds[0],
-            );
-            staged.verify(&self.admin)?;
-            return Ok(staged);
-        }
-
-        let staged = StagedOwnership::new(
-            snapshot.into_fingerprint(),
-            &self.kdamond,
-            &config.kdamonds[0],
-        );
-        staged.verify(&self.admin)?;
-        Ok(staged)
-    }
-
     fn command_after_ownership_check(&self, command: &KdamondCommand) -> Result<()> {
-        self.verify_running()?;
-        retry_busy(|| self.kdamond.command(command))
+        self.managed.command_after_ownership_check(0, command)
     }
 
     pub(super) fn scheme(
@@ -719,7 +537,8 @@ impl ExclusiveSession {
         context_index: usize,
         scheme_index: usize,
     ) -> Result<crate::sysfs::Scheme> {
-        let context_count = self.kdamond.context_count()?;
+        let kdamond = self.managed.kdamond(0);
+        let context_count = kdamond.context_count()?;
         if context_index >= context_count {
             return Err(Error::IndexOutOfBounds {
                 kind: "context",
@@ -727,7 +546,7 @@ impl ExclusiveSession {
                 count: context_count,
             });
         }
-        let context = self.kdamond.context(context_index);
+        let context = kdamond.context(context_index);
         let scheme_count = context.scheme_count()?;
         if scheme_index >= scheme_count {
             return Err(Error::IndexOutOfBounds {
@@ -739,212 +558,23 @@ impl ExclusiveSession {
         Ok(context.scheme(scheme_index))
     }
 
+    pub(super) fn kdamond(&self) -> crate::sysfs::Kdamond {
+        self.managed.kdamond(0)
+    }
+
     fn verify_owned_state(&self) -> Result<()> {
-        match self.state {
-            SessionState::Staged => self.staged.verify(&self.admin),
-            SessionState::Running(_) => self.verify_running(),
-            SessionState::UnidentifiedRunning => Err(Error::OwnershipLost {
-                reason: "the kdamond started but its identity was not captured",
-            }),
-            SessionState::Closed => Err(Error::NotRunning),
-        }
+        self.managed.verify_owned_state()
     }
 
     fn verify_running(&self) -> Result<()> {
-        let SessionState::Running(expected) = self.state else {
-            return Err(Error::NotRunning);
-        };
-        self.staged.verify(&self.admin)?;
-        let current = running_thread_pid(&self.kdamond)?;
-        if current != expected {
-            return Err(Error::OwnershipLost {
-                reason: "the kdamond kernel-thread ID changed",
-            });
-        }
-        Ok(())
+        self.managed.verify_running(0)
     }
 
     fn verify_running_identity(&self) -> Result<()> {
-        self.staged.verify(&self.admin)?;
-        self.verify_running_identity_only()
+        self.managed.verify_running_identity(0)
     }
 
     pub(super) fn verify_running_identity_only(&self) -> Result<()> {
-        let SessionState::Running(expected) = self.state else {
-            return Err(Error::NotRunning);
-        };
-        if self.admin.kdamond_count()? != 1 {
-            return Err(Error::OwnershipLost {
-                reason: "the staged kdamond count changed",
-            });
-        }
-        let current = retry_busy(|| self.kdamond.pid())?.ok_or(Error::NotRunning)?;
-        if current != expected {
-            return Err(Error::OwnershipLost {
-                reason: "the kdamond kernel-thread ID changed",
-            });
-        }
-        Ok(())
-    }
-
-    fn stop_inner(&mut self) -> Result<()> {
-        match self.state {
-            SessionState::Staged => {
-                self.staged.verify(&self.admin)?;
-                match retry_busy(|| self.kdamond.state())? {
-                    KdamondState::Off => Ok(()),
-                    KdamondState::On => Err(Error::OwnershipLost {
-                        reason: "the staged kdamond was started by another controller",
-                    }),
-                    KdamondState::Unknown(state) => Err(Error::UnexpectedKdamondState { state }),
-                }
-            }
-            SessionState::Running(_) => {
-                self.staged.verify(&self.admin)?;
-                match retry_busy(|| self.kdamond.state())? {
-                    KdamondState::On => {
-                        self.verify_running_identity_only()?;
-                        retry_busy(|| self.kdamond.command(&KdamondCommand::Off))?;
-                        self.staged.verify(&self.admin)?;
-                        match retry_busy(|| self.kdamond.state())? {
-                            KdamondState::Off => {
-                                self.state = SessionState::Staged;
-                                Ok(())
-                            }
-                            KdamondState::On => Err(Error::OwnershipLost {
-                                reason: "the kdamond restarted while it was being stopped",
-                            }),
-                            KdamondState::Unknown(state) => {
-                                Err(Error::UnexpectedKdamondState { state })
-                            }
-                        }
-                    }
-                    KdamondState::Off => {
-                        self.staged.verify(&self.admin)?;
-                        self.state = SessionState::Staged;
-                        Ok(())
-                    }
-                    KdamondState::Unknown(state) => Err(Error::UnexpectedKdamondState { state }),
-                }
-            }
-            SessionState::UnidentifiedRunning => {
-                self.staged.verify(&self.admin)?;
-                match retry_busy(|| self.kdamond.state())? {
-                    KdamondState::Off => {
-                        self.state = SessionState::Staged;
-                        Ok(())
-                    }
-                    KdamondState::On => Err(Error::OwnershipLost {
-                        reason: "cannot safely stop a kdamond before its kernel-thread ID was captured",
-                    }),
-                    KdamondState::Unknown(state) => Err(Error::UnexpectedKdamondState { state }),
-                }
-            }
-            SessionState::Closed => Ok(()),
-        }
-    }
-
-    fn close_inner(&mut self) -> Result<()> {
-        if !self.owns_hierarchy {
-            return Ok(());
-        }
-        self.stop_inner()?;
-        self.staged.verify(&self.admin)?;
-        if !retry_busy(|| self.previous.matches_current())? {
-            restore_configuration(&self.admin, &self.previous)?;
-        }
-        self.owns_hierarchy = false;
-        self.state = SessionState::Closed;
-        Ok(())
-    }
-}
-
-fn validate_obsolete_target_updates(previous: &DamonConfig, requested: &DamonConfig) -> Result<()> {
-    for (previous_kdamond, requested_kdamond) in previous.kdamonds.iter().zip(&requested.kdamonds) {
-        for (previous_context, requested_context) in previous_kdamond
-            .contexts
-            .iter()
-            .zip(&requested_kdamond.contexts)
-        {
-            for (index, requested_target) in requested_context.targets.iter().enumerate() {
-                if !requested_target.obsolete {
-                    continue;
-                }
-                let Some(previous_target) = previous_context.targets.get(index) else {
-                    return Err(Error::InvalidConfiguration {
-                        field: "obsolete target",
-                        reason: "must identify an existing target at the same index",
-                    });
-                };
-                let mut retained_target = requested_target.clone();
-                retained_target.obsolete = false;
-                if previous_target.obsolete || retained_target != *previous_target {
-                    return Err(Error::InvalidConfiguration {
-                        field: "obsolete target",
-                        reason: "must match the existing target at the same index",
-                    });
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn contains_obsolete_targets(config: &DamonConfig) -> bool {
-    config.kdamonds.iter().any(|kdamond| {
-        kdamond
-            .contexts
-            .iter()
-            .any(|context| context.targets.iter().any(|target| target.obsolete))
-    })
-}
-
-fn without_obsolete_targets(config: &DamonConfig) -> DamonConfig {
-    let mut cleaned = config.clone();
-    for kdamond in &mut cleaned.kdamonds {
-        for context in &mut kdamond.contexts {
-            context.targets.retain(|target| !target.obsolete);
-        }
-    }
-    cleaned
-}
-
-fn normalize_running_tuned_intervals(
-    requested: &DamonConfig,
-    previous: Option<&DamonConfig>,
-    observed: &mut DamonConfig,
-) -> Result<()> {
-    for (kdamond_index, (requested_kdamond, observed_kdamond)) in requested
-        .kdamonds
-        .iter()
-        .zip(&mut observed.kdamonds)
-        .enumerate()
-    {
-        for (context_index, (requested_context, observed_context)) in requested_kdamond
-            .contexts
-            .iter()
-            .zip(&mut observed_kdamond.contexts)
-            .enumerate()
-        {
-            let was_tuned = previous
-                .and_then(|config| config.kdamonds.get(kdamond_index))
-                .and_then(|kdamond| kdamond.contexts.get(context_index))
-                .is_some_and(|context| context.intervals_goal.aggregation_intervals != 0);
-            if requested_context.intervals_goal.aggregation_intervals == 0 && !was_tuned {
-                continue;
-            }
-            observed_context.intervals = MonitoringIntervals::new(
-                requested_context.intervals.sample(),
-                requested_context.intervals.aggregation(),
-                observed_context.intervals.update(),
-            )?;
-        }
-    }
-    Ok(())
-}
-
-impl Drop for ExclusiveSession {
-    fn drop(&mut self) {
-        let _ = self.close_inner();
+        self.managed.verify_running_identity_only(0)
     }
 }

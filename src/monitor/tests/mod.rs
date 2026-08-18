@@ -10,6 +10,7 @@ use crate::sysfs::{
     SchemeFilterType, TargetConfig,
 };
 
+mod hierarchy;
 mod ownership;
 mod runtime;
 mod session;
@@ -124,6 +125,14 @@ fn transaction_config(pid: u32, action: Action) -> DamonConfig {
     kdamond.contexts.push(context);
     let mut config = DamonConfig::default();
     config.kdamonds.push(kdamond);
+    config
+}
+
+fn multi_transaction_config() -> DamonConfig {
+    let mut config = transaction_config(41, Action::Stat);
+    config
+        .kdamonds
+        .push(transaction_config(43, Action::Cold).kdamonds.remove(0));
     config
 }
 

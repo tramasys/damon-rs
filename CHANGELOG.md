@@ -21,6 +21,8 @@ This project follows Semantic Versioning and Keep a Changelog.
   rollback of known and unknown writable attributes
 - Generic exclusive sessions with runtime commands, explicit close, and
   restoration of preceding stopped configurations
+- Managed multi-kdamond lifecycle with per-thread identity checks, partial-start
+  rollback, selected online updates, and exact hierarchy restoration
 - Transactional online configuration updates and checked runtime batches
 - Advisory locking, ownership fingerprints, rollback, and cleanup
 - CI for formatting, linting, tests, docs, packaging, MSRV, architectures, and

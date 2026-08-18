@@ -9,7 +9,23 @@ use damon::sysfs::{
     QuotaConfig, QuotaGoalConfig, QuotaGoalMetric, RegionSizeRange, SampleControlConfig,
     SampleFilterConfig, SamplePrimitivesConfig, SchemeConfig, SchemeFilterType, TargetConfig,
 };
-use damon::{AddressUnit, Error, Pid, RegionBounds};
+use damon::{AddressUnit, Damon, Error, ManagedHierarchy, Pid, RegionBounds};
+
+#[test]
+fn managed_hierarchy_lifecycle_is_exposed_by_the_public_api() {
+    let api = (
+        Damon::managed_hierarchy as fn(&Damon, &DamonConfig) -> Result<ManagedHierarchy, Error>,
+        ManagedHierarchy::kdamond_count as fn(&ManagedHierarchy) -> usize,
+        ManagedHierarchy::start_all as fn(&mut ManagedHierarchy) -> Result<(), Error>,
+        ManagedHierarchy::stop_all as fn(&mut ManagedHierarchy) -> Result<(), Error>,
+        ManagedHierarchy::is_running as fn(&ManagedHierarchy, usize) -> Result<bool, Error>,
+        ManagedHierarchy::configuration as fn(&ManagedHierarchy) -> Result<DamonConfig, Error>,
+        ManagedHierarchy::update_configuration
+            as fn(&mut ManagedHierarchy, &DamonConfig, &[usize]) -> Result<(), Error>,
+        ManagedHierarchy::close as fn(ManagedHierarchy) -> Result<(), Error>,
+    );
+    std::hint::black_box(api);
+}
 
 #[test]
 fn owned_configuration_is_constructible_from_the_public_api() {

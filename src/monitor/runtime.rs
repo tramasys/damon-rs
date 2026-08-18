@@ -103,6 +103,6 @@ impl RuntimeBatch<'_> {
 
     fn issue_command(&self, command: &KdamondCommand) -> Result<()> {
         self.session.verify_running_identity_only()?;
-        retry_busy(|| self.session.kdamond.command(command))
+        retry_busy(|| self.session.kdamond().command(command))
     }
 }

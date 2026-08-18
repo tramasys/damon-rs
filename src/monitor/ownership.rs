@@ -2,8 +2,8 @@
 
 use super::{
     Capabilities, CapabilitySupport, ConfigurationFingerprint, ConfigurationSnapshot, DamonAdmin,
-    DamonConfig, Duration, Error, File, Kdamond, KdamondConfig, KdamondState, OpenOptions, Path,
-    PathBuf, Pid, Result, SysfsFeature, io,
+    DamonConfig, Duration, Error, File, Kdamond, KdamondState, OpenOptions, Path, PathBuf, Pid,
+    Result, SysfsFeature, io,
 };
 
 pub(super) struct StagedConfiguration {
@@ -140,42 +140,69 @@ pub(super) fn restore_after_capability_probe(
 pub(super) struct StagedOwnership {
     pub(super) configuration: ConfigurationFingerprint,
     pub(super) volatile_paths: Box<[PathBuf]>,
+    kdamond_count: usize,
 }
 
 impl StagedOwnership {
     pub(super) fn new(
         configuration: ConfigurationFingerprint,
-        kdamond: &Kdamond,
-        config: &KdamondConfig,
+        admin: &DamonAdmin,
+        config: &DamonConfig,
     ) -> Self {
         let mut volatile_paths = Vec::new();
-        for (index, context) in config.contexts.iter().enumerate() {
-            if context.intervals_goal.aggregation_intervals == 0 {
-                continue;
+        for (kdamond_index, kdamond_config) in config.kdamonds.iter().enumerate() {
+            let kdamond = admin.kdamond(kdamond_index);
+            for (context_index, context) in kdamond_config.contexts.iter().enumerate() {
+                if context.intervals_goal.aggregation_intervals == 0 {
+                    continue;
+                }
+                let intervals = kdamond
+                    .context(context_index)
+                    .path()
+                    .join("monitoring_attrs/intervals");
+                volatile_paths.push(intervals.join("sample_us"));
+                volatile_paths.push(intervals.join("aggr_us"));
             }
-            let intervals = kdamond
-                .context(index)
-                .path()
-                .join("monitoring_attrs/intervals");
-            volatile_paths.push(intervals.join("sample_us"));
-            volatile_paths.push(intervals.join("aggr_us"));
         }
         volatile_paths.sort_unstable();
         Self {
             configuration,
             volatile_paths: volatile_paths.into_boxed_slice(),
+            kdamond_count: config.kdamonds.len(),
         }
     }
 
     pub(super) fn verify(&self, admin: &DamonAdmin) -> Result<()> {
-        if admin.kdamond_count()? != 1 {
+        self.verify_count(admin)?;
+        if !self
+            .configuration
+            .matches_current_except(&self.volatile_paths)?
+        {
+            return Err(Error::OwnershipLost {
+                reason: "the staged writable configuration changed",
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_count(&self, admin: &DamonAdmin) -> Result<()> {
+        if admin.kdamond_count()? != self.kdamond_count {
             return Err(Error::OwnershipLost {
                 reason: "the staged kdamond count changed",
             });
         }
+        Ok(())
+    }
+
+    pub(super) fn verify_kdamond_configuration(
+        &self,
+        admin: &DamonAdmin,
+        index: usize,
+    ) -> Result<()> {
+        let kdamond = admin.kdamond(index);
         if !self
             .configuration
-            .matches_current_except(&self.volatile_paths)?
+            .matches_current_under_except(kdamond.path(), &self.volatile_paths)?
         {
             return Err(Error::OwnershipLost {
                 reason: "the staged writable configuration changed",

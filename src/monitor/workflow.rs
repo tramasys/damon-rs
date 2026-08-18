@@ -370,7 +370,13 @@ fn start_workflow(
         }
     };
     if let Err(error) = session.start() {
-        return Err(with_rollback(error, session.close()));
+        let start_rollback_failed = matches!(error, Error::Rollback { .. });
+        let close = session.close();
+        return Err(if start_rollback_failed {
+            error
+        } else {
+            with_rollback(error, close)
+        });
     }
     capabilities.confirm_operation(&operation);
 

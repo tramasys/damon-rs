@@ -17,11 +17,13 @@ use crate::{
 /// Conventional advisory lock used by high-level DAMON sessions.
 pub const DEFAULT_SESSION_LOCK_PATH: &str = "/run/lock/damon-rs.lock";
 
+mod hierarchy;
 mod ownership;
 mod runtime;
 mod session;
 mod workflow;
 
+pub use hierarchy::ManagedHierarchy;
 pub use runtime::RuntimeBatch;
 pub use session::{Damon, ExclusiveSession};
 pub use workflow::*;

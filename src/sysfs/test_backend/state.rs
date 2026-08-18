@@ -494,16 +494,23 @@ impl State {
         Ok(false)
     }
 
-    pub(super) fn capture_active_files(&mut self) {
-        self.active_files = Some(
-            self.nodes
-                .iter()
-                .filter_map(|(path, node)| match node {
+    pub(super) fn capture_active_files(&mut self, kdamond: &Path) {
+        let staged = self
+            .nodes
+            .iter()
+            .filter_map(|(path, node)| {
+                if !path.starts_with(kdamond) {
+                    return None;
+                }
+                match node {
                     Node::File(value) => Some((path.clone(), value.clone())),
                     Node::Directory => None,
-                })
-                .collect(),
-        );
+                }
+            })
+            .collect::<Vec<_>>();
+        let active = self.active_files.get_or_insert_default();
+        active.retain(|path, _| !path.starts_with(kdamond));
+        active.extend(staged);
     }
 
     pub(super) fn validate_sample_primitives(&self, kdamond: &Path) -> io::Result<()> {
@@ -527,12 +534,13 @@ impl State {
         Ok(())
     }
 
-    pub(super) fn commit_quota_goals(&mut self) {
+    pub(super) fn commit_quota_goals(&mut self, kdamond: &Path) {
         let staged_goals: Vec<_> = self
             .nodes
             .iter()
             .filter_map(|(path, node)| {
-                if !path.to_string_lossy().contains("/quotas/goals/") {
+                if !path.starts_with(kdamond) || !path.to_string_lossy().contains("/quotas/goals/")
+                {
                     return None;
                 }
                 match node {
@@ -545,7 +553,9 @@ impl State {
             .active_files
             .as_mut()
             .expect("running model has active files");
-        active.retain(|path, _| !path.to_string_lossy().contains("/quotas/goals/"));
+        active.retain(|path, _| {
+            !path.starts_with(kdamond) || !path.to_string_lossy().contains("/quotas/goals/")
+        });
         active.extend(staged_goals);
     }
 
@@ -678,7 +688,7 @@ impl State {
             return Err(io::Error::from_raw_os_error(22));
         }
         self.validate_sample_primitives(kdamond)?;
-        self.capture_active_files();
+        self.capture_active_files(kdamond);
         self.next_kdamond_pid += 1;
         self.file(kdamond.join("state"), b"on\n");
         self.file(
@@ -720,11 +730,11 @@ impl State {
             "commit" => {
                 self.ensure_running(path)?;
                 self.validate_sample_primitives(kdamond)?;
-                self.capture_active_files();
+                self.capture_active_files(kdamond);
             }
             "commit_schemes_quota_goals" => {
                 self.ensure_running(path)?;
-                self.commit_quota_goals();
+                self.commit_quota_goals(kdamond);
             }
             "update_schemes_tried_regions" => {
                 self.ensure_running(path)?;

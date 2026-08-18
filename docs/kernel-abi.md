@@ -31,6 +31,13 @@ kdamond thread ID. Identity is rechecked around runtime commands and cleanup.
 Explicit close restores the preceding hierarchy. Drop attempts the same
 restoration without reporting errors.
 
+`Damon::managed_hierarchy()` applies this ownership model to multiple
+kdamonds. Starts proceed in index order with immediate thread ID capture. A
+later failure stops already identified threads in reverse order. Online
+updates stage the complete hierarchy once and commit only the selected
+kdamonds. Stop and cleanup continue across indexes but never issue `off` for a
+slot whose writable configuration or recorded thread ID no longer matches.
+
 Auto-tuned `sample_us` and `aggr_us` values are kernel-volatile while interval
 tuning is enabled, so ownership checks ignore those two leaves. All other
 captured writable values remain fingerprinted.

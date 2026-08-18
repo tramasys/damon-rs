@@ -43,6 +43,28 @@ impl ConfigurationFingerprint {
         Ok(true)
     }
 
+    pub(crate) fn matches_current_under_except(
+        &self,
+        root: &Path,
+        ignored: &[PathBuf],
+    ) -> Result<bool> {
+        let first = self
+            .entries
+            .partition_point(|entry| entry.path.as_path() < root);
+        for entry in self.entries[first..]
+            .iter()
+            .take_while(|entry| entry.path.starts_with(root))
+        {
+            if ignored.binary_search(&entry.path).is_ok() {
+                continue;
+            }
+            if !read_configuration_value_equals(&entry.path, entry.value.as_bytes())? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn refreshed_paths_except(
         &self,
         paths: &[PathBuf],

@@ -10,7 +10,8 @@ privileged admin sysfs ABI and is not a replacement for the
 - Typed low-level access to DAMON admin sysfs
 - Adaptive owned configuration through Linux 7.2 and current `damo` controls
 - Transactional whole-hierarchy staging with verified rollback
-- Generic exclusive sessions with runtime commands and exact restoration
+- Managed multi-kdamond hierarchies with per-thread ownership and exact restoration
+- Single-kdamond exclusive sessions with runtime commands
 - Runtime discovery for all 57 official `damo` sysfs capabilities
 - Checked address-unit conversion and sparse tried-region parsing
 - Advisory locking, ownership checks, rollback, and cleanup
@@ -81,6 +82,11 @@ against the kernel's operation-specific alignment before staging.
 single-kdamond `DamonConfig`. Explicit `close()` reports restoration failures,
 while `Drop` performs best-effort restoration.
 
+`Damon::managed_hierarchy()` owns any runnable multi-kdamond `DamonConfig`.
+It starts kdamonds in index order, records each kernel-thread ID, rolls back a
+partial start in reverse order, and supports transactional updates to selected
+kdamonds. It stops only identities that the hierarchy still owns.
+
 ## Capability discovery
 
 `Damon::capabilities()` exclusively stages a temporary hierarchy, probes
@@ -112,7 +118,8 @@ the session lock, rejects running kdamonds, verifies kernel read-back, and
 restores the preceding writable hierarchy if staging fails. Changed
 configurations write only differing leaves.
 
-Exclusive sessions can transactionally commit owned configuration updates.
+Managed hierarchies can transactionally commit selected owned kdamond updates.
+Exclusive sessions expose the same behavior for their single kdamond.
 Runtime reads support explicit synchronous refreshes, cached reads, and checked
 batches for lower polling overhead. High-level monitors also provide all-scheme
 statistics and quota reads that share one refresh and ownership scan.
