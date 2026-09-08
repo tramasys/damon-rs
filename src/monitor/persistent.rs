@@ -208,6 +208,7 @@ impl PersistentReceipt {
                 reason: "contains no configured kdamonds",
             });
         }
+        validate_receipt_configuration(&writable_values, &volatile_paths, kdamond_count)?;
         let identity_count = decoder.read_count()?;
         if identity_count > kdamond_count {
             return Err(Error::InvalidReceipt {
@@ -437,6 +438,112 @@ fn validate_relative_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_receipt_configuration(
+    writable_values: &[WritableConfigurationValue],
+    volatile_paths: &[PathBuf],
+    kdamond_count: usize,
+) -> Result<()> {
+    if writable_values
+        .windows(2)
+        .any(|values| values[0].path() >= values[1].path())
+    {
+        return Err(Error::InvalidReceipt {
+            reason: "writable configuration paths are not distinct and ordered",
+        });
+    }
+    if volatile_paths.windows(2).any(|paths| paths[0] >= paths[1]) {
+        return Err(Error::InvalidReceipt {
+            reason: "volatile configuration paths are not distinct and ordered",
+        });
+    }
+
+    let count_path = Path::new("kdamonds/nr_kdamonds");
+    let count_index = writable_values
+        .binary_search_by(|value| value.path().cmp(count_path))
+        .map_err(|_| Error::InvalidReceipt {
+            reason: "does not contain the kdamond count",
+        })?;
+    let recorded_count = writable_values[count_index]
+        .value()
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| Error::InvalidReceipt {
+            reason: "contains an invalid writable kdamond count",
+        })?;
+    if recorded_count != kdamond_count {
+        return Err(Error::InvalidReceipt {
+            reason: "contains inconsistent kdamond counts",
+        });
+    }
+
+    let expected_volatile = expected_volatile_paths(writable_values, kdamond_count)?;
+    if volatile_paths != expected_volatile {
+        return Err(Error::InvalidReceipt {
+            reason: "contains inconsistent auto-tuned interval paths",
+        });
+    }
+    Ok(())
+}
+
+fn expected_volatile_paths(
+    writable_values: &[WritableConfigurationValue],
+    kdamond_count: usize,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for value in writable_values {
+        let Some(intervals_path) = tuned_intervals_path(value.path(), kdamond_count) else {
+            continue;
+        };
+        let aggregation_intervals =
+            value
+                .value()
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| Error::InvalidReceipt {
+                    reason: "contains an invalid interval-goal aggregation count",
+                })?;
+        if aggregation_intervals == 0 {
+            continue;
+        }
+        for name in ["aggr_us", "sample_us"] {
+            let path = intervals_path.join(name);
+            if writable_values
+                .binary_search_by(|value| value.path().cmp(&path))
+                .is_err()
+            {
+                return Err(Error::InvalidReceipt {
+                    reason: "omits an auto-tuned writable interval",
+                });
+            }
+            paths.push(path);
+        }
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn tuned_intervals_path(path: &Path, kdamond_count: usize) -> Option<&Path> {
+    let mut components = path.iter();
+    if components.next()? != "kdamonds" {
+        return None;
+    }
+    let kdamond_index = components.next()?.to_str()?.parse::<usize>().ok()?;
+    if kdamond_index >= kdamond_count || components.next()? != "contexts" {
+        return None;
+    }
+    components.next()?.to_str()?.parse::<usize>().ok()?;
+    for expected in ["monitoring_attrs", "intervals", "intervals_goal", "aggrs"] {
+        if components.next()? != expected {
+            return None;
+        }
+    }
+    if components.next().is_some() {
+        return None;
+    }
+    path.parent()?.parent()
+}
+
 fn current_boot_id() -> Result<&'static str> {
     #[cfg(target_os = "linux")]
     {
@@ -453,10 +560,8 @@ fn current_boot_id() -> Result<&'static str> {
         })?;
         let value = value.trim();
         validate_boot_id(value)?;
-        let _ = BOOT_ID.set(value.into());
-        Ok(BOOT_ID
-            .get()
-            .expect("the validated Linux boot identifier was cached"))
+        let value: Box<str> = value.into();
+        Ok(BOOT_ID.get_or_init(|| value))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -549,17 +654,23 @@ impl<'a> Decoder<'a> {
     }
 
     fn read_u32(&mut self) -> Result<u32> {
-        let bytes = self.take(size_of::<u32>())?;
-        Ok(u32::from_le_bytes(
-            bytes.try_into().expect("the decoder returned four bytes"),
-        ))
+        let bytes = self
+            .take(size_of::<u32>())?
+            .try_into()
+            .map_err(|_| Error::InvalidReceipt {
+                reason: "contains an invalid 32-bit field",
+            })?;
+        Ok(u32::from_le_bytes(bytes))
     }
 
     fn read_u64(&mut self) -> Result<u64> {
-        let bytes = self.take(size_of::<u64>())?;
-        Ok(u64::from_le_bytes(
-            bytes.try_into().expect("the decoder returned eight bytes"),
-        ))
+        let bytes = self
+            .take(size_of::<u64>())?
+            .try_into()
+            .map_err(|_| Error::InvalidReceipt {
+                reason: "contains an invalid 64-bit field",
+            })?;
+        Ok(u64::from_le_bytes(bytes))
     }
 
     fn read_count(&mut self) -> Result<usize> {

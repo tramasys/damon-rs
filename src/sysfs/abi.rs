@@ -277,6 +277,42 @@ pub struct ByteSizeRange {
     max: u64,
 }
 
+/// An inclusive range of monitoring-probe hit weighted sums.
+///
+/// The DAMON sysfs ABI stores these values in the same `min` and `max` files
+/// used by huge-page-size filters, but they are dimensionless rather than byte
+/// counts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProbeHitsWeightedSumRange {
+    min: u64,
+    max: u64,
+}
+
+impl ProbeHitsWeightedSumRange {
+    /// Creates a validated inclusive weighted-sum range.
+    pub const fn new(min: u64, max: u64) -> Result<Self> {
+        if min > max {
+            return Err(Error::InvalidConfiguration {
+                field: "probe hits weighted sum range",
+                reason: "minimum must not exceed maximum",
+            });
+        }
+        Ok(Self { min, max })
+    }
+
+    /// Returns the inclusive minimum.
+    #[must_use]
+    pub const fn min(self) -> u64 {
+        self.min
+    }
+
+    /// Returns the inclusive maximum.
+    #[must_use]
+    pub const fn max(self) -> u64 {
+        self.max
+    }
+}
+
 impl ByteSizeRange {
     /// Creates a validated inclusive byte-size range.
     pub const fn new(min: u64, max: u64) -> Result<Self> {

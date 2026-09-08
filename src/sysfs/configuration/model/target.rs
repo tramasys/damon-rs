@@ -98,6 +98,12 @@ impl ProbeFilterConfig {
         if matches!(self.filter_type, ProbeFilterType::MemoryControlGroup) {
             validate_required_path("probe filter cgroup path", self.cgroup_path.as_deref())?;
         } else if let Some(path) = &self.cgroup_path {
+            if !matches!(self.filter_type, ProbeFilterType::Unknown(_)) {
+                return invalid(
+                    "probe filter payload",
+                    "a cgroup path belongs only to a memcg or unknown filter",
+                );
+            }
             validate_sysfs_string("probe filter cgroup path", path)?;
         }
         Ok(())
@@ -244,9 +250,27 @@ impl SampleFilterConfig {
         match self.filter_type {
             SampleFilterType::CpuMask => {
                 validate_required_path("sample filter CPU mask", self.cpu_mask.as_deref())?;
+                if self.thread_ids.is_some() {
+                    return invalid(
+                        "sample filter payload",
+                        "a thread list does not belong to a cpumask filter",
+                    );
+                }
             }
             SampleFilterType::Threads => {
                 validate_required_path("sample filter thread list", self.thread_ids.as_deref())?;
+                if self.cpu_mask.is_some() {
+                    return invalid(
+                        "sample filter payload",
+                        "a CPU mask does not belong to a threads filter",
+                    );
+                }
+            }
+            SampleFilterType::Write if self.cpu_mask.is_some() || self.thread_ids.is_some() => {
+                return invalid(
+                    "sample filter payload",
+                    "write filters do not accept a CPU mask or thread list",
+                );
             }
             _ => {}
         }

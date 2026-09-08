@@ -91,6 +91,9 @@ impl Model {
         state.expose_current_damo_extensions = true;
         state.supported_probe_filter_types = b"anon\nmemcg\npgidle_unset\npgidle_set\n".to_vec();
         state
+            .supported_scheme_filter_types
+            .extend_from_slice(b"probe_hits_wsum\n");
+        state
             .supported_scheme_actions
             .extend_from_slice(b"damos_alloc\ndamos_free\n");
         state

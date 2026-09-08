@@ -1,8 +1,9 @@
 use super::{
     ByteSizeRange, DestinationConfig, Error, FilterConfig, MigrationDestination, Path, PathBuf,
-    Result, SchemeFilter, SchemeFilterType, invalid_kernel_value, optional_pair, optional_read,
-    path_exists, read_bool, read_enum, read_i32, read_sysfs_string, read_u32, read_u64,
-    validate_count, validate_sysfs_string, write_bool, write_bytes, write_enum, write_value,
+    ProbeHitsWeightedSumRange, Result, SchemeFilter, SchemeFilterType, invalid_kernel_value,
+    optional_pair, optional_read, path_exists, read_bool, read_enum, read_i32, read_sysfs_string,
+    read_u32, read_u64, validate_count, validate_sysfs_string, write_bool, write_bytes, write_enum,
+    write_value,
 };
 
 impl SchemeFilter {
@@ -107,6 +108,26 @@ impl SchemeFilter {
         write_value(&self.path.join("max"), value)
     }
 
+    /// Reads the minimum monitoring-probe hit weighted sum.
+    pub fn minimum_probe_hits_weighted_sum(&self) -> Result<u64> {
+        read_u64(&self.path.join("min"))
+    }
+
+    /// Sets the minimum monitoring-probe hit weighted sum.
+    pub fn set_minimum_probe_hits_weighted_sum(&self, value: u64) -> Result<()> {
+        write_value(&self.path.join("min"), value)
+    }
+
+    /// Reads the maximum monitoring-probe hit weighted sum.
+    pub fn maximum_probe_hits_weighted_sum(&self) -> Result<u64> {
+        read_u64(&self.path.join("max"))
+    }
+
+    /// Sets the maximum monitoring-probe hit weighted sum.
+    pub fn set_maximum_probe_hits_weighted_sum(&self, value: u64) -> Result<()> {
+        write_value(&self.path.join("max"), value)
+    }
+
     /// Reads the filtered DAMON target index.
     pub fn target_index(&self) -> Result<usize> {
         let path = self.path.join("damon_target_idx");
@@ -141,6 +162,12 @@ impl SchemeFilter {
             }
             SchemeFilterType::Target => {
                 config.target_index = Some(self.target_index()?);
+            }
+            SchemeFilterType::ProbeHitsWeightedSum => {
+                config.probe_hits_weighted_sum_range = Some(ProbeHitsWeightedSumRange::new(
+                    self.minimum_probe_hits_weighted_sum()?,
+                    self.maximum_probe_hits_weighted_sum()?,
+                )?);
             }
             SchemeFilterType::Unknown(_) => {
                 config.cgroup_path =
@@ -182,6 +209,10 @@ impl SchemeFilter {
         }
         if let Some(index) = config.target_index {
             self.set_target_index(index)?;
+        }
+        if let Some(range) = config.probe_hits_weighted_sum_range {
+            self.set_minimum_probe_hits_weighted_sum(range.min())?;
+            self.set_maximum_probe_hits_weighted_sum(range.max())?;
         }
         Ok(())
     }

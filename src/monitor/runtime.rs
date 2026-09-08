@@ -599,23 +599,29 @@ fn cached_scheme(
             count,
         });
     }
-    if cached_context
-        .as_ref()
-        .is_none_or(|(cached_index, _, _)| *cached_index != context_index)
-    {
-        let context = kdamond.context(context_index);
-        let scheme_count = context.scheme_count()?;
-        *cached_context = Some((context_index, context, scheme_count));
+    if let Some((cached_index, context, scheme_count)) = cached_context.as_ref() {
+        if *cached_index == context_index {
+            if scheme_index >= *scheme_count {
+                return Err(Error::IndexOutOfBounds {
+                    kind: "scheme",
+                    index: scheme_index,
+                    count: *scheme_count,
+                });
+            }
+            return Ok(context.scheme(scheme_index));
+        }
     }
-    let (_, context, scheme_count) = cached_context
-        .as_ref()
-        .expect("the selected context was cached");
-    if scheme_index >= *scheme_count {
+
+    let context = kdamond.context(context_index);
+    let scheme_count = context.scheme_count()?;
+    if scheme_index >= scheme_count {
         return Err(Error::IndexOutOfBounds {
             kind: "scheme",
             index: scheme_index,
-            count: *scheme_count,
+            count: scheme_count,
         });
     }
-    Ok(context.scheme(scheme_index))
+    let scheme = context.scheme(scheme_index);
+    *cached_context = Some((context_index, context, scheme_count));
+    Ok(scheme)
 }

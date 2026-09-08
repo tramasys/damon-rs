@@ -5,9 +5,10 @@ use std::time::Duration;
 use damon::sysfs::{
     AccessCountRange, AccessPattern, Action, ByteSizeRange, ContextConfig, DamonConfig,
     FilterConfig, FilterLayer, InitialRegionConfig, KdamondConfig, Operation,
-    OperationAttributesConfig, ProbeConfig, ProbePreparationAction, ProbePreparationConfig,
-    QuotaConfig, QuotaGoalConfig, QuotaGoalMetric, RegionSizeRange, SampleControlConfig,
-    SampleFilterConfig, SamplePrimitivesConfig, SchemeConfig, SchemeFilterType, TargetConfig,
+    OperationAttributesConfig, ProbeConfig, ProbeHitsWeightedSumRange, ProbePreparationAction,
+    ProbePreparationConfig, QuotaConfig, QuotaGoalConfig, QuotaGoalMetric, RegionSizeRange,
+    SampleControlConfig, SampleFilterConfig, SamplePrimitivesConfig, SchemeConfig,
+    SchemeFilterType, TargetConfig,
 };
 use damon::{
     AddressUnit, Damon, Error, ManagedHierarchy, ManagedKdamond, Pid, ProcessTarget, RegionBounds,
@@ -60,6 +61,11 @@ fn owned_configuration_is_constructible_from_the_public_api() {
         ByteSizeRange::new(2 << 20, 1 << 30).expect("valid byte-size range"),
         true,
         true,
+    ));
+    scheme.filters.push(FilterConfig::probe_hits_weighted_sum(
+        ProbeHitsWeightedSumRange::new(0, u32::MAX.into()).expect("valid weighted-sum range"),
+        true,
+        false,
     ));
     scheme
         .validate_for(1)

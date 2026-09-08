@@ -4,6 +4,19 @@ This project follows Semantic Versioning and Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-08
+
+### Added
+
+- Typed and capability-driven support for `probe_hits_wsum` DAMOS filters
+- Official `damo` feature-name reporting for `pgidle_set` probe filters
+
+### Changed
+
+- Reject payload fields that do not belong to a known filter type before I/O
+- Validate serialized persistent receipt configuration and volatile paths
+- Reduce repeated ownership fingerprint lookups during runtime updates
+
 ## [0.1.0] - 2026-08-18
 
 ### Added

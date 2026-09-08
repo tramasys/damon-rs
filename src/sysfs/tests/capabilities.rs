@@ -25,6 +25,10 @@ fn public_string_parsers_preserve_atomic_future_values() {
         SchemeFilterType::Unknown("future_filter".into())
     );
     assert_eq!(
+        SchemeFilterType::from_str("probe_hits_wsum").expect("parse weighted-sum filter"),
+        SchemeFilterType::ProbeHitsWeightedSum
+    );
+    assert_eq!(
         KdamondState::from_str("future_state").expect("parse state"),
         KdamondState::Unknown("future_state".into())
     );
@@ -226,11 +230,19 @@ fn semantic_features_match_the_official_damo_sysfs_map() {
             SysfsFeature::ProbeTypePageIdleUnset,
             "sysfs/probe_type_pgidle_unset",
         ),
+        (
+            SysfsFeature::ProbeTypePageIdleSet,
+            "sysfs/probe_type_pgidle_set",
+        ),
+        (
+            SysfsFeature::SchemeFilterProbeHitsWeightedSum,
+            "sysfs/damos_filter_probe_hits_wsum",
+        ),
         (SysfsFeature::SampleControl, "sysfs/damon_sample_control"),
         (SysfsFeature::OperationAttributes, "sysfs/ops_attrs"),
     ];
 
-    assert_eq!(expected.len(), 57);
+    assert_eq!(expected.len(), 59);
     let names = expected
         .iter()
         .map(|(feature, expected_name)| {

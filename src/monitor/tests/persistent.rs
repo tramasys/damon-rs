@@ -130,11 +130,13 @@ fn receipt_parser_rejects_truncation_and_trailing_data() {
         .start_persistent(&transaction_config(42, Action::Stat))
         .expect("start persistent hierarchy");
     let bytes = receipt.to_bytes().expect("serialize receipt");
-    assert!(matches!(
-        PersistentReceipt::from_bytes(&bytes[..bytes.len() - 1]),
-        Err(Error::InvalidReceipt { .. })
-    ));
-    let mut trailing = bytes;
+    for length in 0..bytes.len() {
+        assert!(matches!(
+            PersistentReceipt::from_bytes(&bytes[..length]),
+            Err(Error::InvalidReceipt { .. })
+        ));
+    }
+    let mut trailing = bytes.clone();
     trailing.push(0);
     assert!(matches!(
         PersistentReceipt::from_bytes(&trailing),
@@ -142,5 +144,36 @@ fn receipt_parser_rejects_truncation_and_trailing_data() {
     ));
 
     let mut attached = damon.attach(&receipt).expect("attach receipt");
+    attached.stop().expect("stop hierarchy");
+}
+
+#[test]
+fn receipt_parser_rejects_forged_volatile_configuration_paths() {
+    let model = Model::new("vaddr\n");
+    let lock = TestLock::new();
+    let damon = Damon::at_with_lock(model.root(), lock.path()).expect("open model");
+    let mut config = transaction_config(42, Action::Stat);
+    config.kdamonds[0].contexts[0].intervals_goal = IntervalsGoalConfig {
+        access_basis_points: 5_000,
+        aggregation_intervals: 10,
+        minimum_sample: Duration::from_micros(1_000),
+        maximum_sample: Duration::from_micros(10_000),
+    };
+    let receipt = damon
+        .start_persistent(&config)
+        .expect("start persistent hierarchy");
+    let mut bytes = receipt.to_bytes().expect("serialize receipt");
+    let offset = bytes
+        .windows(b"sample_us".len())
+        .rposition(|window| window == b"sample_us")
+        .expect("serialized volatile sample interval path");
+    bytes[offset..offset + b"update_us".len()].copy_from_slice(b"update_us");
+
+    assert!(matches!(
+        PersistentReceipt::from_bytes(&bytes),
+        Err(Error::InvalidReceipt { .. })
+    ));
+
+    let mut attached = damon.attach(&receipt).expect("attach original receipt");
     attached.stop().expect("stop hierarchy");
 }

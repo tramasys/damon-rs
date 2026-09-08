@@ -81,6 +81,8 @@ pub enum SysfsFeature {
     SchemeFilterUnmapped,
     /// Active-page DAMOS filters (`sysfs/schemes_filters_active`).
     SchemeFilterActive,
+    /// Monitoring-probe hit weighted-sum DAMOS filters.
+    SchemeFilterProbeHitsWeightedSum,
     /// Separate core and operations DAMOS filter directories.
     SeparateSchemeFilterDirectories,
     /// Per-filter allow controls (`sysfs/allow_filter`).
@@ -185,6 +187,7 @@ impl SysfsFeature {
             Self::SchemeFilterHugePageSize => Some("sysfs/schemes_filters_hugepage_size"),
             Self::SchemeFilterUnmapped => Some("sysfs/schemes_filters_unmapped"),
             Self::SchemeFilterActive => Some("sysfs/schemes_filters_active"),
+            Self::SchemeFilterProbeHitsWeightedSum => Some("sysfs/damos_filter_probe_hits_wsum"),
             Self::SeparateSchemeFilterDirectories => Some("sysfs/schemes_filters_core_ops_dirs"),
             Self::SchemeFilterAllow => Some("sysfs/allow_filter"),
             Self::SchemeQuotaGoals => Some("sysfs/schemes_quota_goals"),
@@ -224,8 +227,8 @@ impl SysfsFeature {
             | Self::ProbeFilterPath
             | Self::SchemeQuotaGoalHugePageMemory
             | Self::DamosAllocateAction
-            | Self::DamosFreeAction
-            | Self::ProbeTypePageIdleSet => None,
+            | Self::DamosFreeAction => None,
+            Self::ProbeTypePageIdleSet => Some("sysfs/probe_type_pgidle_set"),
         }
     }
 }

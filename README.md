@@ -37,7 +37,7 @@ Building requires Rust 1.85 or newer. The running Linux kernel needs
 privileges.
 
 This read-only check reports the relevant kernel options, sysfs availability,
-access permissions, and Rust version:
+and access permissions:
 
 ```bash
 damon_kernel_config="/boot/config-$(uname -r)"

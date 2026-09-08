@@ -12,7 +12,7 @@ use super::sysfs_io::{
 };
 use super::{
     AccessPattern, Action, ByteSizeRange, Context, DamonAdmin, Kdamond, Operation, Probe,
-    ProbeFilter, ProbeFilterType, Scheme, Target,
+    ProbeFilter, ProbeFilterType, ProbeHitsWeightedSumRange, Scheme, Target,
 };
 
 mod attributes;

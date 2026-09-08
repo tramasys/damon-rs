@@ -2,13 +2,13 @@
 
 use super::{
     ByteSizeRange, DestinationConfig, Duration, Error, FilterConfig, InitialRegionConfig,
-    MAX_EAGER_READ_CAPACITY, OperationAttributesConfig, Path, PathBuf, ProbePreparationAction,
-    ProbePreparationConfig, QuotaConfig, QuotaGoalConfig, QuotaGoalMetric, QuotaGoalTuner,
-    QuotaWeights, Result, SampleControlConfig, SampleFilterConfig, SampleFilterType,
-    SamplePrimitivesConfig, SchemeFilterType, WatermarkMetric, WatermarksConfig, ensure_count,
-    exact_micros, exact_millis, invalid_kernel_value, needs_stage, optional_pair, optional_read,
-    path_exists, read_bool, read_enum, read_i32, read_indexed, read_sysfs_string, read_u32,
-    read_u64, read_usize, stage_optional_default, validate_count, validate_sysfs_string,
+    MAX_EAGER_READ_CAPACITY, OperationAttributesConfig, Path, PathBuf, ProbeHitsWeightedSumRange,
+    ProbePreparationAction, ProbePreparationConfig, QuotaConfig, QuotaGoalConfig, QuotaGoalMetric,
+    QuotaGoalTuner, QuotaWeights, Result, SampleControlConfig, SampleFilterConfig,
+    SampleFilterType, SamplePrimitivesConfig, SchemeFilterType, WatermarkMetric, WatermarksConfig,
+    ensure_count, exact_micros, exact_millis, invalid_kernel_value, needs_stage, optional_pair,
+    optional_read, path_exists, read_bool, read_enum, read_i32, read_indexed, read_sysfs_string,
+    read_u32, read_u64, read_usize, stage_optional_default, validate_count, validate_sysfs_string,
     write_bool, write_bytes, write_enum, write_value,
 };
 

@@ -2,10 +2,11 @@
 
 use super::{
     AccessPattern, Action, AddressUnit, ByteSizeRange, Duration, Error, MonitoringIntervals,
-    Operation, Pid, ProbeFilterType, RegionBounds, Result, canonicalize_filter_placements,
-    exact_micros, exact_millis, exact_refresh_millis, invalid, invalid_const, minimum_region_units,
-    validate_address_unit_for_host, validate_count, validate_kernel_aligned_initial_regions,
-    validate_required_path, validate_scaled_initial_regions, validate_sysfs_string, validate_token,
+    Operation, Pid, ProbeFilterType, ProbeHitsWeightedSumRange, RegionBounds, Result,
+    canonicalize_filter_placements, exact_micros, exact_millis, exact_refresh_millis, invalid,
+    invalid_const, minimum_region_units, validate_address_unit_for_host, validate_count,
+    validate_kernel_aligned_initial_regions, validate_required_path,
+    validate_scaled_initial_regions, validate_sysfs_string, validate_token,
 };
 use std::fmt;
 use std::str::FromStr;
@@ -81,7 +82,7 @@ macro_rules! kernel_string_enum {
 }
 
 kernel_string_enum! {
-    /// A Linux 7.2 DAMOS filter type.
+    /// A DAMOS filter type.
     pub enum SchemeFilterType {
         /// Anonymous memory.
         Anonymous => "anon",
@@ -99,6 +100,8 @@ kernel_string_enum! {
         Address => "addr",
         /// A DAMON target index.
         Target => "target",
+        /// A monitoring-probe hit weighted-sum range.
+        ProbeHitsWeightedSum => "probe_hits_wsum",
     }
 }
 
@@ -125,7 +128,7 @@ kernel_string_enum! {
 impl SchemeFilterType {
     pub(super) fn handled_by_operations(&self) -> Option<bool> {
         match self {
-            Self::Address | Self::Target => Some(false),
+            Self::Address | Self::Target | Self::ProbeHitsWeightedSum => Some(false),
             Self::Anonymous
             | Self::Active
             | Self::MemoryControlGroup

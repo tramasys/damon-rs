@@ -2,10 +2,20 @@
 
 use super::{
     AccessPattern, Action, ByteSizeRange, Duration, Error, FilterLayer, FilterPlacement, Operation,
-    QuotaGoalMetric, QuotaGoalTuner, Result, SchemeFilterType, WatermarkMetric, exact_micros,
-    exact_millis, invalid, validate_count, validate_required_path, validate_sysfs_string,
-    validate_token,
+    ProbeHitsWeightedSumRange, QuotaGoalMetric, QuotaGoalTuner, Result, SchemeFilterType,
+    WatermarkMetric, exact_micros, exact_millis, invalid, validate_count, validate_required_path,
+    validate_sysfs_string, validate_token,
 };
+
+#[derive(Clone, Copy)]
+enum FilterPayload {
+    None,
+    CgroupPath,
+    AddressRange,
+    SizeRange,
+    TargetIndex,
+    ProbeHitsWeightedSumRange,
+}
 
 /// Configuration for a DAMOS filter.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,6 +37,8 @@ pub struct FilterConfig {
     pub size_range: Option<ByteSizeRange>,
     /// Target index for a target filter.
     pub target_index: Option<usize>,
+    /// Inclusive range for a monitoring-probe hit weighted-sum filter.
+    pub probe_hits_weighted_sum_range: Option<ProbeHitsWeightedSumRange>,
 }
 
 impl FilterConfig {
@@ -42,6 +54,7 @@ impl FilterConfig {
             address_range: None,
             size_range: None,
             target_index: None,
+            probe_hits_weighted_sum_range: None,
         }
     }
 
@@ -78,6 +91,19 @@ impl FilterConfig {
         Self {
             target_index: Some(index),
             ..Self::new(SchemeFilterType::Target, matching, allow)
+        }
+    }
+
+    /// Creates a monitoring-probe hit weighted-sum filter.
+    #[must_use]
+    pub fn probe_hits_weighted_sum(
+        range: ProbeHitsWeightedSumRange,
+        matching: bool,
+        allow: bool,
+    ) -> Self {
+        Self {
+            probe_hits_weighted_sum_range: Some(range),
+            ..Self::new(SchemeFilterType::ProbeHitsWeightedSum, matching, allow)
         }
     }
 
@@ -121,6 +147,33 @@ impl FilterConfig {
             _ => {}
         }
 
+        match &self.filter_type {
+            SchemeFilterType::MemoryControlGroup => {
+                self.validate_payload_fields(FilterPayload::CgroupPath)?;
+            }
+            SchemeFilterType::Address => {
+                self.validate_payload_fields(FilterPayload::AddressRange)?;
+            }
+            SchemeFilterType::HugePageSize => {
+                self.validate_payload_fields(FilterPayload::SizeRange)?;
+            }
+            SchemeFilterType::Target => {
+                self.validate_payload_fields(FilterPayload::TargetIndex)?;
+            }
+            SchemeFilterType::ProbeHitsWeightedSum => {
+                self.validate_payload_fields(FilterPayload::ProbeHitsWeightedSumRange)?;
+            }
+            SchemeFilterType::Unknown(_) => {
+                if self.probe_hits_weighted_sum_range.is_some() {
+                    return invalid(
+                        "scheme filter payload",
+                        "a weighted-sum range requires the probe_hits_wsum filter type",
+                    );
+                }
+            }
+            _ => self.validate_payload_fields(FilterPayload::None)?,
+        }
+
         match self.filter_type {
             SchemeFilterType::MemoryControlGroup => {
                 validate_required_path("scheme filter cgroup path", self.cgroup_path.as_deref())?;
@@ -150,6 +203,14 @@ impl FilterConfig {
                     return invalid("target filter index", "must refer to a configured target");
                 }
             }
+            SchemeFilterType::ProbeHitsWeightedSum
+                if self.probe_hits_weighted_sum_range.is_none() =>
+            {
+                return invalid(
+                    "probe hits weighted sum filter",
+                    "requires a weighted-sum range",
+                );
+            }
             _ => {}
         }
 
@@ -158,6 +219,22 @@ impl FilterConfig {
         }
         if let Some(index) = self.target_index {
             validate_count("target filter index", index)?;
+        }
+        Ok(())
+    }
+
+    fn validate_payload_fields(&self, payload: FilterPayload) -> Result<()> {
+        if (!matches!(payload, FilterPayload::CgroupPath) && self.cgroup_path.is_some())
+            || (!matches!(payload, FilterPayload::AddressRange) && self.address_range.is_some())
+            || (!matches!(payload, FilterPayload::SizeRange) && self.size_range.is_some())
+            || (!matches!(payload, FilterPayload::TargetIndex) && self.target_index.is_some())
+            || (!matches!(payload, FilterPayload::ProbeHitsWeightedSumRange)
+                && self.probe_hits_weighted_sum_range.is_some())
+        {
+            return invalid(
+                "scheme filter payload",
+                "contains data that does not belong to the selected filter type",
+            );
         }
         Ok(())
     }

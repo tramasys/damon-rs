@@ -191,6 +191,20 @@ fn owned_configuration_round_trips_current_damo_probe_and_sample_controls() {
         thread_ids: "41 42".to_owned(),
     };
     context.probes.push(probe);
+    let pattern = AccessPattern::new(
+        RegionSizeRange::new(0, u64::MAX).expect("valid size range"),
+        AccessCountRange::new(0, u32::MAX).expect("valid access range"),
+        AgeRange::new(0, u32::MAX).expect("valid age range"),
+    );
+    let mut scheme = SchemeConfig::new(Action::Stat, pattern);
+    let mut weighted_sum_filter = FilterConfig::probe_hits_weighted_sum(
+        ProbeHitsWeightedSumRange::new(7, 700).expect("valid weighted-sum range"),
+        true,
+        false,
+    );
+    weighted_sum_filter.placement = FilterPlacement::Core;
+    scheme.filters.push(weighted_sum_filter);
+    context.schemes.push(scheme);
     context.sample_control = SampleControlConfig {
         primitives: SamplePrimitivesConfig {
             page_table: false,
@@ -218,6 +232,30 @@ fn owned_configuration_round_trips_current_damo_probe_and_sample_controls() {
         kdamond.configuration().expect("read current damo controls"),
         config
     );
+}
+
+#[test]
+fn known_filter_types_reject_unrelated_payloads_before_staging() {
+    let mut scheme_filter = FilterConfig::new(SchemeFilterType::Anonymous, true, false);
+    scheme_filter.address_range = Some((0, 4_096));
+    assert!(matches!(
+        scheme_filter.validate_for(FilterLayer::Operations, 1),
+        Err(Error::InvalidConfiguration { .. })
+    ));
+
+    let mut probe_filter = ProbeFilterConfig::new(ProbeFilterType::PageIdleSet, true, true);
+    probe_filter.cgroup_path = Some("/workload".to_owned());
+    assert!(matches!(
+        probe_filter.validate(),
+        Err(Error::InvalidConfiguration { .. })
+    ));
+
+    let mut sample_filter = SampleFilterConfig::write(true, true);
+    sample_filter.cpu_mask = Some("0-3".to_owned());
+    assert!(matches!(
+        sample_filter.validate(),
+        Err(Error::InvalidConfiguration { .. })
+    ));
 }
 
 #[test]

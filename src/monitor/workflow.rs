@@ -1162,7 +1162,9 @@ impl Monitor {
             return Err(Error::MultipleSnapshotResults { count });
         }
         let snapshots = self.materialize_snapshots()?;
-        Ok(&snapshots[0])
+        snapshots.first().ok_or(Error::OwnershipLost {
+            reason: "a successful singular snapshot request returned no result",
+        })
     }
 
     /// Materializes all target-scoped or ungrouped snapshot results.

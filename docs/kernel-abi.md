@@ -68,6 +68,8 @@ conversion explicit.
 Initial regions are checked for ordering, overlap, kernel alignment, native
 range, and scaled-address overflow before staging. Huge-page filter sizes are
 always byte values and are not scaled by the context address unit.
+Monitoring-probe hit weighted-sum filter ranges are dimensionless even though
+the sysfs ABI exposes them through the same `min` and `max` names.
 
 `stats/max_nr_snapshots` is an application limit. Reaching it deactivates
 further scheme application. It is not a retained-result count.

@@ -257,7 +257,7 @@ fn exclusive_capability_probe_materializes_nested_attributes_and_restores_empty_
             .iter()
             .filter(|capability| capability.feature().damo_name().is_some())
             .count(),
-        57
+        59
     );
 }
 
@@ -421,6 +421,7 @@ fn exclusive_capability_probe_recognizes_damon_next_values() {
         SysfsFeature::SchemeQuotaGoalHugePageMemory,
         SysfsFeature::ProbeTypePageIdleSet,
         SysfsFeature::ProbePreparationSetPageIdle,
+        SysfsFeature::SchemeFilterProbeHitsWeightedSum,
     ] {
         assert_eq!(
             capabilities.feature_support(feature),

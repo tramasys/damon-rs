@@ -201,6 +201,10 @@ impl Kdamond {
                 (SysfsFeature::SchemeFilterHugePageSize, "hugepage_size"),
                 (SysfsFeature::SchemeFilterUnmapped, "unmapped"),
                 (SysfsFeature::SchemeFilterActive, "active"),
+                (
+                    SysfsFeature::SchemeFilterProbeHitsWeightedSum,
+                    "probe_hits_wsum",
+                ),
             ],
         )?;
 
@@ -453,6 +457,7 @@ fn scheme_filter_capabilities(scheme: &Scheme) -> Result<Vec<FeatureCapability>>
         SysfsFeature::SchemeFilterHugePageSize,
         SysfsFeature::SchemeFilterUnmapped,
         SysfsFeature::SchemeFilterActive,
+        SysfsFeature::SchemeFilterProbeHitsWeightedSum,
     ]
     .into_iter()
     .map(|feature| feature_capability(feature, support))

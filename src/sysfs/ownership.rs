@@ -158,11 +158,12 @@ impl ConfigurationFingerprint {
         let mut refreshed = self.clone();
         let entries = Arc::make_mut(&mut refreshed.entries);
         for path in paths {
-            let entry = entries.iter_mut().find(|entry| &entry.path == path).ok_or(
-                Error::OwnershipLost {
+            let index = entries
+                .binary_search_by(|entry| entry.path.cmp(path))
+                .map_err(|_| Error::OwnershipLost {
                     reason: "a controlled configuration path disappeared",
-                },
-            )?;
+                })?;
+            let entry = &mut entries[index];
             entry.value = read_configuration_value(path)?;
         }
         if !refreshed.matches_current_except(ignored)? {
